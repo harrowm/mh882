@@ -53,3 +53,9 @@ dkms.conf
 
 # debug information files
 *.dwo
+
+# Simulation artifacts (RTL/testbench builds)
+*.vcd
+obj_*/
+sim/
+.DS_Store
