@@ -1,13 +1,12 @@
 `timescale 1ns/1ps
 `default_nettype none
 
-// MC68882 Top Level -- Phase 1 skeleton.
+// MC68882 Top Level -- Phase 2.
 //
-// Pin-compatible port list (CLAUDE.md's own Pin List table), wired here to
-// two internal blocks: m68882_sync (one synchronizer instance per
-// asynchronous host input) and m68882_biu (Phase 1's own async-cycle-
-// detect + DSACK skeleton). No CIR register file yet -- see plan.md
-// Phase 2.
+// Pin-compatible port list (CLAUDE.md's own Pin List table), wired here
+// to three internal blocks: m68882_sync (one synchronizer instance per
+// asynchronous host input), m68882_biu (bus-cycle-type dispatch + DSACK
+// generation, Phase 2), and m68882_cir (CIR register storage, Phase 2).
 //
 // Clock: clk_4x is this chip's OWN independent internal clock, already
 // multiplied to 4x its own external CLK rate -- supplied by the
@@ -26,7 +25,8 @@ module m68882_top (
     // ─────────────────────────────────────────────────────────────────
     // Pin-compatible external interface (CLAUDE.md Pin List)
     // ─────────────────────────────────────────────────────────────────
-    input  logic [4:0]  a,          // A0-A4, CIR select (no on-chip FC/CPU-space decode)
+    input  logic [4:0]  a,          // A0-A4, CIR select (A0 doubles as the SIZE-strap
+                                     // partner in 16/32-bit bus mode -- Section 9.1/9.3)
     inout  wire  [31:0] d,          // D0-D31
     input  logic        size_n,     // SIZE#, port-width strap
     input  logic        as_n,       // AS#
@@ -35,7 +35,7 @@ module m68882_top (
     input  logic        ds_n,       // DS#
     output logic        dsack0_n,   // DSACK0#
     output logic        dsack1_n,   // DSACK1#
-    inout  wire         sense_n     // SENSE# (optional, unused Phase 1)
+    inout  wire         sense_n     // SENSE# (optional, unused)
 );
 
     // ── Synchronize every host-driven input into this chip's own clk_4x
@@ -50,7 +50,8 @@ module m68882_top (
     m68882_sync #(.WIDTH(1)) u_sync_size (.clk_4x, .rst_n, .d(size_n), .q(size_n_s));
     m68882_sync #(.WIDTH(5)) u_sync_a    (.clk_4x, .rst_n, .d(a),      .q(a_s));
 
-    logic cyc_active, cyc_write;
+    logic                           cyc_active, cyc_write, cyc_ack;
+    m68882_cir_pkg::cir_sel_t       cyc_sel;
 
     m68882_biu u_biu (
         .clk_4x,
@@ -59,19 +60,31 @@ module m68882_top (
         .ds_n_s,
         .cs_n_s,
         .rw_s,
+        .size_n_s,
+        .a_s,
         .dsack0_n,
         .dsack1_n,
         .cyc_active,
-        .cyc_write
+        .cyc_ack,
+        .cyc_write,
+        .cyc_sel
     );
 
-    // a_s/size_n_s are captured and available for Phase 2's own CIR
-    // register file (which CIR is selected, and its real bus width) --
-    // deliberately unused past this point in Phase 1, since no register
-    // file exists yet to consume them.
+    logic [31:0] d_out;
+    logic        d_oe;
 
-    // No CIR register file yet (Phase 2) -- data bus stays tri-stated.
-    assign d = 32'bz;
+    m68882_cir u_cir (
+        .clk_4x,
+        .rst_n,
+        .cyc_ack,
+        .cyc_write,
+        .cyc_sel,
+        .d_in  (d),
+        .d_out (d_out),
+        .d_oe  (d_oe)
+    );
+
+    assign d = d_oe ? d_out : 32'bz;
     assign sense_n = 1'bz;
 
 endmodule

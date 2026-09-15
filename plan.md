@@ -1,6 +1,6 @@
 # MC68882 FPU — Phased Scope Plan
 
-## Status: Phase 0 and Phase 1 complete. Phase 2 (CIR bus-cycle timing) is next.
+## Status: Phases 0-2 complete. Phase 3 (programming model + primitive protocol) is next.
 
 ## Origin
 
@@ -247,17 +247,66 @@ latency (2-stage synchronizer + 1 detect register, confirmed within a
 2-6 tick window), and correct negation once the host releases `AS`/`DS`/
 `CS`.
 
-### Phase 2 — CIR bus-cycle timing (the accuracy-critical phase)
-Implement the CIR register file and get all three bus-cycle types
-S-state-exact against Figures 10-6/10-7/10-8: synchronous read
-(Response/Save, 1½-clock-after-sample DSACK delay, 5-clock baseline with
-real wait-state variability), asynchronous read (3-clock baseline,
-clock-frequency-independent), asynchronous write (3-clock baseline,
-DS-pulse-triggered). Implement the Section 10.5 inter-cycle restrictions
-(Control/Restore LSB writes, Operand CIR sequencing under busy-frame
-save/restore). Budget a `timing_diagrams/` pass here, same methodology
-MH030 uses for its own — that process has repeatedly caught real S-state
-bugs there and should be expected to do the same here.
+### Phase 2 — CIR bus-cycle timing (the accuracy-critical phase) (COMPLETE)
+`rtl/m68882_cir_pkg.sv` (CIR offset constants; `is_sync_read()`/
+`is_32bit()` classifiers; `port_size()` and `dsack_encode()`, both
+directly table-driven from Table 9-2/9-3), a rewritten `rtl/m68882_biu.sv`
+(synchronous-read counted delay for Response/Save, per Section 10.4.1 —
+DSACK asserts a fixed 1.5-"real"-clock delay after CS#+AS#+DS# sampled,
+always landing on the clean 5-clock/2-wait-state baseline rather than
+modeling the manual's own 6-7-clock variability, a deliberate
+simplification since that variability is a real-silicon metastability
+artifact this project's fixed-latency synchronizer doesn't reproduce;
+asynchronous fast-ack for everything else, per Section 10.4.2/10.4.3; the
+Section 10.5 inter-cycle busy timer, approximated at word granularity —
+see the RTL's own header comment for why that's a safe superset, not a
+silent shortcut), and `rtl/m68882_cir.sv` (CIR register storage with the
+real D16-D31/D31-D0 data-lane placement).
+
+**Two real findings, both confirmed directly against the manual/via
+simulation, not assumed:**
+
+1. **A0 is not a free address bit in 16/32-bit bus mode** (Section 9.1/
+   Table 9-2) — it doubles as the port-size-strap partner to `SIZE#`; the
+   real register-select field in that mode is A4-A1, not A4-A0. This
+   changed the CIR pin/register-select model from what Phase 0's own
+   first pass at `CLAUDE.md` assumed (corrected there too).
+
+2. **Phase 1's own DSACK polarity placeholder was actually wrong** —
+   confirmed against the real Table 9-3: it modeled an 8-bit-port ack,
+   not a 16-bit one (the two are opposite-polarity encodings). Fixed via
+   a real, table-driven `dsack_encode()` function.
+
+3. **A genuine write-data corruption bug**, found via simulation:
+   `m68882_cir.sv`'s original write logic gated the register update on
+   the LEVEL of `write_strobe`, which stays asserted a few extra
+   `clk_4x` ticks after a real host releases the data bus (an
+   unavoidable consequence of Phase 1's own synchronizer latency). The
+   level-sensitive write kept re-latching `d_in` on those extra ticks,
+   corrupting the just-written value with X/Z once the host tri-stated
+   the bus. Fixed by edge-detecting `write_strobe`'s own rising edge —
+   also the more faithful reading of Section 10.4.3's own wording ("an
+   asserted pulse occurs on DS, the FPCP responds by ... latching the
+   value").
+
+**Verified**: `tb/m68882_biu_smoke_tb.sv`, 10/10 checks via `make test` —
+synchronous-vs-asynchronous read latency separation, Table 9-3 DSACK
+polarity across all 3 port sizes and both A4 halves, the inter-cycle
+busy-timer delay, and register write/read-back round-trips on both the
+16-bit (D16-D31) and 32-bit (D31-D0) lanes.
+
+**Scope boundary carried forward**: 8-bit-port operation and a 16-bit
+port accessing a 32-bit CIR both need genuine multi-cycle byte-
+sequencing, not implemented — this project's real use cases (MH030, or
+any reasonable third-party 68030/68020 host) are 32-bit-bus systems.
+
+A dedicated `timing_diagrams/` pass (mirroring MH030's own methodology)
+was considered for this phase but deferred — the manual doesn't provide
+per-pixel S-state diagrams for these 3 cycle types the way MC68030UM.pdf
+does for the CPU side (Figures 10-6/10-7/10-8 are schematic, not the
+detailed per-signal timing charts MH030's own diagram pipeline crops from
+MC68030UM.pdf). Revisit if a future phase's own verification work turns
+up a case where a visual diagram would clarify a real ambiguity.
 
 ### Phase 3 — Programming model and primitive protocol (no real math yet)
 FP0-FP7 (80-bit), FPCR/FPSR/FPIAR, Command CIR op-word decode, Response
