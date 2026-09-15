@@ -1,6 +1,6 @@
 # MC68882 FPU — Phased Scope Plan
 
-## Status: Phase 0 in progress. No RTL/testbench work has started yet.
+## Status: Phase 0 and Phase 1 complete. Phase 2 (CIR bus-cycle timing) is next.
 
 ## Origin
 
@@ -219,19 +219,33 @@ APU/CU concurrent-exception attribution rule above). This is what makes
 this repo genuinely standalone-readable on its own, with no dependency
 on MH030's own docs to understand it.
 
-### Phase 1 — Clock domain and pin-level BIU skeleton
-`rtl/m68882_top.sv` with the real pin list, and a NEW, independent
-internally-multiplied clock generator for this chip's own `CLK` — same
-4× convention MH030 uses, but a wholly separate instance with no fixed
-relationship to any host CPU's own bus clock. Because a host may run an
-unrelated clock, every bus input (`AS`, `DS`, `CS`, `R/W`, `SIZE`) needs
-2-stage synchronization into this chip's own clock domain — broader than
-MH030's own synchronizer convention (which only synchronizes error/
-arbitration lines), since here there is no shared-clock guarantee at
-all. Deliverable: a bus slave that recognizes `CS`+`AS`+`DS` cycle
-boundaries and can source/sink `DSACK0/1` with correct polarity, no CIR
-content behind it yet. Smoke-tested with a raw register read/write
-drive, not through any host CPU.
+### Phase 1 — Clock domain and pin-level BIU skeleton (COMPLETE)
+`rtl/m68882_top.sv` with the real pin list, `rtl/m68882_sync.sv` (generic
+2-stage synchronizer, one instance per host-driven input: `AS`, `DS`,
+`CS`, `R/W`, `SIZE`, `A0-4`), and `rtl/m68882_biu.sv` (recognizes a
+`CS`+`AS`+`DS` cycle boundary and sources `DSACK0/1`, asynchronous-cycle
+model only — no CIR content yet, Phase 2).
+
+**Finding**: no separate clock-multiplier module was built or needed.
+`clk_4x` is simply a plain top-level input port, supplied already-
+multiplied by the testbench/environment — exactly mirroring MH030's own
+`m68030_top.sv` convention (its own port is literally named `clk_4x`
+too). A literal on-chip PLL that multiplies a slower `CLK` pin up to 4x
+is out of scope for a cycle-accurate RTL *simulation* model on either
+project — MH030 never built one either, and there was no reason for this
+project to be the first. This chip's `clk_4x` is a wholly separate port
+from MH030's own, with no fixed relationship enforced between them —
+satisfying the "own clock" requirement without needing new clock-
+generation RTL.
+
+**Verified**: `tb/m68882_biu_smoke_tb.sv` (raw pin-level drive, no host
+CPU — mirrors MH030's own `tb/biu_tb.sv` convention for a first-cut BIU
+test) — 8/8 checks pass via `make test` (Icarus Verilog): read and write
+cycle recognition, `DSACK0/1` polarity (a fixed 16-bit-port placeholder,
+to be replaced with real per-CIR width in Phase 2), bounded assert
+latency (2-stage synchronizer + 1 detect register, confirmed within a
+2-6 tick window), and correct negation once the host releases `AS`/`DS`/
+`CS`.
 
 ### Phase 2 — CIR bus-cycle timing (the accuracy-critical phase)
 Implement the CIR register file and get all three bus-cycle types
