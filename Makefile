@@ -34,6 +34,10 @@ $(SIM)/frame: $(RTL_SRCS) tb/m68882_frame_tb.sv | $(SIM)
 $(SIM)/pipeline: $(RTL_SRCS) tb/m68882_pipeline_tb.sv | $(SIM)
 	$(IV) $(IVFLAGS) -o $@ $^
 
+# ── Phase 10: Conditional Predicate Field + BSUN ────────────────────────────
+$(SIM)/cond: $(RTL_SRCS) tb/m68882_cond_tb.sv | $(SIM)
+	$(IV) $(IVFLAGS) -o $@ $^
+
 # ── Phase 7: Musashi golden-reference cosim ─────────────────────────────────
 MUSASHI_DIR := tools/musashi
 MUSASHI_SRC := $(MUSASHI_DIR)/m68kcpu.c $(MUSASHI_DIR)/m68kdasm.c \
@@ -68,12 +72,13 @@ $(SIM)/example: $(RTL_SRCS) rtl/glue_cs_decode.sv example/mh882_companion_exampl
 
 .PHONY: test
 test: $(SIM)/biu_smoke $(SIM)/proto $(SIM)/apu $(SIM)/frame $(SIM)/pipeline \
-      $(SIM)/musashi_cosim tests/fpu_musashi_ref.txt $(SIM)/glue $(SIM)/example
+      $(SIM)/cond $(SIM)/musashi_cosim tests/fpu_musashi_ref.txt $(SIM)/glue $(SIM)/example
 	$(VVP) $(SIM)/biu_smoke
 	$(VVP) $(SIM)/proto
 	$(VVP) $(SIM)/apu
 	$(VVP) $(SIM)/frame
 	$(VVP) $(SIM)/pipeline
+	$(VVP) $(SIM)/cond
 	$(VVP) $(SIM)/musashi_cosim
 	$(VVP) $(SIM)/glue
 	$(VVP) $(SIM)/example

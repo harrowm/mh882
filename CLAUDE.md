@@ -866,12 +866,31 @@ Python/`Decimal` high-precision references (sanity-checked against
 known closed forms before use, after Phase 9h's own reference-script
 bug taught that lesson the hard way).
 
-See `plan.md` for the full phased build plan. What remains genuinely
-out of scope for this project — none of it a transcendental-instruction
-gap any more — is W/B/P integer/packed-decimal formats, BSUN/INEX1,
-denormals, exponent-overflow traps, and the MH030-side coprocessor-
-conditional-instruction gap.
+**Phase 10 (Conditional Predicates + BSUN + Take-Pre-Instruction-
+Exception) is complete — the post-Phase-9 gap-closure plan
+(`wobbly-honking-cascade.md`) is now underway.** Only 2 of the 32
+Conditional Predicate Field encodings were previously real (EQ/NE); all
+32 are now implemented, ported directly from `tools/musashi/m68kfpu.c`'s
+own `TEST_CONDITION()` (already vendored, already trusted elsewhere) —
+the manual's own printed Boolean equations have lost negation-bar
+formatting in several places, confirmed directly while transcribing
+them, so Musashi's own unambiguous C switch was used as the primary
+source instead. BSUN now fires correctly (signaling-group predicates
+with the NAN condition-code bit set), escalating to a real
+Take-Pre-Instruction-Exception primitive when FPCR's own BSUN-enable
+bit is also set — a new dedicated `bsun_set_en` register-file port
+(mirroring the existing `fpiar_auto_wr_en` dedicated-port pattern)
+splices the BSUN bit into FPSR without racing a same-cycle arithmetic-
+commit FPSR write. New `tb/m68882_cond_tb.sv` (89 checks) covers all 32
+predicates across 5 representative condition-code states plus the
+BSUN/Take-Pre behavior itself. **`make test` grew to 9 suites, all
+clean.**
+
+See `plan.md` for the full phased build plan, including the remaining
+gap-closure phases (W/B/P integer/packed-decimal formats, denormals,
+trap-enabled destination-write semantics, and — cross-repo — MH030's
+own coprocessor-conditional instructions).
 
 ```bash
-make test   # builds and runs all eight testbenches via Icarus Verilog
+make test   # builds and runs all nine testbenches via Icarus Verilog
 ```

@@ -1944,3 +1944,74 @@ start of Phase 9 (W/B/P integer/packed-decimal formats, BSUN/INEX1,
 denormals, exponent-overflow traps, and the MH030-side coprocessor-
 conditional-instruction gap) — none of it a transcendental-instruction
 gap any more.
+
+## Phase 10 — Conditional predicates + BSUN + Take-Pre-Instruction-Exception (COMPLETE)
+
+Closes the first item of the post-Phase-9 gap-closure plan
+(`wobbly-honking-cascade.md`). Confirmed directly before starting: only
+2 of the 32 Conditional Predicate Field encodings were real (EQ/NE);
+the other 30 fell into a `default: cond_tf_next = 1'b0` — silently
+wrong even for trivial cases like `T` (always-true, code `0x0F`), which
+had never been caught because nothing exercised it. `PRIM_TAKE_PRE`
+already existed as an enum value with its own clearing logic wired,
+but nothing had ever raised it.
+
+**Spec source, deliberately not the manual's own printed equations**:
+Table 4-20/4.4's own Boolean equations have lost negation-bar
+(overline) formatting in the available scan — directly observed while
+transcribing them (e.g. GE's own printed equation is literally
+ambiguous without knowing which sub-term the lost bar covered).
+`tools/musashi/m68kfpu.c`'s own `TEST_CONDITION()` (already vendored
+into this repo, already trusted elsewhere as a golden reference)
+implements the identical 32-condition set unambiguously in C, and its
+own structure confirms the encoding: predicate bit 4 (`0x10`) selects
+the "signaling"/BSUN-checking group (Note 2) vs. the "ordered" group
+(Note 1, never sets BSUN); bits[3:0] select one of 16 underlying
+Boolean tests over N/Z/NAN, reused identically by both groups
+(Musashi's own switch literally falls through `case 0x1X: case 0x0X:`
+for all 16). `cond_eval()` in `rtl/m68882_proto.sv` is a direct,
+line-for-line port of that switch.
+
+**BSUN + Take-Pre-Instruction-Exception**: when a signaling-group
+predicate (`cond_pred[4]=1`) is evaluated while FPSR's NAN
+condition-code bit is set, FPSR's own BSUN bit is set; if FPCR's own
+BSUN-enable bit is ALSO set, the Condition CIR's own response becomes
+`PRIM_TAKE_PRE` instead of the ordinary null true/false result (Table
+4-20 Note 2, confirmed directly). A new dedicated `bsun_set_en` port on
+`m68882_regfile.sv` sets FPSR bit 15 alone (a single-bit OR, not a full
+FPSR overwrite — a Condition CIR evaluation's own EXC-byte contribution
+is scoped to BSUN alone, unlike an arithmetic op's own commit-time
+`fpsr_next()` which legitimately refreshes all 8 EXC bits together),
+composing safely with a same-cycle `ctrl_wr_en`/FPSR write by splicing
+into that write's own data rather than racing it — the same
+`fpiar_auto_wr_en`-style dedicated-port pattern this project already
+established for exactly this class of same-cycle collision.
+
+**Testing**: a new dedicated `tb/m68882_cond_tb.sv` (89 checks, wired
+into `make test` as a 9th suite) — all 16 base predicates across 5
+representative FPSR condition-code states (including one deliberately
+combining N=1 with NAN=1, to confirm N never leaks through when NAN
+already dominates a formula), a spot-check confirming the signaling
+group reuses the identical 16 formulas, and the BSUN/Take-Pre-
+Instruction-Exception behavior itself (ordered-group predicates never
+set BSUN even with NaN present; signaling-group predicates do; the
+primitive only becomes `PRIM_TAKE_PRE` when the trap is also enabled).
+Expected values were derived independently from Musashi's own C switch
+as a flat per-state array, deliberately NOT copied from the RTL's own
+case statement, so a shared transcription bug wouldn't silently cancel
+out between the two. **Not yet done, a documented simplification**:
+the plan's own "genuinely Musashi-verifiable via a real FBcc/FScc
+F-line-opcode harness" cross-check was not built this phase — the
+direct-from-Musashi-source truth table already gives strong,
+independently-derived confidence, and building a second full
+opcode-assembly harness for the same 32-entry table was judged not
+worth the additional effort right now; can be added later if ever in
+doubt. **`make test` grew to 9 suites (was 8), all clean.**
+
+## Phase 11 — Word (W) and Byte (B) integer external-operand formats, NOT YET STARTED
+
+Next in the gap-closure plan. Mechanical width-narrowing of Phase 4c's
+own already-proven `int32_to_ext`/`ext_to_int32` tasks to 16-bit and
+8-bit signed integers, plus wiring `FMT_W`/`FMT_B` (already real enum
+values with correct byte-counts in `fmt_bytes()`) into the existing
+`supply_staged`/`receive_converted` muxes in `rtl/m68882_proto.sv`.

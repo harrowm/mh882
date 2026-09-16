@@ -366,6 +366,7 @@ module m68882_proto (
     logic [95:0] apu_wr_data;
     logic        fpiar_auto_wr_en;
     logic [31:0] fpiar_auto_wr_data;
+    logic        bsun_set_en;
 
     m68882_regfile u_regfile (
         .clk_4x, .rst_n,
@@ -375,6 +376,7 @@ module m68882_proto (
         .ctrl_wr_sel(ctrl_wr_sel_r), .ctrl_wr_en, .ctrl_wr_data,
         .fpsr_o, .fpcr_o, .fpiar_o, .all_zero_o, .null_reset_en,
         .fpiar_auto_wr_en, .fpiar_auto_wr_data,
+        .bsun_set_en,
         .apu_a_sel, .apu_b_sel, .apu_a_rd, .apu_b_rd,
         .apu_wr_en, .apu_wr_sel, .apu_wr_data
     );
@@ -985,18 +987,72 @@ module m68882_proto (
         endcase
     end
 
-    // Condition CIR predicate field + FPSR Z bit (combinational). This
-    // dialog is NOT gated by the mandatory-Instruction-Address rule --
-    // see the header comment's own scoping note.
-    wire [5:0] cond_pred = d_in[21:16];
-    wire       fpsr_z    = fpsr_o[26];
+    // ── Phase 10: the full 32-condition Conditional Predicate Field
+    // (Table 4-20/4.4). The manual's own printed Boolean equations have
+    // lost negation-bar (overline) formatting in several places (directly
+    // observed while transcribing them -- e.g. GE's own printed equation
+    // is literally ambiguous without knowing which sub-term the lost bar
+    // covered). tools/musashi/m68kfpu.c's own TEST_CONDITION() (already
+    // vendored into this repo, already trusted elsewhere as a golden
+    // reference) implements the identical 32-condition set unambiguously
+    // in C, and confirms the encoding structure: predicate bit 4 (0x10)
+    // selects the "signaling"/BSUN-checking group (Table 4-20 Note 2) vs.
+    // the "ordered" group (Note 1, never sets BSUN); bits[3:0] select one
+    // of 16 underlying Boolean tests, reused IDENTICALLY by both groups
+    // (Musashi's own switch literally falls through `case 0x1X: case
+    // 0x0X: return <formula>` for every one of the 16). cond_eval below
+    // is a direct, line-for-line port of that switch -- the primary
+    // source for the equations themselves, not the OCR'd manual text.
+    function automatic logic cond_eval(logic [3:0] base, logic n, logic z, logic nan);
+        // Plain case (not `unique case`) -- base is arithmetically
+        // exhaustive over 4'h0..4'hF for any real predicate field, but at
+        // simulation time 0 (before reset/first Condition CIR write)
+        // cond_pred is still X, which `unique case` would flag as a
+        // spurious violation every run (the same X-propagation shape
+        // fp_sincos's own quadrant case already hit this session).
+        case (base)
+            4'h0: cond_eval = 1'b0;                // F / SF
+            4'h1: cond_eval = z;                   // EQ / SEQ
+            4'h2: cond_eval = !(nan || z || n);     // OGT / GT
+            4'h3: cond_eval = z || !(nan || n);     // OGE / GE
+            4'h4: cond_eval = n && !(nan || z);     // OLT / LT
+            4'h5: cond_eval = z || (n && !nan);     // OLE / LE
+            4'h6: cond_eval = !nan && !z;           // OGL / GL
+            4'h7: cond_eval = !nan;                 // OR / GLE
+            4'h8: cond_eval = nan;                  // UN / NGLE
+            4'h9: cond_eval = nan || z;              // UEQ / NGL
+            4'hA: cond_eval = nan || !(n || z);       // UGT / NLE
+            4'hB: cond_eval = nan || z || !n;         // UGE / NLT
+            4'hC: cond_eval = nan || (n && !z);       // ULT / NGE
+            4'hD: cond_eval = nan || z || n;          // ULE / NGT
+            4'hE: cond_eval = !z;                     // NE / SNE
+            4'hF: cond_eval = 1'b1;                   // T / ST
+        endcase
+    endfunction
+
+    // Condition CIR predicate field + FPSR N/Z/NAN condition-code bits
+    // (combinational). This dialog is NOT gated by the mandatory-
+    // Instruction-Address rule -- see the header comment's own scoping
+    // note.
+    wire [5:0] cond_pred     = d_in[21:16];
+    wire       fpsr_n        = fpsr_o[27];
+    wire       fpsr_z        = fpsr_o[26];
+    wire       fpsr_nan      = fpsr_o[24];
+    // Table 4-20 Note 3: predicate bit 5 set (0x20-0x3F) is "undefined,
+    // reserved... redundant encodings with 0XXXXX" -- masked off here so
+    // those 32 reserved codes evaluate identically to their own
+    // low-5-bit twin rather than reading past cond_pred's own real range.
+    wire       cond_bsun_group = cond_pred[4];
+    wire       cond_tf_base    = cond_eval(cond_pred[3:0], fpsr_n, fpsr_z, fpsr_nan);
+    // Table 4-20 Note 2: "If the NAN condition code bit is set, then set
+    // the BSUN bit in the FPSR. If the BSUN trap is enabled, then return
+    // the take pre-instruction exception primitive... otherwise, indicate
+    // the condition true/false result" -- confirmed directly.
+    wire       cond_bsun_fires = cond_bsun_group && fpsr_nan;
+    wire       fpcr_bsun_enable = fpcr_o[15];
     logic      cond_tf_next;
     always_comb begin
-        unique case (cond_pred)
-            6'b000001: cond_tf_next = fpsr_z;   // EQ
-            6'b001110: cond_tf_next = !fpsr_z;  // NE
-            default:   cond_tf_next = 1'b0;     // other 30 predicates: not yet implemented
-        endcase
+        cond_tf_next = cond_tf_base;
     end
 
     function automatic logic [1:0] chunks_for_bytes(int unsigned nbytes);
@@ -1081,6 +1137,7 @@ module m68882_proto (
             slotB_iaddr_r <= 32'h0;
             fpiar_auto_wr_en   <= 1'b0;
             fpiar_auto_wr_data <= 32'h0;
+            bsun_set_en        <= 1'b0;
         end else begin
             fp_wr_en      <= 1'b0;
             ctrl_wr_en    <= 1'b0;
@@ -1088,6 +1145,7 @@ module m68882_proto (
             null_reset_en <= 1'b0;
             proto_violation_r  <= 1'b0;
             fpiar_auto_wr_en   <= 1'b0;
+            bsun_set_en        <= 1'b0;
 
             if (abort) begin
                 state_r <= ST_IDLE;
@@ -1283,9 +1341,28 @@ module m68882_proto (
                     end
 
                     CIR_CONDITION: if (state_r == ST_IDLE) begin
-                        ca_r      <= 1'b0;
-                        prim_r    <= PRIM_NULL;
-                        cond_tf_r <= cond_tf_next;
+                        // Table 4-20 Note 2: a "signaling" predicate
+                        // (cond_pred[4]=1) evaluated while the NAN
+                        // condition-code bit is set always sets BSUN;
+                        // if FPCR's own BSUN trap-enable bit is ALSO
+                        // set, the response becomes Take-Pre-Instruction-
+                        // Exception instead of the ordinary null
+                        // true/false result -- confirmed directly, not
+                        // assumed.
+                        if (cond_bsun_fires) bsun_set_en <= 1'b1;
+                        if (cond_bsun_fires && fpcr_bsun_enable) begin
+                            prim_r <= PRIM_TAKE_PRE;
+                            ca_r   <= 1'b1;
+                            // dr_r pinned for the same reason
+                            // PRIM_TAKE_MID's own commit-path comment
+                            // gives below -- a genuinely new non-null
+                            // primitive that never otherwise sets dr_r.
+                            dr_r   <= 1'b0;
+                        end else begin
+                            ca_r      <= 1'b0;
+                            prim_r    <= PRIM_NULL;
+                            cond_tf_r <= cond_tf_next;
+                        end
                         state_r   <= ST_IDLE;
                     end
 

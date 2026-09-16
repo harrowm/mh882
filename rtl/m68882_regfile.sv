@@ -72,6 +72,17 @@ module m68882_regfile (
     input  logic       fpiar_auto_wr_en,
     input  logic [31:0] fpiar_auto_wr_data,
 
+    // Phase 10: dedicated BSUN-bit-set port (Table 4-20 Note 2: "set the
+    // BSUN bit in the FPSR" -- a single-bit OR, not a full FPSR
+    // overwrite, since a Condition CIR evaluation's own EXC-byte
+    // contribution is scoped to BSUN alone, unlike an arithmetic op's
+    // own commit-time fpsr_next() which legitimately refreshes all 8 EXC
+    // bits together). Composes safely with a same-cycle ctrl_wr_en/FPSR
+    // write below (spliced into that write's own data) rather than
+    // racing it with a second, independent bit-select assignment to the
+    // same register.
+    input  logic       bsun_set_en,
+
     // Direct debug/condition-evaluation read ports (Phase 3's own
     // Condition CIR logic needs FPSR's condition-code byte without going
     // through the chunked ctrl_sel port)
@@ -137,10 +148,12 @@ module m68882_regfile (
             if (ctrl_wr_en) begin
                 unique case (ctrl_wr_sel)
                     2'd0: fpcr_r  <= ctrl_wr_data;
-                    2'd1: fpsr_r  <= ctrl_wr_data;
+                    2'd1: fpsr_r  <= ctrl_wr_data | (bsun_set_en ? 32'h0000_8000 : 32'h0);
                     2'd2: if (!fpiar_auto_wr_en) fpiar_r <= ctrl_wr_data;
                     default: ;
                 endcase
+            end else if (bsun_set_en) begin
+                fpsr_r[15] <= 1'b1;
             end
             // Phase 6: independent of the block above, so an FPSR commit
             // write (ctrl_wr_sel==FPSR) and an FPIAR auto-load can both
