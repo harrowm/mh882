@@ -1618,15 +1618,86 @@ committed result and failed outright (including trivially-should-pass
 cases like `FSIN(+0.0)==+0.0`) until the bound was raised to 3000 —
 comfortably above every entry in the latency table (max 2784, FACOS).
 
-### Phase 9e+ — The remaining log/exp/hyperbolic/inverse-trig set, NOT YET STARTED
+### Phase 9e — FSINCOS, COMPLETE (the dual-register-write plumbing deferred at Phase 9d)
+
+Closes Phase 9d's own deliberate scope cut: FSINCOS ($30-$37) needs a
+SECOND register write in the same instruction (sin to the usual Ry
+destination, cos to a second, opmode-encoded register) — something
+this architecture's slot pipeline had never done before (every other
+op, across all of Phase 4-9d, commits exactly one register write per
+dispatched instruction).
+
+**Encoding**: confirmed directly against Musashi's own `REG_FP[opmode&7]`
+(`m68kfpu.c`) — FSINCOS's own 7-bit extension code has a fixed top
+nibble (`ext[6:3]==4'b0110`, i.e. $30-$37) and the LOW 3 BITS select the
+cos-destination register directly. Since `slotA_op_r` already carries
+the raw 7-bit extension code (Phase 9a's own "op tag IS the Table 4-13
+code" design), no new dispatch-time field was needed — the cos
+destination is just `slotA_op_r[2:0]`, read directly at commit.
+
+**Commit sequencing**: the register file has exactly one APU-facing
+write port (`apu_wr_en`/`apu_wr_sel`/`apu_wr_data`, full 96 bits in one
+cycle — Phase 3's own design, unrelated to the separate 32-bit-chunked
+port the external CIR transfer dialog uses). Rather than add a second
+write port (real extra hardware this project has no other reason to
+build), FSINCOS's own commit spends an EXTRA tick reusing the same
+port sequentially: tick 1 writes sin to the usual Ry destination and
+finalizes FPSR (condition codes computed from sin alone, matching
+Musashi's own single `SET_CONDITION_CODES(REG_FP[dst])` call — cos
+never touches FPSR at all); tick 2 writes cos to `slotA_op_r[2:0]` and
+only THEN reports any trapped exception / promotes slot B / clears the
+slot — the instruction isn't "done" from the host's own point of view
+until both registers have landed. New 1-bit `slotA_sincos_pending_r`
+register drives the two-phase split; no other op's commit path changed
+shape at all (every existing single-tick op still commits in exactly
+one tick, unchanged).
+
+**Timing**: real Table 8-3 total for FSINCOS ("FPn to FPm" column,
+confirmed directly) is 454 cycles = 1816 clk_4x ticks — 60 cycles (240
+ticks) more than FSIN's own 394. `apu_latency()` deliberately returns
+1815 for FSINCOS (ONE tick short of the real total), specifically so
+the commit's own extra cos-write tick brings the total back up to the
+real 1816, not past it — this is the exact inverse of "no cheating
+cycles": undershooting the table by one place-holder tick everywhere
+else would BE cheating, but here the two-tick commit itself is the
+genuinely necessary extra cycle a single write port forces, and
+1815+1=1816 is what makes the OBSERVABLE total match real silicon,
+not an excuse to add cycles nowhere else needed. Verified via a new
+differential timing check in `tb/m68882_apu_tb.sv` (`dispatch_timed`)
+that measures FSIN's and FSINCOS's own real elapsed tick counts through
+the identical harness and checks their DIFFERENCE equals exactly 240 —
+deliberately differential rather than an absolute tick count, since an
+absolute check would also bake in the testbench's own CIR-dialog
+dispatch overhead (confirmed nonzero: FSIN itself measured 1574 ticks,
+not the raw 1576 `apu_latency` value), which isn't what this check is
+trying to verify.
+
+**Reused, not re-derived**: the SIN/COS values themselves reuse the
+exact same `fp_sincos` task Phase 9d already built and verified — no
+new numerical code, only new commit-path plumbing. New tests confirm
+both registers land correctly (`check_close` against the same
+high-precision sin(0.5)/cos(0.5) reference values Phase 9d's own
+FSIN(0.5)/FCOS(0.5) tests already used) and that FPSR reflects sin
+alone. **APU test grew 85→89 checks, `make test` 8/8 suites clean,
+310/310 total.**
+
+Not Musashi-cross-checkable for the dual-write shape itself (Musashi's
+own precision limitation for FSIN/FCOS/FSINCOS is already documented
+separately in
+[`docs/musashi_issue_sincos_precision.md`](docs/musashi_issue_sincos_precision.md),
+and `tools/musashi_fpu_ref.c`'s own harness only ever reads back a
+single destination register, not a second opmode-encoded one — not
+worth extending for a case whose numerical answer is already known to
+be Musashi-imprecise).
+
+### Phase 9f+ — The remaining log/exp/hyperbolic/inverse-trig set, NOT YET STARTED
 
 18 functions (FACOS/FASIN/FATAN/FATANH/FCOSH/FETOX/FETOXM1/FLOGN/
-FLOGNP1/FLOG10/FLOG2/FSINH/FTAN/FTANH/FTENTOX/FTWOTOX, plus FSINCOS's
-own deferred dual-register-write plumbing). Needs a genuine numerical
-algorithm per function (polynomial/rational minimax approximation, or
-argument-reduction + series the way FSIN/FCOS's own `fp_sincos` now
-does) verified to the manual's own ~64 ULP typical / 4096 ULP
-worst-case tolerance. None of these are Musashi-verifiable at all —
+FLOGNP1/FLOG10/FLOG2/FSINH/FTAN/FTANH/FTENTOX/FTWOTOX). Needs a genuine
+numerical algorithm per function (polynomial/rational minimax
+approximation, or argument-reduction + series the way FSIN/FCOS's own
+`fp_sincos` does) verified to the manual's own ~64 ULP typical / 4096
+ULP worst-case tolerance. None of these are Musashi-verifiable at all —
 that emulator's own printed version simply doesn't implement any of
 them (confirmed at Phase 9's own initial research) — so this phase
 needs Python/mpmath-generated reference vectors throughout, the same

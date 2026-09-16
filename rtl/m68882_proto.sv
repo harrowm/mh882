@@ -291,10 +291,24 @@ module m68882_proto (
             7'h28:   return 12'd224;  // FSUB,             56 cyc
             7'h38:   return 12'd152;  // FCMP,             38 cyc
             7'h3A:   return 12'd144;  // FTST,             36 cyc
-            default: return 12'd4;    // FSINCOS ($30-$37) + anything else
-                                       // not yet dispatched into the real
-                                       // pipeline (see cmd_is_* gating --
-                                       // never actually reached today)
+            // FSINCOS ($30-$37): real Table 8-3 total is 454 cyc (×4 =
+            // 1816 ticks, "FPn to FPm" column, confirmed directly),
+            // same for all 8 values -- the low 3 bits only select the
+            // cos-destination register, never affecting timing. Returns
+            // 1815, ONE tick short of that real total: the commit
+            // logic's own two-tick write sequence (sin then cos, since
+            // the register file has only one write port -- see
+            // slotA_sincos_pending_r's own header comment) spends an
+            // extra tick beyond the single-tick commit every other op
+            // uses, and that extra tick is what brings the TOTAL
+            // dispatch-to-completion latency back up to the real 1816 --
+            // not an extra, undocumented cycle on top of it.
+            7'h30, 7'h31, 7'h32, 7'h33, 7'h34, 7'h35, 7'h36, 7'h37:
+                     return 12'd1815; // FSINCOS,   454 cyc total - 1
+            default: return 12'd4;    // anything else not yet dispatched
+                                       // into the real pipeline (see
+                                       // cmd_is_* gating -- never actually
+                                       // reached today)
         endcase
     endfunction
 
@@ -304,6 +318,18 @@ module m68882_proto (
     logic [2:0]  slotA_dest_r;
     logic [1:0]  slotA_round_r;
     logic [11:0] apu_busy_cnt_r;
+    // Phase 9e: FSINCOS ($30-$37) is the one op whose real semantics
+    // need TWO register writes (sin to the usual Ry destination, cos to
+    // a SECOND register the extension word's own low 3 bits select --
+    // slotA_op_r[2:0], since slotA_op_r already holds the raw 7-bit
+    // Table 4-13 extension code and FSINCOS's own encoding packs its
+    // cos-destination directly into those bits, confirmed against
+    // Musashi's own `REG_FP[opmode&7]`). This architecture's commit
+    // logic otherwise always finishes a slot in exactly one tick; this
+    // flag extends FSINCOS's own commit to two, reusing the SAME single
+    // apu_wr_en/apu_wr_sel/apu_wr_data port sequentially rather than
+    // adding a second write port to the register file.
+    logic        slotA_sincos_pending_r;
 
     logic        slotB_valid_r;
     logic [6:0]  slotB_op_r;
@@ -313,6 +339,7 @@ module m68882_proto (
     logic [31:0] slotB_iaddr_r;
 
     wire apu_pipeline_busy = slotA_valid_r || slotB_valid_r;
+    wire slotA_is_fsincos = (slotA_op_r[6:3] == 4'b0110);
 
     // ── Register file ──────────────────────────────────────────────
     logic [2:0]  fp_sel;
@@ -407,6 +434,11 @@ module m68882_proto (
     wire cmd_is_frem    = (cmd_ext_r == 7'h25);
     wire cmd_is_fsin    = (cmd_ext_r == 7'h0E);
     wire cmd_is_fcos    = (cmd_ext_r == 7'h1D);
+    // FSINCOS ($30-$37): top 4 bits fixed at 0110, low 3 bits select the
+    // cos-destination register (Musashi's own `opmode&7`; confirmed
+    // against Table 4-13's own general-instruction-format extension-word
+    // breakdown).
+    wire cmd_is_fsincos = (cmd_ext_r[6:3] == 4'b0110);
 
     // State-frame format words (Section 6.4.2) -- see plan.md/CLAUDE.md
     // for the full derivation; unchanged from Phase 5.
@@ -659,6 +691,23 @@ module m68882_proto (
                 slotA_flag_operr = slotA_sincos_operr; slotA_flag_dz = 1'b0;
                 slotA_flag_ovfl = 1'b0; slotA_flag_unfl = 1'b0; slotA_flag_inex2 = 1'b0;
             end
+            7'h30, 7'h31, 7'h32, 7'h33, 7'h34, 7'h35, 7'h36, 7'h37: begin
+                // FSINCOS: the PRIMARY committed result (into the usual
+                // Ry destination, slotA_dest_r) is the SIN value --
+                // condition codes/exception flags are likewise derived
+                // from sin alone, matching Musashi's own
+                // `SET_CONDITION_CODES(REG_FP[dst])` (dst == the sin
+                // register). The cos value (slotA_cos_result) is written
+                // to a SECOND register on commit's own extra tick below;
+                // it never flows through this flag set at all.
+                slotA_result = slotA_sin_result;
+                slotA_flag_z = is_zero_fpx(unpack_fpx(slotA_sin_result));
+                slotA_flag_n = slotA_sin_result[95] && !slotA_flag_z;
+                slotA_flag_i = is_inf_fpx(unpack_fpx(slotA_sin_result));
+                slotA_flag_nan = is_nan_fpx(unpack_fpx(slotA_sin_result));
+                slotA_flag_operr = slotA_sincos_operr; slotA_flag_dz = 1'b0;
+                slotA_flag_ovfl = 1'b0; slotA_flag_unfl = 1'b0; slotA_flag_inex2 = 1'b0;
+            end
             default: begin // FADD / FSUB / FCMP (identical adder)
                 slotA_result = slotA_addsub_result; slotA_flag_z = slotA_addsub_z; slotA_flag_n = slotA_addsub_n;
                 slotA_flag_i = slotA_addsub_i; slotA_flag_nan = slotA_addsub_nan; slotA_flag_operr = slotA_addsub_operr;
@@ -831,6 +880,7 @@ module m68882_proto (
             slotA_dest_r  <= 3'h0;
             slotA_round_r <= 2'h0;
             apu_busy_cnt_r <= 12'h0;
+            slotA_sincos_pending_r <= 1'b0;
             slotB_valid_r <= 1'b0;
             slotB_op_r    <= 3'h0;
             slotB_a_r     <= 96'h0;
@@ -907,7 +957,7 @@ module m68882_proto (
                                     cmd_is_fint || cmd_is_fintrz || cmd_is_fgetexp ||
                                     cmd_is_fgetman || cmd_is_fscale ||
                                     cmd_is_fsgldiv || cmd_is_fsglmul || cmd_is_fmod || cmd_is_frem ||
-                                    cmd_is_fsin || cmd_is_fcos) begin
+                                    cmd_is_fsin || cmd_is_fcos || cmd_is_fsincos) begin
                                     state_r <= ST_IDLE;
                                     if (!slotA_valid_r) begin
                                         ca_r    <= 1'b0;
@@ -1224,26 +1274,60 @@ module m68882_proto (
             // takes priority over an ordinary same-cycle dispatch ack. ──
             if (slotA_valid_r) begin
                 if (apu_busy_cnt_r <= 12'd1) begin
-                    // Section 4.5.5.1: FCMP compares "as if" FPn-source
-                    // were computed, but FPn itself is never written.
-                    // FTST likewise never writes (source-only, condition
-                    // codes only).
-                    if (slotA_op_r != 7'h38 && slotA_op_r != 7'h3A) begin
-                        apu_wr_en   <= 1'b1;
-                        apu_wr_sel  <= slotA_dest_r;
-                        apu_wr_data <= slotA_result;
-                    end
+                  if (slotA_is_fsincos && !slotA_sincos_pending_r) begin
+                    // FSINCOS tick 1 of 2: write SIN to the usual Ry
+                    // destination and set FPSR from sin's own condition
+                    // codes now (matching Musashi's own single
+                    // SET_CONDITION_CODES(REG_FP[dst]) call, dst==sin) --
+                    // everything else (exception-trap reporting, slot-B
+                    // promotion, FPIAR auto-load) deliberately waits for
+                    // tick 2 below, since the instruction isn't "done"
+                    // from the host's own point of view until BOTH
+                    // registers have landed. apu_busy_cnt_r is re-armed
+                    // to 1 rather than decremented, buying exactly one
+                    // more tick through this same branch.
+                    apu_wr_en   <= 1'b1;
+                    apu_wr_sel  <= slotA_dest_r;
+                    apu_wr_data <= slotA_result; // == slotA_sin_result, via the mux above
                     ctrl_wr_en    <= 1'b1;
                     ctrl_wr_sel_r <= 2'd1; // FPSR
-                    // Section 2.3.2/Figure 2-5: FMOD/FREM ALONE also load
-                    // the FPSR quotient byte (bits[23:16]) -- every other
-                    // instruction's own Status Register table entry reads
-                    // "Quotient Byte: Not affected," confirmed directly.
-                    if (slotA_op_r == 7'h21 || slotA_op_r == 7'h25) begin
-                        ctrl_wr_data <= {slotA_fpsr_next_val[31:24], slotA_modrem_quot_byte,
-                                          slotA_fpsr_next_val[15:0]};
+                    ctrl_wr_data  <= slotA_fpsr_next_val;
+                    slotA_sincos_pending_r <= 1'b1;
+                    apu_busy_cnt_r <= 12'd1;
+                  end else begin
+                    if (slotA_sincos_pending_r) begin
+                        // FSINCOS tick 2 of 2: write COS to the SECOND,
+                        // opmode-encoded register (slotA_op_r[2:0] -- the
+                        // extension word's own low 3 bits, confirmed
+                        // against Musashi's own `REG_FP[opmode&7]`). FPSR
+                        // was already finalized on tick 1; don't re-touch
+                        // it here.
+                        apu_wr_en   <= 1'b1;
+                        apu_wr_sel  <= slotA_op_r[2:0];
+                        apu_wr_data <= slotA_cos_result;
+                        slotA_sincos_pending_r <= 1'b0;
                     end else begin
-                        ctrl_wr_data <= slotA_fpsr_next_val;
+                        // Section 4.5.5.1: FCMP compares "as if" FPn-source
+                        // were computed, but FPn itself is never written.
+                        // FTST likewise never writes (source-only, condition
+                        // codes only).
+                        if (slotA_op_r != 7'h38 && slotA_op_r != 7'h3A) begin
+                            apu_wr_en   <= 1'b1;
+                            apu_wr_sel  <= slotA_dest_r;
+                            apu_wr_data <= slotA_result;
+                        end
+                        ctrl_wr_en    <= 1'b1;
+                        ctrl_wr_sel_r <= 2'd1; // FPSR
+                        // Section 2.3.2/Figure 2-5: FMOD/FREM ALONE also load
+                        // the FPSR quotient byte (bits[23:16]) -- every other
+                        // instruction's own Status Register table entry reads
+                        // "Quotient Byte: Not affected," confirmed directly.
+                        if (slotA_op_r == 7'h21 || slotA_op_r == 7'h25) begin
+                            ctrl_wr_data <= {slotA_fpsr_next_val[31:24], slotA_modrem_quot_byte,
+                                              slotA_fpsr_next_val[15:0]};
+                        end else begin
+                            ctrl_wr_data <= slotA_fpsr_next_val;
+                        end
                     end
                     if (slotA_exc_trap) begin
                         prim_r <= PRIM_TAKE_MID;
@@ -1272,6 +1356,7 @@ module m68882_proto (
                     end else begin
                         slotA_valid_r <= 1'b0;
                     end
+                  end
                 end else begin
                     apu_busy_cnt_r <= apu_busy_cnt_r - 12'd1;
                 end

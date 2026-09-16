@@ -748,13 +748,43 @@ a real testbench bug along the way: the pipeline-drain wait bound
 latency, silently observing still-in-flight results and failing every
 check — bumped to 3000. **306/306 across all eight testbenches** (APU
 grew 69→85 checks; Musashi cosim battery unchanged at 54 vectors,
-FSIN/FCOS deliberately excluded from it per above).
+FSIN/FCOS deliberately excluded from it per above). A fourth Musashi
+finding was also documented separately (not grouped with the other
+three logic bugs, since it's a different kind of issue): FSIN/FCOS/
+FSINCOS round-trip through IEEE `double` (53-bit) precision instead of
+the chip's own 64-bit extended precision — confirmed empirically
+(`docs/musashi_issue_sincos_precision.md`), every sampled result has
+≥11 trailing-zero mantissa bits (the exact 64-53 bit gap), and ULP
+error vs. an independently-computed high-precision reference exceeds
+the manual's own "~64 ULP typical" bound on 7 of 8 samples.
+
+**Phase 9e (FSINCOS) is also complete — closes Phase 9d's own deferred
+dual-register-write scope cut.** FSINCOS needs a genuine second
+register write (sin to the usual Ry destination, cos to a second,
+opmode-encoded register — `slotA_op_r[2:0]`, confirmed against
+Musashi's own `REG_FP[opmode&7]`; no new dispatch-time field needed
+since `slotA_op_r` already carries the raw extension code). The
+register file has exactly one APU-facing write port, so FSINCOS's own
+commit spends one EXTRA tick reusing it sequentially (new 1-bit
+`slotA_sincos_pending_r`: tick 1 writes sin + finalizes FPSR from sin
+alone, matching Musashi's own single `SET_CONDITION_CODES` call; tick 2
+writes cos, then reports any trap / promotes slot B / clears the slot)
+— every other op's single-tick commit is unchanged. `apu_latency()`
+deliberately returns 1815 for FSINCOS, one tick short of the real 1816
+(454 cyc × 4, Table 8-3), specifically so the extra commit tick brings
+the OBSERVABLE total back up to the real hardware number, not past it
+— verified via a new differential timing check (`dispatch_timed`)
+comparing FSIN's and FSINCOS's own measured tick counts rather than an
+absolute count, since an absolute count would also bake in this
+testbench's own nonzero CIR-dialog dispatch overhead. Reuses the exact
+same `fp_sincos` task Phase 9d built — no new numerical code, only new
+commit-path plumbing. **APU test grew 85→89 checks, `make test` 8/8
+suites clean, 310/310 total.**
 
 See `plan.md` for the full phased build plan and the complete list of
-what remains deliberately out of scope (Phase 9e+ — the remaining 18
-log/exp/hyperbolic/inverse-trig functions plus FSINCOS's own deferred
-dual-write plumbing — W/B/P formats, BSUN/INEX1, denormals, and the
-rest).
+what remains deliberately out of scope (Phase 9f+ — the remaining 18
+log/exp/hyperbolic/inverse-trig functions — W/B/P formats, BSUN/INEX1,
+denormals, and the rest).
 
 ```bash
 make test   # builds and runs all eight testbenches via Icarus Verilog

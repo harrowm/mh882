@@ -186,6 +186,24 @@ module m68882_apu_tb;
         repeat (2) @(posedge clk_4x);
     endtask
 
+    // Same as dispatch(), but reports the real elapsed clk_4x tick count
+    // from "instruction address ack" to "slot pipeline empty" -- for a
+    // dedicated cycle-accuracy check (mirrors the timing checks already
+    // done in tb/m68882_pipeline_tb.sv, e.g. its own FDIV 432-tick
+    // check) rather than the ordinary functional dispatch() above,
+    // which only cares that the wait eventually terminates.
+    task automatic dispatch_timed(input logic [31:0] cmdw, output int ticks);
+        logic [31:0] rd2;
+        run_cycle(CIR_COMMAND, 1'b1, cmdw, rd2);
+        run_cycle(CIR_INSTRADDR, 1'b1, 32'h0000_2000, rd2);
+        ticks = 0;
+        while ((u_top.u_proto.slotA_valid_r || u_top.u_proto.slotB_valid_r) && ticks < 3000) begin
+            @(posedge clk_4x);
+            ticks++;
+        end
+        repeat (2) @(posedge clk_4x);
+    endtask
+
     // Shares dispatch()'s own drain-wait logic, for a test that dispatched
     // via raw run_cycle calls directly (to observe mid-flight state) and
     // now just needs to wait for the already-in-flight op to commit.
@@ -650,6 +668,45 @@ module m68882_apu_tb;
         dispatch(cmd_word(3'b000, 3'd0, 3'd1, 7'h1D)); // FCOS(+inf)
         check(u_top.u_proto.u_regfile.fpsr_r[24] == 1'b1, "Phase 9d: FCOS(+inf) NAN condition code set");
         check(u_top.u_proto.u_regfile.fpsr_r[13] == 1'b1, "Phase 9d: FCOS(+inf) OPERR exception-status bit set");
+
+        // ── Phase 9e: FSINCOS ─────────────────────────────────────────
+        // The one real op needing TWO register writes -- ext=$32 (top
+        // nibble $30-$37 fixed = FSINCOS, low 3 bits = 2 selects FP2 as
+        // the cos destination, matching Musashi's own `opmode&7`). Ry=1
+        // (FP1) is the usual sin destination. Reference values are the
+        // SAME high-precision sin(0.5)/cos(0.5) constants already
+        // verified above for FSIN(0.5)/FCOS(0.5).
+        load_fp(0, EXT_0_5);
+        load_fp(1, 96'h0); // sentinel, must be overwritten with sin(0.5)
+        load_fp(2, 96'h0); // sentinel, must be overwritten with cos(0.5)
+        dispatch(cmd_word(3'b000, 3'd0, 3'd1, 7'h32)); // FSINCOS(0.5), cos->FP2
+        check_close(u_top.u_proto.u_regfile.fp_r[1], 96'h3ffd_0000_f57743a2582f7f44,
+                    4096, "Phase 9e: FSINCOS(0.5) sin (FP1, the usual Ry dest) ~= 0.4794255386...");
+        check_close(u_top.u_proto.u_regfile.fp_r[2], 96'h3ffe_0000_e0a94032dbea7cee,
+                    4096, "Phase 9e: FSINCOS(0.5) cos (FP2, the opmode-encoded 2nd dest) ~= 0.8775825619...");
+        check(u_top.u_proto.u_regfile.fpsr_r[24] == 1'b0 && u_top.u_proto.u_regfile.fpsr_r[27] == 1'b0,
+              "Phase 9e: FSINCOS(0.5) condition codes reflect the SIN result only (matching Musashi's own SET_CONDITION_CODES(REG_FP[dst]))");
+
+        // Real Table 8-3 totals ("FPn to FPm" column, confirmed directly)
+        // are FSIN=394 cyc, FSINCOS=454 cyc -- a real 60-cycle (240-tick)
+        // difference, entirely attributable to FSINCOS's own extra
+        // register write. Rather than pin an exact absolute tick count
+        // (which would also bake in this testbench's own CIR-dialog
+        // dispatch overhead, not something this check cares about),
+        // measure BOTH ops through the identical harness and check their
+        // DIFFERENCE against the real, table-derived delta -- this
+        // directly tests whether the 2-tick commit sequence's own extra
+        // tick lands on the real total, independent of dispatch overhead.
+        begin
+            int fsin_ticks, fsincos_ticks;
+            load_fp(0, EXT_0_5);
+            dispatch_timed(cmd_word(3'b000, 3'd0, 3'd1, 7'h0E), fsin_ticks); // FSIN(0.5)
+            load_fp(0, EXT_0_5);
+            dispatch_timed(cmd_word(3'b000, 3'd0, 3'd1, 7'h32), fsincos_ticks); // FSINCOS(0.5)
+            check((fsincos_ticks - fsin_ticks) == 240,
+                  $sformatf("Phase 9e: FSINCOS real Table 8-3 timing: %0d ticks (FSINCOS) - %0d ticks (FSIN) = %0d, want exactly 240 (the real 60-cycle Table 8-3 delta x4 -- the 2-tick dual-register commit landing on the real total, not one tick short or one tick over)",
+                            fsincos_ticks, fsin_ticks, fsincos_ticks - fsin_ticks));
+        end
 
         $display("---");
         $display("%0d passed, %0d failed", pass_count, fail_count);
