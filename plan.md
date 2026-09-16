@@ -1397,18 +1397,69 @@ register-to-register arithmetic space).
 **227/227 across all eight testbenches** (11+27+52+28+32+63+12+2 — APU
 gained 4 new checks).
 
-### Phase 9b — Exact auxiliary ops (FINT/FINTRZ/FGETEXP/FGETMAN/FSCALE), NEXT
+### Phase 9b — Exact auxiliary ops (FINT/FINTRZ/FGETEXP/FGETMAN/FSCALE), COMPLETE
 
-These 5 have exact, well-defined IEEE bit-manipulation semantics, NOT
-subject to the ~64-ULP transcendental tolerance (they're not
-approximations — FINT/FINTRZ round to/toward an integer, FGETEXP/
-FGETMAN split a value into its unbiased exponent and normalized
-mantissa, FSCALE multiplies by a power of 2 via a pure exponent shift).
-Real Table 8-3 latencies already in place from Phase 9a. Plan:
-implement each as a new slot-A op (same pipeline pattern as FABS/FNEG),
-verify FINT/FINTRZ/FGETEXP against Musashi directly (all 3 implemented
-there); FGETMAN/FSCALE against independently-derived Python reference
-values (Musashi doesn't implement either).
+All 5 implemented as new `rtl/m68882_apu.sv` tasks (`fp_int` — shared by
+both FINT and FINTRZ, since FINTRZ is just FINT with the effective
+rounding mode forced to `RND_ZERO` regardless of FPCR, muxed in BEFORE
+the single shared call site rather than adding a second independent
+call to the same task — exactly the class of confirmed Icarus livelock
+Phase 6 already hit once, so this was a real, deliberate design
+constraint, not a style preference; `fp_getexp`; `fp_getman`; `fp_scale`,
+the one genuinely DYADIC auxiliary op, RX=scale factor/RY=value being
+scaled and overwritten, matching `fp_add_sub`'s own RX=source/RY=dest
+convention) and wired into `m68882_proto.sv`'s existing slot-A pipeline
+exactly like FABS/FNEG. `fp_int`'s own integer/fraction boundary
+rounding reuses `round_mantissa` directly and, per the established
+Icarus workaround (`ext_to_int32`, Phase 4c), computes guard/round/
+sticky bits via dynamic shift+mask throughout rather than any
+variable-width part-select. `fp_getexp` reuses `int32_to_ext` directly
+(the real exponent always fits comfortably in 32 bits) rather than
+re-deriving the same int-to-extended conversion a second time.
+`fp_getman` and `fp_scale` are both genuinely EXACT (no rounding at all
+— `fp_getman` is just "keep the mantissa, force the exponent field to
+the bias," `fp_scale` is a pure exponent-field addition with the
+mantissa untouched).
+
+**Two real, confirmed bugs found in Musashi itself while cross-checking
+— genuine independent-verification findings, not bugs in this
+project's own RTL:**
+1. **FGETEXP** (`m68kfpu.c`'s own case `0x1e`): `temp = source.high;`
+   reads the FULL 16-bit field — sign bit AND the 15-bit exponent
+   together — into a signed 16-bit temp WITHOUT masking the sign off
+   first, corrupting the result for any negative or zero source
+   (confirmed directly by inspecting that one line, not assumed; e.g.
+   FGETEXP(-4.0) returns a huge garbage-looking value instead of the
+   correct +2.0). This project's own `fp_getexp` correctly extracts only
+   the 15-bit exponent field via `fpx_t`'s own `.exp`, independent of
+   sign — verified directly in `tb/m68882_apu_tb.sv` instead of via the
+   Musashi battery for this specific case.
+2. **FINT/FINTRZ**: both round-trip through a plain `sint32`
+   intermediate (`floatx80_to_int32[_round_to_zero]` then
+   `int32_to_floatx80`) — a 32-bit integer has no negative-zero
+   representation at all, so ANY negative source that truncates to zero
+   necessarily loses its sign there and comes back +0.0 regardless of
+   what real hardware does. This project's own RTL never goes through an
+   integer intermediate (direct bit manipulation throughout) and
+   correctly preserves the sign — matching IEEE 754-2008's own
+   `roundToIntegralTowardZero`, which explicitly preserves the sign of a
+   zero result. `FINTRZ(-0.75)` (the one vector in the original battery
+   that actually hits this) verified directly instead.
+
+Both findings are exactly what an independent verification harness is
+FOR — confirmed via direct source inspection in both cases, not assumed
+from a mismatching test result, and documented with the same rigor as
+this project's own real bugs (mirroring the FSQRT-default-NaN-pattern
+divergence Phase 7 already found and documented the same way).
+
+`scripts/gen_fpu_vectors.py`'s own battery grew from 31 to 49 vectors
+(18 new: FINT under all 4 rounding modes on tie/non-tie/already-
+integral/zero cases, FINTRZ, FGETEXP on positive sources only — the 2
+Musashi-bug-triggering cases excluded from the shared battery with a
+full inline explanation, tested directly in `tb/m68882_apu_tb.sv`
+instead alongside FGETMAN/FSCALE, neither of which Musashi implements
+at all). **271/271 across all eight testbenches** (11+27+60+28+32+99+
+12+2 — APU gained 8 new checks, Musashi cosim gained 36).
 
 ### Phase 9c+ — The real trig/log/exp set, NOT YET STARTED
 

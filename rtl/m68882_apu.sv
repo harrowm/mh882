@@ -992,4 +992,285 @@ package m68882_apu_pkg;
         end
     endtask
 
+    // ── Phase 9b: exact auxiliary ops (Table 4-13: $01 FINT, $03
+    // FINTRZ, $1E FGETEXP, $1F FGETMAN, $26 FSCALE) -- NOT approximated,
+    // unlike the real trig/log/exp transcendental set (Section 4.3's own
+    // ~64-ULP-typical tolerance does not apply to any of these 5; they
+    // are exact IEEE-shape bit manipulations, like FABS/FNEG). ─────────
+
+    // Truncate (round-toward-zero) an extended-precision value to a
+    // signed integer, saturating at +-32767 for any magnitude beyond
+    // that -- FSCALE's own real exponent field is only 15 bits, so no
+    // legitimate scale factor ever needs a wider range than this; the
+    // saturated value just guarantees the OVFL/UNFL path fires
+    // correctly regardless of the destination's own starting exponent.
+    function automatic logic signed [15:0] trunc_to_int16(fpx_t a);
+        logic signed [17:0] real_exp;
+        logic [6:0]         frac_bits;
+        logic [63:0]        int_part;
+        logic signed [17:0] mag;
+
+        if (is_zero_fpx(a)) return 16'sd0;
+
+        real_exp = $signed({3'b0, a.exp}) - 18'sd16383;
+        if (real_exp < 18'sd0) return 16'sd0; // |a| < 1.0 -- truncates to 0
+        if (real_exp >= 18'sd15) return a.sign ? -16'sd32767 : 16'sd32767; // saturate
+
+        frac_bits = 7'(63 - real_exp);
+        int_part  = a.mant >> frac_bits; // low (real_exp+1) bits hold the truncated magnitude
+        mag       = $signed({3'b0, int_part[14:0]});
+        return a.sign ? -mag[15:0] : mag[15:0];
+    endfunction
+
+    // FINT ($01, uses the caller-supplied rounding mode -- FPCR's own
+    // current setting) / FINTRZ ($03, caller always passes RND_ZERO
+    // regardless of FPCR -- the same task serves both, the only
+    // difference is which rounding mode the caller hands in). Rounds
+    // the source to the nearest/truncated integer VALUE, in the SAME
+    // extended-precision format (not a true integer format -- Section
+    // 4.x's own "round to floating-point integer" framing).
+    task automatic fp_int(
+        input  logic [95:0]  a_raw,
+        input  round_mode_t  rmode,
+        output logic [95:0]  result,
+        output logic         flag_z,
+        output logic         flag_n,
+        output logic         flag_i,
+        output logic         flag_nan,
+        output logic         flag_inex2
+    );
+        fpx_t a;
+        logic signed [17:0] real_exp;
+
+        a = unpack_fpx(a_raw);
+        flag_inex2 = 1'b0;
+
+        if (is_nan_fpx(a) || is_inf_fpx(a) || is_zero_fpx(a)) begin
+            result = a_raw; // already "integral" -- propagate unchanged
+        end else begin
+            real_exp = $signed({3'b0, a.exp}) - 18'sd16383;
+
+            if (real_exp >= 18'sd63) begin
+                result = a_raw; // no fractional bits present at all
+            end else if (real_exp < 18'sd0) begin
+                // |value| < 1.0 -- rounds to a signed zero or +-1.0.
+                // Always inexact (a genuine nonzero value can never
+                // equal its own {0,+-1.0} rounded result).
+                logic round_up;
+                unique case (rmode)
+                    RND_ZERO: round_up = 1'b0;
+                    RND_MINF: round_up = a.sign;
+                    RND_PINF: round_up = !a.sign;
+                    default:  // RND_NEAREST -- exact 0.5 ties to even (0)
+                        round_up = (real_exp == -18'sd1) && (a.mant[62:0] != 63'h0);
+                endcase
+                result = round_up ? {a.sign, 15'd16383, 16'h0, 64'h8000_0000_0000_0000}
+                                   : {a.sign, 15'h0, 16'h0, 64'h0};
+                flag_inex2 = 1'b1;
+            end else begin
+                // 0 <= real_exp < 63: split at the real integer/fraction
+                // boundary. int_part occupies bits [real_exp:0] of a
+                // 64-bit register (all higher bits zero); frac_bits =
+                // 63-real_exp is the fractional-bit count being rounded
+                // away. Uses dynamic shift+mask throughout, NOT a
+                // variable-width part-select (`x.mant[frac_bits-3:0]`)
+                // -- the same established Icarus workaround this
+                // project has needed before (ext_to_int32, Phase 4c).
+                logic [6:0]  frac_bits;
+                logic [63:0] int_part, rounded_int, new_mant, sticky_mask;
+                logic        guard, round_bit, sticky, carry, overflow;
+                logic [17:0] new_real_exp;
+
+                frac_bits   = 7'(63 - real_exp);
+                int_part    = a.mant >> frac_bits;
+                guard       = (frac_bits >= 7'd1) ? ((a.mant >> (frac_bits - 7'd1)) & 64'h1) : 1'b0;
+                round_bit   = (frac_bits >= 7'd2) ? ((a.mant >> (frac_bits - 7'd2)) & 64'h1) : 1'b0;
+                sticky_mask = (frac_bits >= 7'd3) ? ((64'h1 << (frac_bits - 7'd2)) - 64'h1) : 64'h0;
+                sticky      = |(a.mant & sticky_mask);
+
+                round_mantissa(int_part, guard, round_bit, sticky, a.sign, rmode, rounded_int, carry);
+                flag_inex2 = guard | round_bit | sticky;
+
+                // round_mantissa's OWN carry_out only fires if all 64
+                // bits of int_part overflow, which int_part's own
+                // guaranteed-zero top bit (frac_bits>=1 here) makes
+                // unreachable in practice -- the REAL "grew into one
+                // more integer bit" case (e.g. 1.111...->10.000...) is
+                // instead visible directly in rounded_int's own value,
+                // checked here via `overflow` (again dynamic shift+mask,
+                // not a variable-index bit-select).
+                overflow = |((rounded_int >> (real_exp + 18'sd1)) & 64'h1);
+                if (overflow) begin
+                    new_real_exp = real_exp + 18'sd1;
+                    new_mant     = rounded_int << (frac_bits - 7'd1);
+                end else begin
+                    new_real_exp = real_exp;
+                    new_mant     = rounded_int << frac_bits;
+                end
+                result = {a.sign, new_real_exp[14:0] + 15'd16383, 16'h0, new_mant};
+            end
+        end
+
+        begin
+            fpx_t r;
+            r = unpack_fpx(result);
+            flag_z   = is_zero_fpx(r);
+            flag_n   = r.sign && !flag_z;
+            flag_i   = is_inf_fpx(r);
+            flag_nan = is_nan_fpx(r);
+        end
+    endtask
+
+    // FGETEXP ($1E): returns the source's own real (unbiased) exponent,
+    // AS A FLOATING-POINT VALUE (e.g. source=8.0 -> result=3.0). Exact,
+    // no rounding -- the real exponent always fits comfortably in
+    // int32_to_ext's own 32-bit input range, reused directly rather
+    // than re-deriving the same int-to-extended conversion a second
+    // time.
+    task automatic fp_getexp(
+        input  logic [95:0]  a_raw,
+        output logic [95:0]  result,
+        output logic         flag_z,
+        output logic         flag_n,
+        output logic         flag_i,
+        output logic         flag_nan,
+        output logic         flag_operr
+    );
+        fpx_t a;
+        logic signed [17:0] real_exp;
+
+        a = unpack_fpx(a_raw);
+        flag_operr = 1'b0;
+
+        if (is_nan_fpx(a)) begin
+            result = a_raw;
+        end else if (is_inf_fpx(a)) begin
+            // Undefined operation on an infinite operand -- OPERR, same
+            // default-NaN convention as fp_sqrt's own negative-operand
+            // case (Section 4.3's own accuracy scope note applies to
+            // this project's own choice of default-NaN payload, not
+            // confirmed against the manual's real bit pattern -- see
+            // plan.md's own Phase 7 FSQRT-vs-Musashi divergence writeup).
+            flag_operr = 1'b1;
+            result = {1'b0, 15'h7FFF, 16'h0, 64'hC000_0000_0000_0000};
+        end else if (is_zero_fpx(a)) begin
+            result = {a.sign, 15'h0, 16'h0, 64'h0}; // sign-preserving zero
+        end else begin
+            real_exp = $signed({3'b0, a.exp}) - 18'sd16383;
+            int32_to_ext({{14{real_exp[17]}}, real_exp}, result);
+        end
+
+        begin
+            fpx_t r;
+            r = unpack_fpx(result);
+            flag_z   = is_zero_fpx(r);
+            flag_n   = r.sign && !flag_z;
+            flag_i   = is_inf_fpx(r);
+            flag_nan = is_nan_fpx(r);
+        end
+    endtask
+
+    // FGETMAN ($1F): returns the source's own normalized mantissa, in
+    // [1,2) -- exact, no rounding at all. This project's own internal
+    // format ALREADY stores the mantissa exactly this way (explicit
+    // integer bit at bit63, Table 3-3), so the whole operation is just
+    // "keep the mantissa, force the exponent field to the bias" (2^0).
+    task automatic fp_getman(
+        input  logic [95:0]  a_raw,
+        output logic [95:0]  result,
+        output logic         flag_z,
+        output logic         flag_n,
+        output logic         flag_i,
+        output logic         flag_nan,
+        output logic         flag_operr
+    );
+        fpx_t a;
+        a = unpack_fpx(a_raw);
+        flag_operr = 1'b0;
+
+        if (is_nan_fpx(a)) begin
+            result = a_raw;
+        end else if (is_inf_fpx(a)) begin
+            flag_operr = 1'b1;
+            result = {1'b0, 15'h7FFF, 16'h0, 64'hC000_0000_0000_0000};
+        end else if (is_zero_fpx(a)) begin
+            result = a_raw; // signed zero preserved
+        end else begin
+            result = {a.sign, 15'd16383, 16'h0, a.mant};
+        end
+
+        begin
+            fpx_t r;
+            r = unpack_fpx(result);
+            flag_z   = is_zero_fpx(r);
+            flag_n   = r.sign && !flag_z;
+            flag_i   = is_inf_fpx(r);
+            flag_nan = is_nan_fpx(r);
+        end
+    endtask
+
+    // FSCALE ($26): FPn = FPn * 2^trunc(FPm) -- a genuinely DYADIC
+    // auxiliary op (unlike FINT/FGETEXP/FGETMAN, all monadic). `a` is
+    // the source (RX, the scale factor); `b` is the destination
+    // accumulator (RY, the value being scaled AND overwritten) --
+    // matching fp_add_sub's own "RX=source, RY=dest" convention exactly.
+    // Exact, no rounding -- purely an exponent shift, mantissa
+    // untouched. Edge cases the manual doesn't fully specify (an
+    // infinite or NaN scale factor) are this project's own reasonable,
+    // documented choice: NaN propagates (a before b, matching this
+    // project's own established tie-break elsewhere); an infinite scale
+    // factor is handled naturally by trunc_to_int16's own saturation
+    // (which already guarantees OVFL/UNFL fires regardless of b's own
+    // starting exponent).
+    task automatic fp_scale(
+        input  logic [95:0]  a_raw,
+        input  logic [95:0]  b_raw,
+        output logic [95:0]  result,
+        output logic         flag_z,
+        output logic         flag_n,
+        output logic         flag_i,
+        output logic         flag_nan,
+        output logic         flag_ovfl,
+        output logic         flag_unfl
+    );
+        fpx_t a, b;
+        logic signed [17:0] new_exp_biased;
+        logic signed [15:0] k;
+
+        a = unpack_fpx(a_raw);
+        b = unpack_fpx(b_raw);
+        flag_ovfl = 1'b0;
+        flag_unfl = 1'b0;
+
+        if (is_nan_fpx(a)) begin
+            result = a_raw;
+        end else if (is_nan_fpx(b)) begin
+            result = b_raw;
+        end else if (is_zero_fpx(b) || is_inf_fpx(b)) begin
+            result = b_raw; // scaling zero or infinity by any finite factor: unchanged
+        end else begin
+            k = trunc_to_int16(a);
+            new_exp_biased = $signed({3'b0, b.exp}) + {{2{k[15]}}, k};
+
+            if (new_exp_biased >= 18'sd32767) begin
+                flag_ovfl = 1'b1;
+                result = {b.sign, 15'h7FFF, 16'h0, 64'h8000_0000_0000_0000};
+            end else if (new_exp_biased <= 18'sd0) begin
+                flag_unfl = 1'b1;
+                result = {b.sign, 15'h0, 16'h0, 64'h0};
+            end else begin
+                result = {b.sign, new_exp_biased[14:0], 16'h0, b.mant};
+            end
+        end
+
+        begin
+            fpx_t r;
+            r = unpack_fpx(result);
+            flag_z   = is_zero_fpx(r);
+            flag_n   = r.sign && !flag_z;
+            flag_i   = is_inf_fpx(r);
+            flag_nan = is_nan_fpx(r);
+        end
+    endtask
+
 endpackage

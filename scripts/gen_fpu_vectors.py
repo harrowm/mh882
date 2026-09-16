@@ -35,6 +35,13 @@ VALUES = {
     "0.0":  (0x0000, 0x0000000000000000),
     "+inf": (0x7fff, 0x8000000000000000),
     "qnan": (0x7fff, 0xc000000000000001),
+    # Phase 9b additions
+    "2.5":   (0x4000, 0xa000000000000000),
+    "-2.5":  (0xc000, 0xa000000000000000),
+    "0.75":  (0x3ffe, 0xc000000000000000),
+    "-0.75": (0xbffe, 0xc000000000000000),
+    "8.0":   (0x4002, 0x8000000000000000),
+    "-8.0":  (0xc002, 0x8000000000000000),
 }
 
 # (ext, name, rx, ry, round) -- round: 0=Nearest,1=Zero,2=-Inf,3=+Inf
@@ -72,6 +79,47 @@ CASES = [
     (0x20, "FDIV",  "2.0",  "3.0",  1),
     (0x20, "FDIV",  "2.0",  "3.0",  2),
     (0x20, "FDIV",  "2.0",  "3.0",  3),
+    # Phase 9b: exact auxiliary ops (FINT/FINTRZ/FGETEXP). ry is unused
+    # (all 3 are monadic) but still required by the vector format.
+    (0x01, "FINT",   "2.5",   "0.0", 0), # nearest, exact tie -> even (2.0)
+    (0x01, "FINT",   "2.5",   "0.0", 1), # toward zero -> 2.0
+    (0x01, "FINT",   "2.5",   "0.0", 2), # toward -inf -> 2.0
+    (0x01, "FINT",   "2.5",   "0.0", 3), # toward +inf -> 3.0
+    (0x01, "FINT",   "-2.5",  "0.0", 0), # nearest, exact tie -> even (-2.0)
+    (0x01, "FINT",   "-2.5",  "0.0", 2), # toward -inf -> -3.0 (away from zero)
+    (0x01, "FINT",   "-2.5",  "0.0", 3), # toward +inf -> -2.0 (toward zero)
+    (0x01, "FINT",   "0.75",  "0.0", 0), # nearest, not a tie -> 1.0
+    (0x01, "FINT",   "-0.75", "0.0", 0), # nearest, not a tie -> -1.0
+    (0x01, "FINT",   "8.0",   "0.0", 0), # already integral -> unchanged
+    (0x01, "FINT",   "0.0",   "0.0", 0),
+    (0x03, "FINTRZ", "2.5",   "0.0", 0), # always truncates regardless of round field -> 2.0
+    (0x03, "FINTRZ", "-2.5",  "0.0", 0), # -> -2.0
+    (0x03, "FINTRZ", "0.75",  "0.0", 0), # -> 0.0
+    # FINTRZ(-0.75) deliberately excluded: Musashi's own FINT/FINTRZ
+    # (m68kfpu.c) round-trip through a plain sint32 intermediate
+    # (floatx80_to_int32[_round_to_zero] then int32_to_floatx80) --
+    # confirmed by direct inspection, not assumed -- and a plain 32-bit
+    # integer has no negative-zero representation at all, so ANY
+    # negative source that truncates to zero necessarily loses its sign
+    # there and comes back +0.0, regardless of what real hardware does.
+    # This project's own RTL never goes through an integer intermediate
+    # (direct bit manipulation throughout) and preserves the sign, per
+    # the standard round-toward-zero convention (IEEE 754-2008's own
+    # roundToIntegralTowardZero explicitly preserves the sign of a
+    # zero result). Tested directly in tb/m68882_apu_tb.sv instead.
+    (0x03, "FINTRZ", "8.0",   "0.0", 0), # already integral -> unchanged
+    # FGETEXP: POSITIVE, nonzero sources only -- a real, confirmed Musashi
+    # bug (tools/musashi/m68kfpu.c's own FGETEXP case, `temp =
+    # source.high` reads the sign bit into the exponent value UNMASKED,
+    # corrupting the result for any negative or zero source; confirmed by
+    # direct inspection of that one line, not assumed) means this vector
+    # battery can only cross-check the cases where that bug doesn't
+    # trigger. Negative/zero-source FGETEXP is instead tested directly in
+    # tb/m68882_apu_tb.sv with a hand-derived expected value -- see that
+    # file's own comment for the full writeup.
+    (0x1E, "FGETEXP", "8.0",  "0.0", 0), # 8.0 = 1.0*2^3 -> 3.0
+    (0x1E, "FGETEXP", "0.75", "0.0", 0), # 0.75 = 1.5*2^-1 -> -1.0
+    (0x1E, "FGETEXP", "1.0",  "0.0", 0), # 1.0 = 1.0*2^0 -> 0.0
 ]
 
 

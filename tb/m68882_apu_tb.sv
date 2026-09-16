@@ -125,6 +125,10 @@ module m68882_apu_tb;
     localparam logic [95:0] EXT_2_25 = 96'h4000_0000_9000_0000_0000_0000;
     localparam logic [95:0] EXT_N3_0 = 96'hc000_0000_c000_0000_0000_0000;
     localparam logic [95:0] EXT_0_25 = 96'h3ffd_0000_8000_0000_0000_0000;
+    localparam logic [95:0] EXT_N0_75 = 96'hbffe_0000_c000_0000_0000_0000;
+    localparam logic [95:0] EXT_12_0  = 96'h4002_0000_c000_0000_0000_0000;
+    localparam logic [95:0] EXT_N8_0  = 96'hc002_0000_8000_0000_0000_0000;
+    localparam logic [95:0] EXT_N4_0  = 96'hc001_0000_8000_0000_0000_0000;
 
     logic [31:0] rd;
 
@@ -432,6 +436,64 @@ module m68882_apu_tb;
         dispatch(cmd_word(3'b000, 3'd0, 3'd1, 7'h00)); // FMOVE FP0,FP1
         check(u_top.u_proto.u_regfile.fp_r[1] == EXT_N3_0, "Phase 9: FMOVE FP0,FP1 copies the source value (-3.0) to the destination");
         check(u_top.u_proto.u_regfile.fpsr_r[27] == 1'b1, "Phase 9: FMOVE sets the N condition code for a negative moved value");
+
+        // ── Phase 9b: FGETMAN ($1F) -- extract the normalized mantissa in
+        // [1,2) as a float. Not in Musashi's own opcode set at all (never
+        // implemented there), so verified here directly instead of via
+        // the Musashi cosim battery.
+        load_fp(0, EXT_N8_0);
+        dispatch(cmd_word(3'b000, 3'd0, 3'd1, 7'h1F)); // FGETMAN -8.0
+        check(u_top.u_proto.u_regfile.fp_r[1] == EXT_N1_0, "Phase 9b: FGETMAN(-8.0) == -1.0 (sign preserved, mantissa already 1.0)");
+
+        load_fp(0, EXT_6_0);
+        dispatch(cmd_word(3'b000, 3'd0, 3'd1, 7'h1F)); // FGETMAN 6.0
+        check(u_top.u_proto.u_regfile.fp_r[1] == EXT_1_5, "Phase 9b: FGETMAN(6.0) == 1.5 (6.0 = 1.5 * 2^2)");
+
+        // ── Phase 9b: FSCALE ($26) -- dyadic (RX=scale factor, RY=dest
+        // value being scaled). Also not in Musashi's own opcode set.
+        load_fp(0, EXT_2_0); // scale factor: trunc(2.0) = 2
+        load_fp(1, EXT_3_0); // value being scaled (and overwritten)
+        dispatch(cmd_word(3'b000, 3'd0, 3'd1, 7'h26)); // FSCALE
+        check(u_top.u_proto.u_regfile.fp_r[1] == EXT_12_0, "Phase 9b: FSCALE(2.0, 3.0) == 3.0 * 2^2 == 12.0");
+
+        load_fp(0, EXT_N1_0); // scale factor: trunc(-1.0) = -1
+        load_fp(1, EXT_3_0);
+        dispatch(cmd_word(3'b000, 3'd0, 3'd1, 7'h26)); // FSCALE
+        check(u_top.u_proto.u_regfile.fp_r[1] == EXT_1_5, "Phase 9b: FSCALE(-1.0, 3.0) == 3.0 * 2^-1 == 1.5");
+
+        // ── Phase 9b: FGETEXP on a negative and a zero source --
+        // deliberately EXCLUDED from the Musashi cosim battery (a real,
+        // confirmed Musashi bug: m68kfpu.c's own FGETEXP reads
+        // `source.high` -- the sign bit AND the exponent together --
+        // straight into a signed 16-bit temp without masking the sign
+        // off first, corrupting the result for any negative or zero
+        // source; confirmed by direct inspection of that one line, not
+        // assumed). This project's own rtl/m68882_apu.sv correctly
+        // extracts only the 15-bit exponent field (fpx_t's own `.exp`),
+        // independent of the source's sign -- verified here directly.
+        load_fp(0, EXT_N4_0);
+        dispatch(cmd_word(3'b000, 3'd0, 3'd1, 7'h1E)); // FGETEXP -4.0
+        check(u_top.u_proto.u_regfile.fp_r[1] == EXT_2_0,
+              "Phase 9b: FGETEXP(-4.0) == +2.0 (the exponent's own sign is independent of the source's sign -- NOT the Musashi bug's -32766-ish garbage)");
+
+        load_fp(0, 96'h0);
+        dispatch(cmd_word(3'b000, 3'd0, 3'd1, 7'h1E)); // FGETEXP 0.0
+        check(u_top.u_proto.u_regfile.fp_r[1] == 96'h0, "Phase 9b: FGETEXP(0.0) == 0.0 (not the Musashi bug's garbage result)");
+
+        // ── Phase 9b: FINTRZ(-0.75) -- deliberately EXCLUDED from the
+        // Musashi cosim battery: Musashi's own FINT/FINTRZ round-trip
+        // through a plain sint32 intermediate (floatx80_to_int32[_
+        // round_to_zero] then int32_to_floatx80), and a 32-bit integer
+        // has no negative-zero representation, so any negative source
+        // that truncates to zero necessarily comes back +0.0 there
+        // regardless of what real hardware does. This project's own RTL
+        // never goes through an integer intermediate and preserves the
+        // sign, matching IEEE 754-2008's own roundToIntegralTowardZero
+        // (explicitly sign-preserving for a zero result).
+        load_fp(0, EXT_N0_75);
+        dispatch(cmd_word(3'b000, 3'd0, 3'd1, 7'h03)); // FINTRZ -0.75
+        check(u_top.u_proto.u_regfile.fp_r[1] == {1'b1, 95'h0}, "Phase 9b: FINTRZ(-0.75) == -0.0 (sign preserved on truncation to zero)");
+        check(u_top.u_proto.u_regfile.fpsr_r[26] == 1'b1, "Phase 9b: FINTRZ(-0.75) sets the Z condition code (a signed zero is still zero)");
 
         $display("---");
         $display("%0d passed, %0d failed", pass_count, fail_count);

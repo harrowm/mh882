@@ -395,7 +395,12 @@ module m68882_proto (
     wire cmd_is_fabs  = (cmd_ext_r == 7'h18);
     wire cmd_is_fneg  = (cmd_ext_r == 7'h1A);
     wire cmd_is_fsqrt = (cmd_ext_r == 7'h04);
-    wire cmd_is_fmove = (cmd_ext_r == 7'h00);
+    wire cmd_is_fmove   = (cmd_ext_r == 7'h00);
+    wire cmd_is_fint    = (cmd_ext_r == 7'h01);
+    wire cmd_is_fintrz  = (cmd_ext_r == 7'h03);
+    wire cmd_is_fgetexp = (cmd_ext_r == 7'h1E);
+    wire cmd_is_fgetman = (cmd_ext_r == 7'h1F);
+    wire cmd_is_fscale  = (cmd_ext_r == 7'h26);
 
     // State-frame format words (Section 6.4.2) -- see plan.md/CLAUDE.md
     // for the full derivation; unchanged from Phase 5.
@@ -466,6 +471,33 @@ module m68882_proto (
                 slotA_sqrt_operr, slotA_sqrt_ovfl, slotA_sqrt_unfl, slotA_sqrt_inex2);
     end
 
+    // Phase 9b: exact auxiliary ops. FINT/FINTRZ share ONE fp_int() call
+    // site (a second, independent call site of the same task is exactly
+    // the class of confirmed Icarus livelock Phase 6 already hit once --
+    // APU_OP_CMP's own header comment -- so FINTRZ's "always round
+    // toward zero regardless of FPCR" requirement is expressed by muxing
+    // the EFFECTIVE rounding mode into the single shared call instead of
+    // adding a second call).
+    logic [1:0] slotA_int_round_bits;
+    assign slotA_int_round_bits = (slotA_op_r == 7'h03) ? 2'b01 /* RND_ZERO */ : slotA_round_r;
+
+    logic [95:0] slotA_int_result, slotA_getexp_result, slotA_getman_result, slotA_scale_result;
+    logic        slotA_int_z, slotA_int_n, slotA_int_i, slotA_int_nan, slotA_int_inex2;
+    logic        slotA_getexp_z, slotA_getexp_n, slotA_getexp_i, slotA_getexp_nan, slotA_getexp_operr;
+    logic        slotA_getman_z, slotA_getman_n, slotA_getman_i, slotA_getman_nan, slotA_getman_operr;
+    logic        slotA_scale_z, slotA_scale_n, slotA_scale_i, slotA_scale_nan, slotA_scale_ovfl, slotA_scale_unfl;
+
+    always_comb begin
+        fp_int(slotA_a_r, round_mode_t'(slotA_int_round_bits),
+               slotA_int_result, slotA_int_z, slotA_int_n, slotA_int_i, slotA_int_nan, slotA_int_inex2);
+        fp_getexp(slotA_a_r, slotA_getexp_result, slotA_getexp_z, slotA_getexp_n, slotA_getexp_i,
+                  slotA_getexp_nan, slotA_getexp_operr);
+        fp_getman(slotA_a_r, slotA_getman_result, slotA_getman_z, slotA_getman_n, slotA_getman_i,
+                  slotA_getman_nan, slotA_getman_operr);
+        fp_scale(slotA_a_r, slotA_b_r, slotA_scale_result, slotA_scale_z, slotA_scale_n, slotA_scale_i,
+                 slotA_scale_nan, slotA_scale_ovfl, slotA_scale_unfl);
+    end
+
     // FABS/FNEG (trivial sign-bit ops) and FTST/FMOVE (no real ALU work
     // at all) need no genuine arithmetic core -- computed directly here,
     // off the CAPTURED slotA_a_r, same as every other slot-A op.
@@ -523,6 +555,34 @@ module m68882_proto (
                 slotA_flag_i = slotA_a_i; slotA_flag_nan = slotA_a_nan;
                 slotA_flag_operr = 1'b0; slotA_flag_dz = 1'b0; slotA_flag_ovfl = 1'b0;
                 slotA_flag_unfl = 1'b0; slotA_flag_inex2 = 1'b0;
+            end
+            7'h01, 7'h03: begin // FINT / FINTRZ
+                slotA_result = slotA_int_result;
+                slotA_flag_z = slotA_int_z; slotA_flag_n = slotA_int_n;
+                slotA_flag_i = slotA_int_i; slotA_flag_nan = slotA_int_nan;
+                slotA_flag_operr = 1'b0; slotA_flag_dz = 1'b0; slotA_flag_ovfl = 1'b0;
+                slotA_flag_unfl = 1'b0; slotA_flag_inex2 = slotA_int_inex2;
+            end
+            7'h1E: begin // FGETEXP
+                slotA_result = slotA_getexp_result;
+                slotA_flag_z = slotA_getexp_z; slotA_flag_n = slotA_getexp_n;
+                slotA_flag_i = slotA_getexp_i; slotA_flag_nan = slotA_getexp_nan;
+                slotA_flag_operr = slotA_getexp_operr; slotA_flag_dz = 1'b0; slotA_flag_ovfl = 1'b0;
+                slotA_flag_unfl = 1'b0; slotA_flag_inex2 = 1'b0;
+            end
+            7'h1F: begin // FGETMAN
+                slotA_result = slotA_getman_result;
+                slotA_flag_z = slotA_getman_z; slotA_flag_n = slotA_getman_n;
+                slotA_flag_i = slotA_getman_i; slotA_flag_nan = slotA_getman_nan;
+                slotA_flag_operr = slotA_getman_operr; slotA_flag_dz = 1'b0; slotA_flag_ovfl = 1'b0;
+                slotA_flag_unfl = 1'b0; slotA_flag_inex2 = 1'b0;
+            end
+            7'h26: begin // FSCALE (dyadic: slotA_a_r=RX=scale factor, slotA_b_r=RY=value+dest)
+                slotA_result = slotA_scale_result;
+                slotA_flag_z = slotA_scale_z; slotA_flag_n = slotA_scale_n;
+                slotA_flag_i = slotA_scale_i; slotA_flag_nan = slotA_scale_nan;
+                slotA_flag_operr = 1'b0; slotA_flag_dz = 1'b0; slotA_flag_ovfl = slotA_scale_ovfl;
+                slotA_flag_unfl = slotA_scale_unfl; slotA_flag_inex2 = 1'b0;
             end
             default: begin // FADD / FSUB / FCMP (identical adder)
                 slotA_result = slotA_addsub_result; slotA_flag_z = slotA_addsub_z; slotA_flag_n = slotA_addsub_n;
@@ -759,7 +819,9 @@ module m68882_proto (
                                            // Table 8-3 latency.
                                 if (cmd_is_fadd || cmd_is_fsub || cmd_is_fmul ||
                                     cmd_is_fdiv || cmd_is_fsqrt || cmd_is_fcmp ||
-                                    cmd_is_fabs || cmd_is_fneg || cmd_is_ftst || cmd_is_fmove) begin
+                                    cmd_is_fabs || cmd_is_fneg || cmd_is_ftst || cmd_is_fmove ||
+                                    cmd_is_fint || cmd_is_fintrz || cmd_is_fgetexp ||
+                                    cmd_is_fgetman || cmd_is_fscale) begin
                                     state_r <= ST_IDLE;
                                     if (!slotA_valid_r) begin
                                         ca_r    <= 1'b0;

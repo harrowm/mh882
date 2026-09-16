@@ -682,10 +682,23 @@ fast but not instant — they now share the same real pipeline slot every
 other opclass-000 op uses). Auditing the full opcode space this way also
 found a real, previously-undiscovered bug: FMOVE (register-to-register,
 ext=$00) silently did nothing at all, never caught since no test had
-checked its actual result. Both fixed, with new regression tests. See
-plan.md's own Phase 9 section for the full derivation, the complete
-opcode table, and the Phase 9b/9c+ plan (exact auxiliary ops next, the
-real trig/log/exp set after that). **227/227 across all eight
+checked its actual result. Both fixed, with new regression tests.
+**227/227 across all eight testbenches.**
+
+**Phase 9b (exact auxiliary ops: FINT/FINTRZ/FGETEXP/FGETMAN/FSCALE) is
+also complete.** All 5 wired into the same slot-A pipeline as FABS/FNEG.
+Found 2 real, confirmed bugs in Musashi itself while cross-checking (not
+in this project's own RTL) — genuine independent-verification findings:
+`FGETEXP` reads the sign bit into the exponent value unmasked,
+corrupting negative/zero sources; `FINT`/`FINTRZ` round-trip through a
+plain `sint32` intermediate, which has no negative-zero representation,
+so a negative source that truncates to zero always comes back +0.0
+there regardless of real hardware. Both confirmed by direct source
+inspection, both documented and worked around in the test battery
+(tested directly instead of via the Musashi comparison for those
+specific cases). See plan.md's own Phase 9 section for the full
+derivation, the complete opcode table, and the Phase 9c+ plan (the real
+trig/log/exp set, not yet started). **271/271 across all eight
 testbenches.**
 
 See `plan.md` for the full phased build plan and the complete list of
