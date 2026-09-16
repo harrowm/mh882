@@ -3,13 +3,12 @@
 
 import m68882_cir_pkg::*;
 
-// MC68882 CIR register storage -- Control/Restore/Save/Instruction-
-// Address/Operand-Address only (Phase 2, Phase 5/6 territory for the
-// Restore/Save/Instruction-Address dialogs themselves). Response,
-// Command, Condition, Operand, and Register Select moved to
-// m68882_proto.sv (Phase 3) -- those five are the ones with genuine
-// instruction-dialog protocol behind them; this module keeps the
-// simpler, still-mostly-storage-only registers.
+// MC68882 CIR register storage -- Control/Instruction-Address/Operand-
+// Address only. Response, Command, Condition, Operand, and Register
+// Select moved to m68882_proto.sv (Phase 3); Save/Restore moved there
+// too (Phase 5, the FSAVE/FRESTORE state-frame dialog) since they turned
+// into a genuine instruction dialog, not simple storage -- this module
+// keeps only the registers with no real dialog behind them.
 //
 // Correct per-register width and the real D16-D31 data-lane placement
 // (Section 9.8's own explicit note: every 16-bit CIR always lives on
@@ -51,7 +50,6 @@ module m68882_cir (
     output logic         abort       // one-tick pulse on every Control CIR write
 );
 
-    logic [15:0] restore_r;
     logic [31:0] instraddr_r;
     logic [31:0] opndaddr_r;
 
@@ -73,12 +71,10 @@ module m68882_cir (
 
     always_ff @(posedge clk_4x or negedge rst_n) begin
         if (!rst_n) begin
-            restore_r   <= '0;
             instraddr_r <= '0;
             opndaddr_r  <= '0;
         end else if (write_pulse) begin
             case (cyc_sel)
-                CIR_RESTORE:   restore_r   <= d_in[31:16]; // 16-bit CIR, D16-D31 lane
                 CIR_INSTRADDR: instraddr_r <= d_in[31:0];
                 CIR_OPNDADDR:  opndaddr_r  <= d_in[31:0];
                 default: ; // CIR_CONTROL handled above (abort only, no storage
@@ -91,15 +87,14 @@ module m68882_cir (
         d_out = 32'h0000_0000;
         d_oe  = 1'b0;
         case (cyc_sel)
-            CIR_SAVE:      begin d_oe = read_strobe; d_out = 32'h0000_0000; end // Phase 5 stub
-            CIR_RESTORE:   begin d_oe = read_strobe; d_out = {restore_r, 16'h0000}; end
             CIR_OPNDADDR:  begin d_oe = read_strobe; d_out = opndaddr_r; end // R/W but
                                                     // dead/unimplemented on real
                                                     // silicon -- modeled as plain
                                                     // storage anyway, never actually
                                                     // referenced by the real protocol
-            default: ; // Control/Instruction-Address (write-only) and reserved
-                       // offsets: no read path, d_oe stays 0
+            default: ; // Control/Instruction-Address (write-only), Save/Restore
+                       // (moved to m68882_proto.sv), and reserved offsets: no
+                       // read path here, d_oe stays 0
         endcase
     end
 

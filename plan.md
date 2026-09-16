@@ -1,6 +1,6 @@
 # MC68882 FPU — Phased Scope Plan
 
-## Status: Phases 0-3 complete. Phase 4a/4b (core arithmetic, transcendentals deferred)/4c (L/S/D/X conversion, W/B/P remain)/4d (exception/accrued-byte semantics) all complete. Phase 5 (state frame save/restore) is next.
+## Status: Phases 0-4 complete (4a/4b core arithmetic, transcendentals deferred; 4c L/S/D/X conversion, W/B/P remain; 4d exception/accrued-byte semantics). Phase 5 (state frame save/restore) complete. Phase 6 (68882-specific pipelining) is next.
 
 ## Origin
 
@@ -762,11 +762,106 @@ already catalogued but never wired to fire) — a natural candidate for
 Phase 6's own pipelining work, where the primitive-selection logic
 already lives.
 
-### Phase 5 — State frame save/restore
-FSAVE/FRESTORE Null/Idle/Busy frame generation and parsing, both
-chip-variant sizes (68882's extra 32-byte CU-state block after the
-format word). Needed for any context-switch testing against a host CPU
-later.
+### Phase 5 — State frame save/restore (COMPLETE)
+
+**A significant finding before implementation started**: re-reading
+Section 6.4.2's own frame-content figures (not just the sizes Phase 0
+had already recorded) revealed that the Idle/Busy state frame does
+**NOT** contain the FP0-7/FPCR/FPSR/FPIAR register file at all — the
+frame's own listed fields (Exceptional Operand, Command/Condition
+Register, Operand Register, BIU Flags, and — 68882-only — 32 bytes of
+CU Internal Registers) are all genuinely internal/microarchitectural
+state, invisible to ordinary FMOVE/FMOVEM. This is dimensionally
+confirmed too: FP0-7 alone is 96 bytes, more than even the 68881's own
+180-byte Busy frame would comfortably re-derive if it also had to hold
+FPCR/FPSR/FPIAR — the numbers only make sense once the register file is
+excluded. A real OS context switch is expected to call FSAVE/FRESTORE
+for the hidden state AND separately FMOVEM the visible registers as its
+own step. This directly shaped the implementation below: this project
+has no real internal microarchitectural state yet (Phase 6, not built),
+so the frame's own payload is a documented, zero-filled placeholder —
+only the protocol SHAPE (format word, sizes, classification, validation,
+round-trip) is real.
+
+**Implementation**: `rtl/m68882_regfile.sv` gained `fpiar_o` (a direct
+FPIAR read, alongside the existing `fpsr_o`/`fpcr_o`), `all_zero_o` (is
+the WHOLE programmer's model genuinely zero — needed to classify Null
+vs. Idle), and `null_reset_en` (a pulse that clears every register the
+same way `rst_n` does, for the Null-frame-restore case below). Save/
+Restore CIR ownership moved from `rtl/m68882_cir.sv` (Phase 2's own
+simple-storage model) into `rtl/m68882_proto.sv`, since they turned into
+a genuine instruction dialog, matching Response/Command/Condition/
+Operand/Register-Select's own precedent from Phase 3.
+
+Two new dialog states, `ST_WAIT_SAVE_XFER`/`ST_WAIT_RESTORE_XFER`, plus
+a `frame_words_left_r` counter (wide enough for the Busy frame's own 52
+longwords). Confirmed format-word constants (Section 6.4.2): Null =
+16'h0000 (the one value the general M68000 coprocessor interface itself
+defines and every coprocessor must recognize identically); Idle/Busy use
+this project's own version byte (0x1F, NOT confirmed against real 68882
+silicon — there's no real internal state for the payload to hold anyway)
+with size bytes computed per the manual's own confirmed "the size value
+does not include the format word or reserved word" rule (52/208, i.e.
+56/212 total minus the 4-byte header).
+
+**Save dialog** (Section 7.2.3): a Save CIR read is legal at any time
+except during an already-active frame transfer — deliberately the ONLY
+CIR in this whole project that does NOT gate on `state_r==ST_IDLE`,
+since capturing a genuinely BUSY dialog is exactly what the Busy frame
+exists for. Classifies Null (via `all_zero_o`, only when otherwise idle)
+vs. Idle vs. Busy (`state_r != ST_IDLE`), returns the matching format
+word, and (for Idle/Busy) arms the placeholder-payload Operand CIR
+transfer; Null needs no further transfer at all ("the FPCP is in the
+reset state, and the next expected access is to the command or
+condition CIR").
+
+**Restore dialog** (Section 7.2.4): a write latches and validates the
+format word; the FOLLOWING read echoes it back (success) or returns an
+"invalid format" marker (this project's own placeholder, 16'hFFFF, not
+confirmed against a real numeric code — not located in this project's
+own manual extraction). A valid Null restore pulses `null_reset_en`
+(Section 6.4.2.1: "the programmer's model is set to the reset state" —
+confirmed this means the WHOLE model, not just hidden internal state);
+a valid Idle/Busy restore arms the same placeholder-payload transfer,
+this time as Operand CIR writes (accepted and discarded, since there's
+no real internal state yet to restore into).
+
+**Two real bugs found via simulation, not inspection**:
+1. `CIR_RESTORE`'s own combinational read-drive asserted `d_oe`
+   unconditionally, including during a WRITE cycle — genuine bus
+   contention against the host's own driven write data. Manifested as
+   the write data reading back as X specifically on the D16-D31 half
+   (exactly where the DUT's own competing readback value collided with
+   it) — caught by a dedicated smoke-test failure, traced tick-by-tick
+   via hierarchical signal dumps until the contention became visible.
+2. `null_reset_en` was asserted but never cleared anywhere — no
+   default-clear each cycle, no reset-branch initialization (unlike
+   every other one-tick control pulse in this module, which all follow
+   an established `<= 1'b0` default-clear pattern). Left as originally
+   written, this would have permanently held the ENTIRE register file in
+   a reset state after the very first Null-frame restore, since
+   `m68882_regfile.sv`'s own `if (!rst_n || null_reset_en)` branch would
+   never have gone false again. Found by inspection while adding the
+   reset-value initialization for the OTHER new Phase 5 registers
+   (`restore_fmt_r`/`restore_valid_r`/`restore_is_null_r`, which had the
+   same missing-initialization gap but not the same catastrophic
+   always-on consequence) — a good reminder to check every new
+   registered pulse against the established default-clear convention,
+   not just the ones a test happens to exercise.
+
+**Verified**: `tb/m68882_frame_tb.sv` (new, 28/28 checks) — Null vs.
+Idle classification from a genuinely-empty vs. populated register file;
+the Idle frame's own 13-longword placeholder payload (each confirmed
+individually as the documented zero); an invalid Restore format word
+correctly rejected; a valid Idle-frame restore's own round trip
+(including that the dialog machinery is genuinely usable again
+afterward — a real Command CIR dialog works normally right after);
+and a Null-frame restore confirmed to actually clear a previously-
+nonzero FPCR. Plus the existing suite (11+27+48 = 86/86) confirmed
+unaffected, after updating one Phase 2 smoke test that had relied on
+Restore CIR's own old raw-storage behavior (now a real dialog, repurposed
+into a genuine Phase 5 protocol check instead of a generic bus-timing
+one). **114/114 across all four testbenches.**
 
 ### Phase 6 — 68882-specific pipelining (BIU → CU → APU overlap)
 The genuine 68882 differentiator (Section 5.1.1, confirmed above): the

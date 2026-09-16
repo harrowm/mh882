@@ -83,11 +83,13 @@ module m68882_proto (
 
     // ── Dialog state (declared before the register-file wiring below,
     // since reg_idx_r/chunk_idx_r are referenced there) ────────────────
-    typedef enum logic [1:0] {
+    typedef enum logic [2:0] {
         ST_IDLE,
-        ST_WAIT_XFER,       // single EA / FPcr transfer(s) in progress
-        ST_WAIT_REGSEL,     // multi-register move: mask ready to be read
-        ST_WAIT_MULTI_XFER  // multi-register move: transferring longwords
+        ST_WAIT_XFER,        // single EA / FPcr transfer(s) in progress
+        ST_WAIT_REGSEL,      // multi-register move: mask ready to be read
+        ST_WAIT_MULTI_XFER,  // multi-register move: transferring longwords
+        ST_WAIT_SAVE_XFER,   // Phase 5: FSAVE, transferring the state-frame payload out
+        ST_WAIT_RESTORE_XFER // Phase 5: FRESTORE, transferring the state-frame payload in
     } state_t;
 
     state_t      state_r;
@@ -110,6 +112,14 @@ module m68882_proto (
                                 // the last chunk. SUPPLY: pre-converted bytes, staged once
                                 // at command dispatch, read out chunk by chunk.
 
+    // Phase 5: FSAVE/FRESTORE state-frame dialog own state.
+    logic [5:0] frame_words_left_r; // remaining Operand CIR longwords in the
+                                     // current state-frame payload transfer
+                                     // (up to 52, the 68882 Busy frame)
+    logic [15:0] restore_fmt_r;     // format word latched from the last Restore CIR write
+    logic        restore_valid_r;   // did that format word validate?
+    logic        restore_is_null_r; // was it specifically the Null format word?
+
     // ── Register file ──────────────────────────────────────────────
     logic [2:0]  fp_sel;
     logic [1:0]  fp_chunk_idx;
@@ -125,6 +135,9 @@ module m68882_proto (
     logic [31:0] ctrl_wr_data;
     logic [31:0] fpsr_o;
     logic [31:0] fpcr_o;
+    logic [31:0] fpiar_o;
+    logic        all_zero_o;
+    logic        null_reset_en;
     logic [2:0]  apu_a_sel, apu_b_sel;
     logic [95:0] apu_a_rd, apu_b_rd;
     logic        apu_wr_en;
@@ -137,7 +150,7 @@ module m68882_proto (
         .fp_wr_sel(fp_wr_sel_r), .fp_wr_chunk(fp_wr_chunk_r), .fp_wr_en, .fp_wr_data,
         .ctrl_sel, .ctrl_rd_data,
         .ctrl_wr_sel(ctrl_wr_sel_r), .ctrl_wr_en, .ctrl_wr_data,
-        .fpsr_o, .fpcr_o,
+        .fpsr_o, .fpcr_o, .fpiar_o, .all_zero_o, .null_reset_en,
         .apu_a_sel, .apu_b_sel, .apu_a_rd, .apu_b_rd,
         .apu_wr_en, .apu_wr_sel, .apu_wr_data
     );
@@ -179,6 +192,29 @@ module m68882_proto (
     wire is_fabs = (c_ext == 7'h18);
     wire is_fneg = (c_ext == 7'h1A);
     wire is_fsqrt = (c_ext == 7'h04);
+
+    // Phase 5: state-frame format words (Section 6.4.2). The Null format
+    // word (16'h0000) is the one value the M68000 coprocessor interface
+    // itself defines and every coprocessor must recognize identically
+    // (confirmed directly). The Idle/Busy version byte (0x1F) and the
+    // size bytes (52/208 -- Idle=56 and Busy=212 TOTAL bytes each, minus
+    // the 4-byte format-word+reserved-word header the manual's own "size
+    // does not include the format word or reserved word" rule excludes)
+    // are THIS PROJECT'S OWN choice, not confirmed against real 68882
+    // silicon's own version-number value -- there is no internal
+    // microarchitectural state in this project yet for the payload
+    // itself to hold (Section 6.4.2's own Idle/Busy fields -- exceptional
+    // operand latch, BIU flags, internal command/condition register
+    // copies -- are all genuinely internal state, confirmed NOT to
+    // include the visible FP0-7/FPCR/FPSR/FPIAR registers at all), so the
+    // payload is a documented, zero-filled placeholder; only the
+    // protocol SHAPE (format word, sizes, Null-vs-Idle-vs-Busy
+    // classification, round-trip validation) is real.
+    localparam logic [15:0] FRAME_NULL_FMT = 16'h0000;
+    localparam logic [15:0] FRAME_IDLE_FMT = {8'h1F, 8'd52};
+    localparam logic [15:0] FRAME_BUSY_FMT = {8'h1F, 8'd208};
+    localparam logic [5:0]  FRAME_IDLE_WORDS = 6'd13; // 52 bytes / 4
+    localparam logic [5:0]  FRAME_BUSY_WORDS = 6'd52; // 208 bytes / 4
 
     // FCMP (Table 4-13 $38): condition codes as if FPn-source were
     // computed (real fp_add_sub subtraction), but the result is
@@ -419,6 +455,11 @@ module m68882_proto (
             multi_ctrl_r  <= 1'b0;
             xfer_fmt_r    <= 3'h0;
             xfer_stage_r  <= 96'h0;
+            frame_words_left_r <= 6'h0;
+            restore_fmt_r      <= 16'h0;
+            restore_valid_r    <= 1'b0;
+            restore_is_null_r  <= 1'b0;
+            null_reset_en <= 1'b0;
             fp_wr_en      <= 1'b0;
             fp_wr_sel_r   <= 3'h0;
             fp_wr_chunk_r <= 2'h0;
@@ -431,6 +472,7 @@ module m68882_proto (
             fp_wr_en   <= 1'b0;
             ctrl_wr_en <= 1'b0;
             apu_wr_en  <= 1'b0;
+            null_reset_en <= 1'b0;
 
             if (abort) begin
                 state_r <= ST_IDLE;
@@ -600,7 +642,80 @@ module m68882_proto (
                         end
                     end
 
-                    CIR_OPERAND: if (state_r == ST_WAIT_XFER || state_r == ST_WAIT_MULTI_XFER) begin
+                    // Phase 5: FSAVE dialog (Section 7.2.3). A read is
+                    // legal at any time EXCEPT during an already-active
+                    // state-frame transfer; unlike every other CIR this
+                    // module owns, it deliberately does NOT gate on
+                    // state_r==ST_IDLE, since capturing a genuinely BUSY
+                    // dialog is exactly what the Busy frame is for.
+                    CIR_SAVE: if (!cyc_write &&
+                                  state_r != ST_WAIT_SAVE_XFER && state_r != ST_WAIT_RESTORE_XFER) begin
+                        if (all_zero_o && state_r == ST_IDLE) begin
+                            // Null: "the FPCP is in the reset state, and
+                            // the next expected access is to the command
+                            // or condition CIR" -- no Operand CIR transfer.
+                            state_r <= ST_IDLE;
+                        end else if (state_r == ST_IDLE) begin
+                            frame_words_left_r <= FRAME_IDLE_WORDS;
+                            state_r            <= ST_WAIT_SAVE_XFER;
+                        end else begin
+                            // a genuine dialog was in progress -- Busy frame
+                            frame_words_left_r <= FRAME_BUSY_WORDS;
+                            state_r            <= ST_WAIT_SAVE_XFER;
+                        end
+                    end
+
+                    // Phase 5: FRESTORE dialog (Section 7.2.4). The host
+                    // writes the format word first; the FOLLOWING read
+                    // reports validation success/failure and (if valid)
+                    // advances the dialog.
+                    CIR_RESTORE: begin
+                        if (cyc_write && state_r == ST_IDLE) begin
+                            restore_fmt_r     <= d_in[31:16];
+                            restore_is_null_r <= (d_in[31:16] == FRAME_NULL_FMT);
+                            restore_valid_r   <= (d_in[31:16] == FRAME_NULL_FMT) ||
+                                                  (d_in[31:16] == FRAME_IDLE_FMT) ||
+                                                  (d_in[31:16] == FRAME_BUSY_FMT);
+                        end else if (!cyc_write && state_r == ST_IDLE) begin
+                            if (restore_valid_r) begin
+                                if (restore_is_null_r) begin
+                                    // Section 6.4.2.1: restoring the Null
+                                    // frame resets the WHOLE programmer's
+                                    // model, not just the internal state.
+                                    null_reset_en <= 1'b1;
+                                    state_r       <= ST_IDLE;
+                                end else begin
+                                    frame_words_left_r <= (restore_fmt_r == FRAME_BUSY_FMT)
+                                                           ? FRAME_BUSY_WORDS : FRAME_IDLE_WORDS;
+                                    state_r            <= ST_WAIT_RESTORE_XFER;
+                                end
+                            end else begin
+                                // invalid format word -- stay idle; a real
+                                // host is expected to write an abort to the
+                                // Control CIR next (Section 7.2.4), which
+                                // this project's own Control CIR (Phase 3's
+                                // unconditional-abort model) already handles
+                                // unconditionally regardless of dialog state.
+                                state_r <= ST_IDLE;
+                            end
+                        end
+                    end
+
+                    CIR_OPERAND: if (state_r == ST_WAIT_SAVE_XFER || state_r == ST_WAIT_RESTORE_XFER) begin
+                        // Phase 5: FSAVE/FRESTORE payload transfer. Fully
+                        // self-contained (its own state-advance logic, not
+                        // shared with the chunks_left_r-based block below)
+                        // since frame_words_left_r is a differently-sized
+                        // counter with no relationship to chunks_left_r's
+                        // own stale value from whatever dialog last used
+                        // it. Placeholder payload both directions (see
+                        // FRAME_IDLE_FMT's own header comment) -- reads
+                        // return zero (driven combinationally below),
+                        // writes are accepted and discarded; either way
+                        // there is no real internal state yet to latch.
+                        if (frame_words_left_r <= 6'd1) state_r <= ST_IDLE;
+                        else frame_words_left_r <= frame_words_left_r - 6'd1;
+                    end else if (state_r == ST_WAIT_XFER || state_r == ST_WAIT_MULTI_XFER) begin
                         if (!dr_r) begin
                             // RECEIVE: latch host-supplied data into the register file
                             if (is_ctrl_reg_r) begin
@@ -699,7 +814,42 @@ module m68882_proto (
                 d_oe  = 1'b1;
                 d_out = {mask_r, 24'h0}; // MS 8 bits = mask, rest zero (Section 7.2.9)
             end
-            CIR_OPERAND: if (dr_r && (state_r == ST_WAIT_XFER || state_r == ST_WAIT_MULTI_XFER)) begin
+            CIR_SAVE: begin
+                // Phase 5: the format word for whichever frame type
+                // applies right now (Null/Idle/Busy) -- combinational,
+                // since the actual dialog state transition happens in
+                // the always_ff block above; this just needs to present
+                // the correct value AT the ack tick.
+                d_oe = 1'b1;
+                if (state_r != ST_IDLE) begin
+                    d_out = {FRAME_BUSY_FMT, 16'h0};
+                end else if (all_zero_o) begin
+                    d_out = {FRAME_NULL_FMT, 16'h0};
+                end else begin
+                    d_out = {FRAME_IDLE_FMT, 16'h0};
+                end
+            end
+            CIR_RESTORE: if (!cyc_write) begin
+                // Phase 5: echo the validated format word back (success),
+                // or an "invalid format" marker (Section 7.2.4) -- this
+                // project's own placeholder for that marker, 16'hFFFF,
+                // is NOT confirmed against a real numeric code from the
+                // manual (not located in this project's own extraction).
+                // BUG FOUND VIA SIMULATION: this branch originally
+                // asserted d_oe unconditionally, including during a
+                // WRITE cycle -- genuine bus contention against the
+                // host's own driven write data (the host's data showed
+                // as X on the D16-D31 half specifically, exactly where
+                // this readback value collided with it).
+                d_oe  = 1'b1;
+                d_out = {(restore_valid_r ? restore_fmt_r : 16'hFFFF), 16'h0};
+            end
+            CIR_OPERAND: if (state_r == ST_WAIT_SAVE_XFER) begin
+                // Phase 5: placeholder payload (see FRAME_IDLE_FMT's own
+                // header comment) -- always zero.
+                d_oe  = 1'b1;
+                d_out = 32'h0;
+            end else if (dr_r && (state_r == ST_WAIT_XFER || state_r == ST_WAIT_MULTI_XFER)) begin
                 d_oe  = 1'b1;
                 if (is_ctrl_reg_r) begin
                     d_out = ctrl_rd_data;

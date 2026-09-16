@@ -56,6 +56,16 @@ module m68882_regfile (
     // through the chunked ctrl_sel port)
     output logic [31:0] fpsr_o,
     output logic [31:0] fpcr_o,
+    output logic [31:0] fpiar_o,
+
+    // Phase 5: does an FRESTORE-of-a-null-frame need to reset the WHOLE
+    // programmer's model? -- Section 6.4.2.1: "the programmer's model is
+    // set to the reset state" (all zero). all_zero_o lets the Save CIR
+    // dialog classify Null vs Idle without its own separate read port
+    // for all 8 FP registers; null_reset_en is a one-tick pulse that
+    // clears every register the same way rst_n does.
+    output logic         all_zero_o,
+    input  logic          null_reset_en,
 
     // Whole-register FP0-7 ports for the APU (Phase 4) -- arithmetic
     // needs both source operands available combinationally in the SAME
@@ -78,11 +88,16 @@ module m68882_regfile (
 
     assign fpsr_o   = fpsr_r;
     assign fpcr_o   = fpcr_r;
+    assign fpiar_o  = fpiar_r;
     assign apu_a_rd = fp_r[apu_a_sel];
     assign apu_b_rd = fp_r[apu_b_sel];
+    assign all_zero_o = (fpcr_r == 32'h0) && (fpsr_r == 32'h0) && (fpiar_r == 32'h0) &&
+                         (fp_r[0] == 96'h0) && (fp_r[1] == 96'h0) && (fp_r[2] == 96'h0) &&
+                         (fp_r[3] == 96'h0) && (fp_r[4] == 96'h0) && (fp_r[5] == 96'h0) &&
+                         (fp_r[6] == 96'h0) && (fp_r[7] == 96'h0);
 
     always_ff @(posedge clk_4x or negedge rst_n) begin
-        if (!rst_n) begin
+        if (!rst_n || null_reset_en) begin
             for (int i = 0; i < 8; i++) fp_r[i] <= '0;
             fpcr_r  <= '0;
             fpsr_r  <= '0;

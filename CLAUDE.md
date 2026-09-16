@@ -274,19 +274,21 @@ m68882_top            Pin-compatible top level. clk_4x is a plain port (Phase 1
 ├── m68882_cir_pkg      CIR offset constants, port-size/DSACK-encoding tables, command-word
 │                       and data-format decode, Response Primitive encoding — single source
 │                       of truth (IMPLEMENTED, Phases 2-3)
-├── m68882_cir          Control/Restore/Save/Instruction-Address/Operand-Address storage
-│                       (IMPLEMENTED, Phase 2 — 32-bit-port only, see Current State)
+├── m68882_cir          Control/Instruction-Address/Operand-Address storage (IMPLEMENTED,
+│                       Phase 2 — 32-bit-port only, see Current State; Save/Restore moved
+│                       to m68882_proto below, Phase 5, once they became a real dialog)
 ├── m68882_proto        Response/Command/Condition/Operand/Register-Select CIR instruction
 │                       dialog (IMPLEMENTED, Phase 3 — genuine command-word decode for all
-│                       6 opclasses; arithmetic/format-conversion stubbed, see Current State)
+│                       6 opclasses) + Save/Restore CIR FSAVE/FRESTORE state-frame dialog
+│                       (IMPLEMENTED, Phase 5 — real protocol shape, placeholder payload
+│                       content, see Current State)
 ├── m68882_regfile      FP0-FP7 (96-bit each), FPCR, FPSR, FPIAR (IMPLEMENTED, Phase 3)
 ├── m68882_cu           Conversion unit (format conversion, 68882-only pipeline stage) (Phase 6)
-├── m68882_apu          Arithmetic processing unit. FADD/FSUB/FMUL/FDIV/FABS/FNEG/
-│                       FCMP/FTST/FSQRT register-to-register IMPLEMENTED (Phase 4a/4b,
-│                       real extended-precision arithmetic, all 4 rounding modes); the
-│                       transcendental set and format conversion still Phase 4b/4c
-│                       (see Current State/plan.md)
-└── m68882_frame        FSAVE/FRESTORE state-frame generation and parsing (Phase 5)
+└── m68882_apu          Arithmetic processing unit. FADD/FSUB/FMUL/FDIV/FABS/FNEG/FCMP/
+                        FTST/FSQRT register-to-register + L/S/D/X external-operand format
+                        conversion all IMPLEMENTED (Phase 4a/4b/4c, real extended-precision
+                        arithmetic, all 4 rounding modes); the transcendental set and W/B/P
+                        formats remain (see Current State/plan.md)
 ```
 
 Keep each module under ~3000 lines, matching MH030's own guideline.
@@ -513,8 +515,29 @@ when FPCR's ENABLE byte requests one for a set EXC bit — a natural
 Phase 6 candidate, since that's where the Response Primitive selection
 logic (Take-Pre/Mid-Instruction-Exception) already lives.
 
-See `plan.md` for the full phased build plan. Phase 5 (state frame
-save/restore) is next.
+**Phase 5 (FSAVE/FRESTORE state-frame dialog) is also complete.** A
+significant finding before implementation: the Idle/Busy state frame
+does NOT contain FP0-7/FPCR/FPSR/FPIAR at all (confirmed both from the
+manual's own field figures and dimensionally — FP0-7 alone is 96 bytes,
+more than the 68881's own 180-byte Busy frame could hold alongside
+FPCR/FPSR/FPIAR too) — the frame is genuinely internal/microarchitectural
+state (exceptional operand latch, BIU flags, etc.), invisible to ordinary
+FMOVE/FMOVEM. Since this project has no real internal state yet (Phase 6
+territory), the frame payload is a documented, zero-filled placeholder;
+only the protocol SHAPE (format word, sizes, Null/Idle/Busy
+classification, validation, round-trip, and a Null-restore genuinely
+resetting the WHOLE register file per Section 6.4.2.1) is real. Save/
+Restore CIR ownership moved from `m68882_cir.sv` into `m68882_proto.sv`
+once they became a genuine dialog. Two real bugs found via simulation:
+a combinational read-drive that asserted `d_oe` even during a WRITE
+cycle (genuine bus contention, caught via the write data reading back
+as X); and a control pulse (`null_reset_en`) that was set but never
+cleared, which would have permanently held the whole register file in
+reset after the first Null-frame restore. `tb/m68882_frame_tb.sv` (new,
+28/28 checks). **114/114 across all four testbenches.**
+
+See `plan.md` for the full phased build plan. Phase 6 (68882-specific
+pipelining) is next.
 
 ```bash
 make test   # builds and runs all three testbenches via Icarus Verilog
