@@ -1886,20 +1886,61 @@ singularity, where reduced precision is expected and still comfortably
 inside `ulp_tol=4096`). **APU test grew 119→142 checks, `make test`
 8/8 suites clean, 363/363 total.**
 
-### Phase 9i+ — FACOS/FASIN/FATAN/FATANH, NOT YET STARTED
+### Phase 9i — FATAN/FASIN/FACOS/FATANH, COMPLETE — closes Phase 9 in full
 
-The last 4 functions of the original ~28-function transcendental set.
-Needs its own argument-reduction-plus-series or identity-based
-approach now that both `fp_sincos` (Phase 9d) and `fp_logn_core` (Phase
-9h) exist as building blocks: `atan(x)` via its own series with range
-reduction (e.g. `atan(x) = atan(1) - atan((1-x)/(1+x))` for `|x|` far
-from 0, mirroring the same "reduce to a small argument, then a
-converging series" shape every other transcendental here uses);
-`asin(x)=atan(x/sqrt(1-x^2))`; `acos(x)=pi/2-asin(x)`;
-`atanh(x)=0.5*ln((1+x)/(1-x))` (direct reuse of `fp_logn_core`, same
-shape as `fp_tanh` reusing `fp_exp_core`). All verified to the manual's
-own ~64 ULP typical / 4096 ULP worst-case tolerance via the same
-Python/Decimal reference-vector + `check_close` methodology every
-earlier Phase 9 sub-phase established (not Musashi-verifiable either).
-Closes the ENTIRE original ~28-function MC68881/2 transcendental
-instruction set once landed.
+The last 4 functions of the original ~28-function MC68881/2
+transcendental instruction set. **Every transcendental this project set
+out to implement is now implemented.**
+
+**`fp_atan` (the one function here with a genuinely new series, not
+pure composition)**: reciprocal reduction (`|x|>1` →
+`atan(x)=pi/2-atan(1/x)`, reusing `PI_OVER_2` from `fp_sincos`) then a
+half-angle reduction — the real identity `tan(theta/2) =
+x/(1+sqrt(1+x^2))` for `x=tan(theta)`, halving the argument once and
+mapping `[0,1]` to `[0,tan(pi/8)]≈[0,0.4142]` — before a 24-term Horner
+series in `w=x'^2`. Independently verified (Python, `Decimal`, 80
+digits, this time sanity-checked against well-known closed forms like
+`atan(1)=pi/4` BEFORE trusting it, learning Phase 9h's own lesson) to
+truncation error ~3e-21 at the worst case, comfortably inside the
+~6.9e-18 target — needing MORE terms (24) than `fp_logn_core`'s own 18,
+since only one half-angle reduction is applied here (vs. the log
+series' own full `[1,2)`-mantissa reduction), leaving a slightly larger
+worst-case argument.
+
+**`fp_asin`/`fp_acos`/`fp_atanh` are pure composition, no new series**,
+the same shape `fp_tanh`/`fp_sinh`/`fp_cosh` already established for
+the hyperbolic family: `asin(x)=atan(x/sqrt(1-x^2))` (reusing `fp_atan`
+and the existing `fp_sqrt`), `acos(x)=pi/2-asin(x)`,
+`atanh(x)=0.5*ln((1+x)/(1-x))` (direct reuse of `fp_logn_core`).
+
+**One real, manual-confirmed subtlety in `fp_atanh`**: naive composition
+gives `atanh(+1)=0.5*ln(2/0)=+inf` and `atanh(-1)=0.5*ln(0/2)=-inf` —
+but Table 6-3's own "Trap Disabled Results" text is explicit that the
+documented result at each exact boundary has the OPPOSITE sign
+("return a +infinity if the source operand is -1; or a -infinity if
+the source operand is +1"). Confirmed directly against the manual, not
+assumed, and implemented as an explicit override at the exact `±1`
+boundary rather than trusting the natural composition through that
+singularity — a genuine case where the documented hardware behavior
+diverges from the "obvious" mathematical limit.
+
+**Testing**: 32 new checks (numeric `check_close` against independent,
+sanity-checked Python/`Decimal` references for all 4 functions,
+including FATAN's own reciprocal-reduction path, FASIN's own exact-`±1`
+special case avoiding `sqrt(1-1)=0`, and FATANH's own reversed-sign
+boundary check). Measured accuracy 0-1 ULP across every numeric
+vector — the tightest of any Phase 9 sub-phase. **APU test grew
+142→164 checks, `make test` 8/8 suites clean, 385/385 total.**
+
+**This closes Phase 9 (the transcendental instruction set) in full.**
+Every function in Table 4-13's own extension-code map that has a real
+numerical algorithm now has one, verified either against Musashi
+(FSIN/FCOS/FSINCOS/FMOD/FREM/FSGLDIV/FSGLMUL, plus 4 confirmed Musashi
+bugs found and documented along the way) or, for everything Musashi
+doesn't implement, against independent Python/`Decimal` high-precision
+references. What remains genuinely out of scope for this project is
+listed in CLAUDE.md's own "what's left after this" survey from the
+start of Phase 9 (W/B/P integer/packed-decimal formats, BSUN/INEX1,
+denormals, exponent-overflow traps, and the MH030-side coprocessor-
+conditional-instruction gap) — none of it a transcendental-instruction
+gap any more.

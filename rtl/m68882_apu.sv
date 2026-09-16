@@ -2511,4 +2511,270 @@ package m68882_apu_pkg;
         end
     endtask
 
+    // ── Phase 9i: FATAN ($0A) / FASIN ($0C) / FACOS ($1C) / FATANH
+    // ($0D) -- the last 4 functions of the original ~28-function
+    // transcendental set.
+    //
+    // fp_atan's own algorithm: reciprocal reduction (|x|>1 ->
+    // atan(x)=pi/2-atan(1/x), reusing `PI_OVER_2` from `fp_sincos`) then
+    // a half-angle reduction (x'=x/(1+sqrt(1+x^2)), the real identity
+    // tan(theta/2)=x/(1+sqrt(1+x^2)) for x=tan(theta) -- halves the
+    // argument once, mapping [0,1] to [0,tan(pi/8)]~=[0,0.4142]) before
+    // a 24-term Horner series in w=x'^2 -- independently verified in
+    // Python (Decimal, 80 digits) to truncation error ~3e-21 at the
+    // worst case x'~=0.4142, comfortably inside the ~6.9e-18 target
+    // (needing MORE terms than fp_logn_core's own 18, since atan's
+    // series also lacks factorial-accelerated convergence and this
+    // task only applies ONE half-angle reduction, not an iterated one,
+    // leaving a slightly larger worst-case argument than fp_logn_core's
+    // own |t|<=1/3).
+    //
+    // fp_asin reuses fp_atan directly via the identity
+    // asin(x)=atan(x/sqrt(1-x^2)); fp_acos reuses fp_asin via
+    // acos(x)=pi/2-asin(x); fp_atanh reuses fp_logn_core directly via
+    // atanh(x)=0.5*ln((1+x)/(1-x)) -- no new series for any of the
+    // three, pure composition of already-verified building blocks, the
+    // same shape fp_tanh/fp_sinh/fp_cosh already established for the
+    // hyperbolic family.
+    localparam logic [95:0] ATAN_C0  = 96'hbff9_0000_ae4c415c9882b931; // w^23
+    localparam logic [95:0] ATAN_C1  = 96'h3ff9_0000_b60b60b60b60b60b; // w^22
+    localparam logic [95:0] ATAN_C2  = 96'hbff9_0000_be82fa0be82fa0bf; // w^21
+    localparam logic [95:0] ATAN_C3  = 96'h3ff9_0000_c7ce0c7ce0c7ce0c; // w^20
+    localparam logic [95:0] ATAN_C4  = 96'hbff9_0000_d20d20d20d20d20d; // w^19
+    localparam logic [95:0] ATAN_C5  = 96'h3ff9_0000_dd67c8a60dd67c8a; // w^18
+    localparam logic [95:0] ATAN_C6  = 96'hbff9_0000_ea0ea0ea0ea0ea0f; // w^17
+    localparam logic [95:0] ATAN_C7  = 96'h3ff9_0000_f83e0f83e0f83e10; // w^16
+    localparam logic [95:0] ATAN_C8  = 96'hbffa_0000_8421084210842108; // w^15
+    localparam logic [95:0] ATAN_C9  = 96'h3ffa_0000_8d3dcb08d3dcb08d; // w^14
+    localparam logic [95:0] ATAN_C10 = 96'hbffa_0000_97b425ed097b425f; // w^13
+    localparam logic [95:0] ATAN_C11 = 96'h3ffa_0000_a3d70a3d70a3d70a; // w^12
+    localparam logic [95:0] ATAN_C12 = 96'hbffa_0000_b21642c8590b2164; // w^11
+    localparam logic [95:0] ATAN_C13 = 96'h3ffa_0000_c30c30c30c30c30c; // w^10
+    localparam logic [95:0] ATAN_C14 = 96'hbffa_0000_d79435e50d79435e; // w^9
+    localparam logic [95:0] ATAN_C15 = 96'h3ffa_0000_f0f0f0f0f0f0f0f1; // w^8
+    localparam logic [95:0] ATAN_C16 = 96'hbffb_0000_8888888888888889; // w^7
+    localparam logic [95:0] ATAN_C17 = 96'h3ffb_0000_9d89d89d89d89d8a; // w^6
+    localparam logic [95:0] ATAN_C18 = 96'hbffb_0000_ba2e8ba2e8ba2e8c; // w^5
+    localparam logic [95:0] ATAN_C19 = 96'h3ffb_0000_e38e38e38e38e38e; // w^4
+    localparam logic [95:0] ATAN_C20 = 96'hbffc_0000_9249249249249249; // w^3
+    localparam logic [95:0] ATAN_C21 = 96'h3ffc_0000_cccccccccccccccd; // w^2
+    localparam logic [95:0] ATAN_C22 = 96'hbffd_0000_aaaaaaaaaaaaaaab; // w^1
+    localparam logic [95:0] ATAN_C23 = 96'h3fff_0000_8000000000000000; // w^0
+
+    // atan(x_in) for x_in ALREADY known to be in [0,1] -- the shared
+    // half-angle+series core, used both by fp_atan's own general case
+    // (after its own reciprocal reduction settles x_in into [0,1]) and
+    // directly wherever else a [0,1]-domain atan is needed.
+    task automatic atan_series_01(
+        input  logic [95:0]  x_in,
+        output logic [95:0]  atan_x
+    );
+        logic [95:0] x2, sum1, s, den, xp, w, tmp, acc;
+        logic [95:0] atan_coeff [0:23];
+        logic pz, pn, pi_, pnan, poperr, povfl, punfl, pinex2;
+        logic rz, rn, ri, rnan, roperr, rovfl, runfl, rinex2;
+        logic sz, sn, si, snan, soperr, sovfl, sunfl, sinex2;
+        logic qz, qn, qi, qnan, qoperr, qdz, qovfl, qunfl, qinex2;
+        int i;
+        atan_coeff = '{ATAN_C0, ATAN_C1, ATAN_C2, ATAN_C3, ATAN_C4, ATAN_C5, ATAN_C6, ATAN_C7,
+                       ATAN_C8, ATAN_C9, ATAN_C10, ATAN_C11, ATAN_C12, ATAN_C13, ATAN_C14, ATAN_C15,
+                       ATAN_C16, ATAN_C17, ATAN_C18, ATAN_C19, ATAN_C20, ATAN_C21, ATAN_C22, ATAN_C23};
+
+        fp_mul(x_in, x_in, RND_NEAREST, x2, pz, pn, pi_, pnan, poperr, povfl, punfl, pinex2); // x^2
+        fp_add_sub(ONE_EXT, x2, 1'b0, RND_NEAREST, sum1, rz, rn, ri, rnan, roperr, rovfl, runfl, rinex2); // 1+x^2
+        fp_sqrt(sum1, RND_NEAREST, s, sz, sn, si, snan, soperr, sovfl, sunfl, sinex2); // sqrt(1+x^2)
+        fp_add_sub(ONE_EXT, s, 1'b0, RND_NEAREST, den, rz, rn, ri, rnan, roperr, rovfl, runfl, rinex2); // 1+s
+        fp_div(den, x_in, RND_NEAREST, xp, qz, qn, qi, qnan, qoperr, qdz, qovfl, qunfl, qinex2); // x' = x/(1+s)
+
+        fp_mul(xp, xp, RND_NEAREST, w, pz, pn, pi_, pnan, poperr, povfl, punfl, pinex2); // w = x'^2
+        acc = atan_coeff[0];
+        for (i = 1; i < 24; i++) begin
+            fp_mul(acc, w, RND_NEAREST, tmp, pz, pn, pi_, pnan, poperr, povfl, punfl, pinex2);
+            fp_add_sub(atan_coeff[i], tmp, 1'b0, RND_NEAREST, acc, rz, rn, ri, rnan, roperr, rovfl, runfl, rinex2);
+        end
+        fp_mul(acc, xp, RND_NEAREST, tmp, pz, pn, pi_, pnan, poperr, povfl, punfl, pinex2); // atan(x') = x'*P(w)
+        fp_mul(tmp, TWO_EXT, RND_NEAREST, atan_x, pz, pn, pi_, pnan, poperr, povfl, punfl, pinex2); // atan(x) = 2*atan(x')
+    endtask
+
+    task automatic fp_atan(
+        input  logic [95:0]  a_raw,
+        output logic [95:0]  result,
+        output logic         flag_z, flag_n, flag_i, flag_nan
+    );
+        fpx_t a;
+        logic a_nan, a_inf, a_zero;
+        a = unpack_fpx(a_raw);
+        a_nan  = is_nan_fpx(a);
+        a_inf  = is_inf_fpx(a);
+        a_zero = is_zero_fpx(a);
+
+        if (a_nan) begin
+            result = a_raw;
+        end else if (a_inf) begin
+            result = {a.sign, PI_OVER_2[94:0]}; // atan(+-inf) = +-pi/2, well-defined
+        end else if (a_zero) begin
+            result = a_raw; // atan is odd: sign of zero preserved
+        end else begin
+            logic mag_gt_1;
+            logic [95:0] mag, recip, inner, half_pi_minus;
+            logic        qz, qn, qi, qnan, qoperr, qdz, qovfl, qunfl, qinex2;
+            logic        rz, rn, ri, rnan, roperr, rovfl, runfl, rinex2;
+            mag = {1'b0, a.exp, 16'h0, a.mant}; // |a|
+            mag_gt_1 = (a.exp > 15'd16383) || (a.exp == 15'd16383 && a.mant > 64'h8000_0000_0000_0000);
+
+            if (mag_gt_1) begin
+                fp_div(mag, ONE_EXT, RND_NEAREST, recip, qz, qn, qi, qnan, qoperr, qdz, qovfl, qunfl, qinex2); // 1/|a|
+                atan_series_01(recip, inner);
+                fp_add_sub(inner, PI_OVER_2, 1'b1, RND_NEAREST, half_pi_minus, rz, rn, ri, rnan, roperr, rovfl, runfl, rinex2); // pi/2 - atan(1/|a|)
+                result = {a.sign, half_pi_minus[94:0]};
+            end else begin
+                atan_series_01(mag, inner);
+                result = {a.sign, inner[94:0]};
+            end
+        end
+
+        begin
+            fpx_t r_out;
+            r_out = unpack_fpx(result);
+            flag_z   = is_zero_fpx(r_out);
+            flag_n   = r_out.sign && !flag_z;
+            flag_i   = is_inf_fpx(r_out);
+            flag_nan = is_nan_fpx(r_out);
+        end
+    endtask
+
+    task automatic fp_asin(
+        input  logic [95:0]  a_raw,
+        output logic [95:0]  result,
+        output logic         flag_z, flag_n, flag_i, flag_nan, flag_operr
+    );
+        fpx_t a;
+        logic a_nan, a_inf;
+        logic mag_gt_1, mag_eq_1;
+        a = unpack_fpx(a_raw);
+        a_nan = is_nan_fpx(a);
+        a_inf = is_inf_fpx(a);
+        mag_gt_1 = (a.exp > 15'd16383) || (a.exp == 15'd16383 && a.mant > 64'h8000_0000_0000_0000);
+        mag_eq_1 = (a.exp == 15'd16383) && (a.mant == 64'h8000_0000_0000_0000);
+        flag_operr = 1'b0;
+
+        if (a_nan) begin
+            result = a_raw;
+        end else if (a_inf || mag_gt_1) begin
+            // Table 6-2: "Source is +-infinity, >+1, or <-1"
+            flag_operr = 1'b1;
+            result = {1'b0, 15'h7FFF, 16'h0, 64'hC000_0000_0000_0000};
+        end else if (mag_eq_1) begin
+            result = {a.sign, PI_OVER_2[94:0]}; // asin(+-1) = +-pi/2 exactly
+        end else begin
+            logic [95:0] x2, one_minus_x2, den, y;
+            logic        pz, pn, pi_, pnan, poperr, povfl, punfl, pinex2;
+            logic        rz, rn, ri, rnan, roperr, rovfl, runfl, rinex2;
+            logic        sz, sn, si, snan, soperr, sovfl, sunfl, sinex2;
+            logic        qz, qn, qi, qnan, qoperr, qdz, qovfl, qunfl, qinex2;
+            logic        atz, atn, ati, atnan;
+            fp_mul(a_raw, a_raw, RND_NEAREST, x2, pz, pn, pi_, pnan, poperr, povfl, punfl, pinex2); // x^2
+            fp_add_sub(x2, ONE_EXT, 1'b1, RND_NEAREST, one_minus_x2, rz, rn, ri, rnan, roperr, rovfl, runfl, rinex2); // 1-x^2
+            fp_sqrt(one_minus_x2, RND_NEAREST, den, sz, sn, si, snan, soperr, sovfl, sunfl, sinex2); // sqrt(1-x^2)
+            fp_div(den, a_raw, RND_NEAREST, y, qz, qn, qi, qnan, qoperr, qdz, qovfl, qunfl, qinex2); // y = x/sqrt(1-x^2)
+            fp_atan(y, result, atz, atn, ati, atnan);
+        end
+
+        begin
+            fpx_t r_out;
+            r_out = unpack_fpx(result);
+            flag_z   = is_zero_fpx(r_out);
+            flag_n   = r_out.sign && !flag_z;
+            flag_i   = is_inf_fpx(r_out);
+            flag_nan = is_nan_fpx(r_out);
+        end
+    endtask
+
+    task automatic fp_acos(
+        input  logic [95:0]  a_raw,
+        output logic [95:0]  result,
+        output logic         flag_z, flag_n, flag_i, flag_nan, flag_operr
+    );
+        logic [95:0] asin_a;
+        logic        az, an, ai, anan, aoperr;
+        logic        rz, rn, ri, rnan, roperr, rovfl, runfl, rinex2;
+        fp_asin(a_raw, asin_a, az, an, ai, anan, aoperr);
+        fp_add_sub(asin_a, PI_OVER_2, 1'b1, RND_NEAREST, result, rz, rn, ri, rnan, roperr, rovfl, runfl, rinex2); // pi/2 - asin(a)
+        flag_operr = aoperr;
+
+        begin
+            fpx_t r_out;
+            r_out = unpack_fpx(result);
+            flag_z   = is_zero_fpx(r_out);
+            flag_n   = r_out.sign && !flag_z;
+            flag_i   = is_inf_fpx(r_out);
+            flag_nan = is_nan_fpx(r_out);
+        end
+    endtask
+
+    // FATANH ($0D): atanh(x) = 0.5*ln((1+x)/(1-x)), direct reuse of
+    // fp_logn_core (the same "reuse an already-verified core" shape
+    // fp_tanh already established for the hyperbolic side). The exact
+    // +-1 boundary needs its own explicit override: naive composition
+    // would give atanh(+1)=0.5*ln(2/0)=+inf, but Table 6-3's own
+    // documented "Trap Disabled Results" text is explicit that the
+    // REPORTED result is the OPPOSITE sign at each exact boundary
+    // ("+infinity if source=-1; -infinity if source=+1") -- confirmed
+    // directly, not assumed, and deliberately overridden here rather
+    // than trusting the natural composition through that singularity.
+    task automatic fp_atanh(
+        input  logic [95:0]  a_raw,
+        output logic [95:0]  result,
+        output logic         flag_z, flag_n, flag_i, flag_nan, flag_operr, flag_dz
+    );
+        fpx_t a;
+        logic a_nan, a_inf, a_zero;
+        logic mag_gt_1, mag_eq_1;
+        a = unpack_fpx(a_raw);
+        a_nan  = is_nan_fpx(a);
+        a_inf  = is_inf_fpx(a);
+        a_zero = is_zero_fpx(a);
+        mag_gt_1 = (a.exp > 15'd16383) || (a.exp == 15'd16383 && a.mant > 64'h8000_0000_0000_0000);
+        mag_eq_1 = (a.exp == 15'd16383) && (a.mant == 64'h8000_0000_0000_0000);
+        flag_operr = 1'b0;
+        flag_dz    = 1'b0;
+
+        if (a_nan) begin
+            result = a_raw;
+        end else if (a_inf || mag_gt_1) begin
+            // Table 6-2: "Source is >+1, or <-1, Source = +-infinity"
+            flag_operr = 1'b1;
+            result = {1'b0, 15'h7FFF, 16'h0, 64'hC000_0000_0000_0000};
+        end else if (mag_eq_1) begin
+            // Table 6-3 (Divide-by-Zero): "Source Operand = +-1" --
+            // NOTE the documented result sign is the OPPOSITE of the
+            // source's own sign (see this task's own header comment).
+            flag_dz = 1'b1;
+            result = a.sign ? {1'b0, 15'h7FFF, 16'h0, 64'h8000_0000_0000_0000}   // source=-1 -> +infinity
+                             : {1'b1, 15'h7FFF, 16'h0, 64'h8000_0000_0000_0000}; // source=+1 -> -infinity
+        end else if (a_zero) begin
+            result = a_raw; // atanh is odd: sign of zero preserved
+        end else begin
+            logic [95:0] num, den, ratio, ln_ratio;
+            logic        nz, nn, ni, nnan, noperr, novfl, nunfl, ninex2;
+            logic        dz2, dn2, di2, dnan2, doperr2, dovfl2, dunfl2, dinex2b;
+            logic        qz, qn, qi, qnan, qoperr, qdz2, qovfl, qunfl, qinex2;
+            logic        lz, ln_, li, lnan, loperr, ldz;
+            fp_add_sub(ONE_EXT, a_raw, 1'b0, RND_NEAREST, num, nz, nn, ni, nnan, noperr, novfl, nunfl, ninex2); // 1+x
+            fp_add_sub(a_raw, ONE_EXT, 1'b1, RND_NEAREST, den, dz2, dn2, di2, dnan2, doperr2, dovfl2, dunfl2, dinex2b); // 1-x
+            fp_div(den, num, RND_NEAREST, ratio, qz, qn, qi, qnan, qoperr, qdz2, qovfl, qunfl, qinex2); // (1+x)/(1-x)
+            fp_logn_core(ratio, ln_ratio, lz, ln_, li, lnan, loperr, ldz);
+            fp_mul(ln_ratio, HALF, RND_NEAREST, result, qz, qn, qi, qnan, qoperr, qovfl, qunfl, qinex2);
+        end
+
+        begin
+            fpx_t r_out;
+            r_out = unpack_fpx(result);
+            flag_z   = is_zero_fpx(r_out);
+            flag_n   = r_out.sign && !flag_z;
+            flag_i   = is_inf_fpx(r_out);
+            flag_nan = is_nan_fpx(r_out);
+        end
+    endtask
+
 endpackage

@@ -159,6 +159,7 @@ module m68882_apu_tb;
     localparam logic [95:0] EXT_0_001 = 96'h3ff5_0000_8312_6e97_8d4f_df3b;
     localparam logic [95:0] EXT_100_0 = 96'h4005_0000_c800_0000_0000_0000;
     localparam logic [95:0] EXT_N0_999 = 96'hbffe_0000_ffbe_76c8_b439_5810;
+    localparam logic [95:0] PI_OVER_2_EXT = 96'h3fff_0000_c90f_daa2_2168_c235;
 
     logic [31:0] rd;
 
@@ -965,6 +966,102 @@ module m68882_apu_tb;
         dispatch(cmd_word(3'b000, 3'd0, 3'd1, 7'h06)); // FLOGNP1(-8.0), x < -1
         check(u_top.u_proto.u_regfile.fpsr_r[24] == 1'b1, "Phase 9h: FLOGNP1(-8.0) NAN condition code set (x < -1)");
         check(u_top.u_proto.u_regfile.fpsr_r[13] == 1'b1, "Phase 9h: FLOGNP1(-8.0) OPERR exception-status bit set (x < -1)");
+
+        // ── Phase 9i: FATAN/FASIN/FACOS/FATANH (the last 4 functions of
+        // the original transcendental set) ──────────────────────────
+        // References independently computed in Python (80-digit Decimal
+        // reciprocal+half-angle reduction, same methodology as every
+        // earlier Phase 9 sub-phase, sanity-checked against well-known
+        // values like atan(1)=pi/4 and atanh(0.5)=0.5*ln(3) before use --
+        // learning Phase 9h's own lesson about verifying an independent
+        // reference script's own output).
+        load_fp(0, EXT_0_5);
+        dispatch(cmd_word(3'b000, 3'd0, 3'd1, 7'h0A)); // FATAN(0.5), direct (no reduction needed)
+        check_close(u_top.u_proto.u_regfile.fp_r[1], 96'h3ffd_0000_ed63382b0dda7b45,
+                    4096, "Phase 9i: FATAN(0.5) ~= 0.4636476090...");
+
+        load_fp(0, {1'b1, EXT_0_5[94:0]}); // -0.5
+        dispatch(cmd_word(3'b000, 3'd0, 3'd1, 7'h0A)); // FATAN(-0.5), odd function sign check
+        check_close(u_top.u_proto.u_regfile.fp_r[1], 96'hbffd_0000_ed63382b0dda7b45,
+                    4096, "Phase 9i: FATAN(-0.5) ~= -0.4636476090... (odd function)");
+
+        load_fp(0, EXT_2_0);
+        dispatch(cmd_word(3'b000, 3'd0, 3'd1, 7'h0A)); // FATAN(2.0), exercises the reciprocal reduction (|x|>1)
+        check_close(u_top.u_proto.u_regfile.fp_r[1], 96'h3fff_0000_8db70c975df22363,
+                    4096, "Phase 9i: FATAN(2.0) ~= 1.1071487178... (reciprocal reduction)");
+
+        load_fp(0, EXT_10_0);
+        dispatch(cmd_word(3'b000, 3'd0, 3'd1, 7'h0A)); // FATAN(10.0)
+        check_close(u_top.u_proto.u_regfile.fp_r[1], 96'h3fff_0000_bc4de960b0029c17,
+                    4096, "Phase 9i: FATAN(10.0) ~= 1.4711276743... (reciprocal reduction)");
+
+        load_fp(0, 96'h0); // +0.0
+        dispatch(cmd_word(3'b000, 3'd0, 3'd1, 7'h0A)); // FATAN(+0.0)
+        check(u_top.u_proto.u_regfile.fp_r[1] == 96'h0, "Phase 9i: FATAN(+0.0) == +0.0 exactly");
+
+        load_fp(0, 96'h7fff_0000_8000_0000_0000_0000); // +inf
+        dispatch(cmd_word(3'b000, 3'd0, 3'd1, 7'h0A)); // FATAN(+inf)
+        check_close(u_top.u_proto.u_regfile.fp_r[1], PI_OVER_2_EXT, 4096, "Phase 9i: FATAN(+inf) == +pi/2 (well-defined, no exception)");
+
+        load_fp(0, EXT_0_5);
+        dispatch(cmd_word(3'b000, 3'd0, 3'd1, 7'h0C)); // FASIN(0.5)
+        check_close(u_top.u_proto.u_regfile.fp_r[1], 96'h3ffe_0000_860a91c16b9b2c23,
+                    4096, "Phase 9i: FASIN(0.5) ~= 0.5235987756... (= pi/6)");
+
+        load_fp(0, {1'b1, EXT_0_5[94:0]}); // -0.5
+        dispatch(cmd_word(3'b000, 3'd0, 3'd1, 7'h0C)); // FASIN(-0.5)
+        check_close(u_top.u_proto.u_regfile.fp_r[1], 96'hbffe_0000_860a91c16b9b2c23,
+                    4096, "Phase 9i: FASIN(-0.5) ~= -0.5235987756...");
+
+        load_fp(0, EXT_1_0);
+        dispatch(cmd_word(3'b000, 3'd0, 3'd1, 7'h0C)); // FASIN(1.0) exactly, avoids the sqrt(1-1)=0 division
+        check_close(u_top.u_proto.u_regfile.fp_r[1], PI_OVER_2_EXT, 4096, "Phase 9i: FASIN(1.0) == +pi/2 exactly");
+
+        load_fp(0, EXT_2_0);
+        dispatch(cmd_word(3'b000, 3'd0, 3'd1, 7'h0C)); // FASIN(2.0), |x|>1
+        check(u_top.u_proto.u_regfile.fpsr_r[24] == 1'b1, "Phase 9i: FASIN(2.0) NAN condition code set (|x|>1)");
+        check(u_top.u_proto.u_regfile.fpsr_r[13] == 1'b1, "Phase 9i: FASIN(2.0) OPERR exception-status bit set (|x|>1)");
+
+        load_fp(0, EXT_0_5);
+        dispatch(cmd_word(3'b000, 3'd0, 3'd1, 7'h1C)); // FACOS(0.5)
+        check_close(u_top.u_proto.u_regfile.fp_r[1], 96'h3fff_0000_860a91c16b9b2c23,
+                    4096, "Phase 9i: FACOS(0.5) ~= 1.0471975512... (= pi/3)");
+
+        load_fp(0, {1'b1, EXT_0_5[94:0]}); // -0.5
+        dispatch(cmd_word(3'b000, 3'd0, 3'd1, 7'h1C)); // FACOS(-0.5)
+        check_close(u_top.u_proto.u_regfile.fp_r[1], 96'h4000_0000_860a91c16b9b2c23,
+                    4096, "Phase 9i: FACOS(-0.5) ~= 2.0943951024...");
+
+        load_fp(0, 96'h0); // +0.0
+        dispatch(cmd_word(3'b000, 3'd0, 3'd1, 7'h1C)); // FACOS(+0.0)
+        check_close(u_top.u_proto.u_regfile.fp_r[1], PI_OVER_2_EXT, 4096, "Phase 9i: FACOS(+0.0) == +pi/2");
+
+        load_fp(0, EXT_0_5);
+        dispatch(cmd_word(3'b000, 3'd0, 3'd1, 7'h0D)); // FATANH(0.5)
+        check_close(u_top.u_proto.u_regfile.fp_r[1], 96'h3ffe_0000_8c9f53d5681854bb,
+                    4096, "Phase 9i: FATANH(0.5) ~= 0.5493061443... (= 0.5*ln(3))");
+
+        load_fp(0, {1'b1, EXT_0_5[94:0]}); // -0.5
+        dispatch(cmd_word(3'b000, 3'd0, 3'd1, 7'h0D)); // FATANH(-0.5)
+        check_close(u_top.u_proto.u_regfile.fp_r[1], 96'hbffe_0000_8c9f53d5681854bb,
+                    4096, "Phase 9i: FATANH(-0.5) ~= -0.5493061443...");
+
+        load_fp(0, EXT_1_0);
+        dispatch(cmd_word(3'b000, 3'd0, 3'd1, 7'h0D)); // FATANH(+1.0) exactly -- the documented REVERSED-sign boundary
+        check(u_top.u_proto.u_regfile.fp_r[1] == 96'hffff_0000_8000_0000_0000_0000,
+              "Phase 9i: FATANH(+1.0) == -infinity (Table 6-3's own documented sign, NOT the naive +inf a literal 2/0 would suggest)");
+        check(u_top.u_proto.u_regfile.fpsr_r[10] == 1'b1, "Phase 9i: FATANH(+1.0) DZ exception-status bit set");
+
+        load_fp(0, EXT_N1_0);
+        dispatch(cmd_word(3'b000, 3'd0, 3'd1, 7'h0D)); // FATANH(-1.0) exactly
+        check(u_top.u_proto.u_regfile.fp_r[1] == 96'h7fff_0000_8000_0000_0000_0000,
+              "Phase 9i: FATANH(-1.0) == +infinity (Table 6-3's own documented reversed sign)");
+        check(u_top.u_proto.u_regfile.fpsr_r[10] == 1'b1, "Phase 9i: FATANH(-1.0) DZ exception-status bit set");
+
+        load_fp(0, EXT_2_0);
+        dispatch(cmd_word(3'b000, 3'd0, 3'd1, 7'h0D)); // FATANH(2.0), |x|>1
+        check(u_top.u_proto.u_regfile.fpsr_r[24] == 1'b1, "Phase 9i: FATANH(2.0) NAN condition code set (|x|>1)");
+        check(u_top.u_proto.u_regfile.fpsr_r[13] == 1'b1, "Phase 9i: FATANH(2.0) OPERR exception-status bit set (|x|>1)");
 
         $display("---");
         $display("%0d passed, %0d failed", pass_count, fail_count);

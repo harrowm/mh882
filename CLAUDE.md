@@ -842,10 +842,35 @@ checks, `make test` 8/8 suites clean, 363/363 total**, measured
 accuracy 0-47 ULP (the one 47-ULP case deliberately probes near
 FLOGNP1's own genuine `x=-1` mathematical singularity).
 
-See `plan.md` for the full phased build plan and the complete list of
-what remains deliberately out of scope (Phase 9i+ — the last 4
-functions of the original transcendental set, FACOS/FASIN/FATAN/
-FATANH — W/B/P formats, BSUN/INEX1, denormals, and the rest).
+**Phase 9i (FATAN/FASIN/FACOS/FATANH) is also complete — closes Phase 9
+(the transcendental instruction set) IN FULL.** `fp_atan` is the one
+genuinely new series here: reciprocal reduction (`|x|>1`) then a
+half-angle reduction (`tan(theta/2)=x/(1+sqrt(1+x^2))`) before a
+24-term Horner series. `fp_asin`/`fp_acos`/`fp_atanh` are pure
+composition of already-verified building blocks (same shape
+`fp_tanh`/`fp_sinh`/`fp_cosh` established): `asin(x)=atan(x/
+sqrt(1-x^2))`, `acos(x)=pi/2-asin(x)`, `atanh(x)=0.5*ln((1+x)/(1-x))`.
+One real, manual-confirmed subtlety: `fp_atanh`'s own exact `±1`
+boundary needs an explicit override, since Table 6-3's own documented
+result there has the OPPOSITE sign from what naive composition through
+the `ln` singularity would produce (confirmed directly against the
+manual's own "Trap Disabled Results" text, not assumed). **APU test
+grew 142→164 checks, `make test` 8/8 suites clean, 385/385 total**,
+measured accuracy 0-1 ULP — the tightest of any Phase 9 sub-phase.
+
+**Every function in Table 4-13's own extension-code map now has a real
+numerical implementation** — verified either against Musashi (7
+functions, plus 4 confirmed Musashi bugs found and documented) or,
+for everything Musashi doesn't implement, against independent
+Python/`Decimal` high-precision references (sanity-checked against
+known closed forms before use, after Phase 9h's own reference-script
+bug taught that lesson the hard way).
+
+See `plan.md` for the full phased build plan. What remains genuinely
+out of scope for this project — none of it a transcendental-instruction
+gap any more — is W/B/P integer/packed-decimal formats, BSUN/INEX1,
+denormals, exponent-overflow traps, and the MH030-side coprocessor-
+conditional-instruction gap.
 
 ```bash
 make test   # builds and runs all eight testbenches via Icarus Verilog
