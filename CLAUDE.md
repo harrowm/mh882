@@ -906,10 +906,35 @@ sites (the ordinary commit, and both of FSINCOS's own two-tick writes).
 the OVFL contrast case. **`make test`: 9/9 suites clean, APU test grew
 164→172.**
 
+**Phase 13 (denormalized-number support) is complete — the highest-risk
+item in the gap-closure plan, touching `fp_add_sub`/`fp_mul`/`fp_div`/
+`fp_sqrt` directly**, implemented and verified one task at a time. A
+genuine wrinkle resolved empirically via Musashi's own vendored
+`softfloat.c` (already IEEE-correct for `floatx80` denormals): extended
+precision specifically allows `exp=0` with the explicit integer bit set
+to represent a NORMALIZED number (Section 3.2's own NOTE) — confirmed,
+via Musashi's DIV/SQRT paths agreeing unambiguously, to mean this is a
+REDUNDANT encoding of the same value as `exp=1` with that mantissa, so
+a denormal's own effective exponent is anchored at 1 via `1-lz` (`lz` =
+leading-zero-count). Musashi's own ADD path was separately found to
+mishandle that one exact boundary bit pattern as an input (a genuine,
+narrow Musashi bug, not a semantic disagreement — its DIV/SQRT paths
+independently confirm the same reading this project settled on).
+Implementation shape: normalize denormal inputs into the same "1.xxx ×
+2^exponent" form via a signed, range-extended working exponent (18-bit
+vs. the old 15-bit unsigned field — numerically identical for any
+all-normal case, confirmed by zero regressions across the entire
+existing suite at every checkpoint); shift-then-round-once for gradual
+underflow output (never round-then-shift, which would double-round) —
+the already-existing `round_mantissa` needed zero changes to correctly
+produce the manual's own RN/RZ/RM/RP "smallest denormal vs. signed
+zero" table for free. 18 new checks in `tb/m68882_apu_tb.sv`, all but
+one Musashi-cross-checked. **`make test`: 9/9 suites clean at every
+checkpoint, APU test grew 172→190.**
+
 See `plan.md` for the full phased build plan, including the remaining
-gap-closure phases (denormals — the highest-risk item, touching the
-4 core arithmetic tasks directly — Packed Decimal, and, cross-repo,
-MH030's own coprocessor-conditional instructions).
+gap-closure phases (Packed Decimal — the last MH882-local item — and,
+cross-repo, MH030's own coprocessor-conditional instructions).
 
 ```bash
 make test   # builds and runs all nine testbenches via Icarus Verilog

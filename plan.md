@@ -2071,10 +2071,79 @@ the 3-vs-2 asymmetry lands exactly as documented, not over-corrected
 in either direction. **`make test`: 9/9 suites clean, APU test grew
 164→172.**
 
-## Phase 13 — Denormalized-number support, NOT YET STARTED
+## Phase 13 — Denormalized-number support (COMPLETE — the highest-risk item in this plan)
 
-Next in the gap-closure plan, and the highest-risk item in it — touches
-`fp_add_sub`/`fp_mul`/`fp_div`/`fp_sqrt` directly. See
-`wobbly-honking-cascade.md` for the full derivation (real semantics,
-verification strategy via Musashi's own vendored `softfloat.c`, and the
-one-task-at-a-time regression discipline this phase will follow).
+Touches `fp_add_sub`/`fp_mul`/`fp_div`/`fp_sqrt` directly — the four
+most foundational, most heavily-relied-upon tasks in the entire
+project. Implemented and verified ONE task at a time (add/sub first,
+full regression; then mul; then div; then sqrt), exactly as planned.
+
+**A genuine, non-obvious wrinkle found by reading Section 3.2/Figure
+3-4's own NOTE directly, not assumed**: for extended precision
+SPECIFICALLY (unlike single/double), "an extended precision number with
+an exponent of zero MAY have an explicit integer bit equal to ONE,
+which results in a NORMALIZED number (even though the exponent is
+equal to the minimum value)." This was resolved empirically rather than
+purely by re-reading the text a third time (an earlier hand-analysis
+pass flip-flopped between two plausible readings before settling this
+the right way): cross-checked directly against Musashi's own vendored
+`softfloat.c` (which already implements IEEE-correct `floatx80`
+denormal arithmetic) across FADD/FDIV/FSQRT vectors specifically
+constructed to disambiguate the two readings. Musashi's own DIV and
+SQRT paths agree unambiguously: `exp=0, mantissa=0x8000...0000` is a
+REDUNDANT alternate encoding of the SAME value as `exp=1` with that
+same mantissa (both = the smallest normal magnitude) — i.e. a
+denormal's own effective exponent is anchored at **1** (the real normal
+floor), not 0, via one unified formula: `effective_exponent = 1-lz`
+where `lz` = the raw mantissa's own leading-zero count (`lz=0` exactly
+recovers the boundary/redundant-encoding case; `lz>0` extends below the
+normal floor for a true denormal). **Musashi's own ADD path was
+separately found to mishandle this one exact boundary bit pattern as
+an input** (doubling it via FADD spuriously gives zero instead of the
+correct doubled value) — confirmed as Musashi's own narrow bug, not a
+disagreement about the underlying semantics, since its DIV/SQRT paths
+independently confirm the same `1-lz` reading this project settled on.
+
+**Implementation shape, identical across all 4 tasks**: (1) at the top,
+normalize any denormal operand into the SAME "1.xxx × 2^effective_
+exponent" form a normal operand already has, using a signed,
+range-extended (18-bit) working exponent instead of the old plain
+15-bit unsigned field — for any all-normal-operand case this is
+numerically IDENTICAL to the pre-Phase-13 math (confirmed by a full,
+zero-regression `make test` sweep after each task), so the risk is
+entirely confined to genuinely denormal inputs/outputs; (2) at the
+bottom, gradual underflow is implemented as shift-the-mantissa-right-
+THEN-round-once (never round-then-shift, which would double-round) —
+whenever the result's own true pre-rounding exponent is below the
+normal floor (`<1`; `==1` is explicitly NOT underflow per the manual's
+own footnote, since the explicit integer bit already represents the
+smallest normal number exactly), matching the manual's own documented
+"shift, then round" ordering (Section 6.1.5/4.5.5.2). The already-
+existing `round_mantissa` function needed ZERO changes to correctly
+produce the manual's own documented RN/RZ/RM/RP "smallest denormal vs.
+signed zero" table when every bit shifts out — that behavior falls out
+for free from logic already written for ordinary rounding.
+`fp_sqrt`'s own gradual-underflow output branch is kept for
+architectural symmetry but is genuinely unreachable for any real
+operand (sqrt roughly halves the exponent magnitude, so even the
+smallest denormal square-roots deep into ordinary normal range) —
+documented as such, not silently dead code.
+
+**Testing**: 18 new checks in `tb/m68882_apu_tb.sv`, all but one
+Musashi-cross-checked (denormal+denormal, denormal+normal, and
+denormal-as-divisor cases for each of the 4 tasks, plus exact-
+cancellation-to-zero and underflow-past-the-smallest-denormal cases) —
+the one exception being the `exp=0/explicit-bit-set` boundary value
+doubled via FADD specifically, verified from the manual's own text and
+hand-calculation instead, since that's the one input Musashi's own ADD
+path is confirmed to mishandle. **`make test`: 9/9 suites clean at
+every checkpoint, zero regressions to the pre-existing 172-check APU
+suite; APU test grew 172→190.**
+
+## Phase 14 — Packed Decimal (P) external-operand format + INEX1, NOT YET STARTED
+
+The last MH882-local item in the gap-closure plan, and the largest
+remaining effort — see `wobbly-honking-cascade.md` for the full format
+derivation (Figure 3-11/Table 3-4), the decimal↔binary conversion
+design (reusing `fp_tentox`/`fp_log10`, already built), and the
+k-factor rounding requirements.

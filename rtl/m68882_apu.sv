@@ -191,24 +191,87 @@ package m68882_apu_pkg;
             result = b_raw;
         end else begin
             // Both finite (includes zero as an exp=0/mant=0 subset).
-            logic [14:0] exp_a, exp_b, exp_hi, exp_lo, exp_diff;
+            // Phase 13: exp_a/exp_b/exp_hi/exp_lo/exp_diff/result_exp are
+            // now SIGNED and range-extended (18 bits, plenty of headroom
+            // beyond the 15-bit packed field) rather than the plain
+            // unsigned 15-bit fields used before denormal support --
+            // this is what lets a denormal input's own effective exponent
+            // (which is genuinely BELOW the normal minimum of 1) and an
+            // intermediate denormal-range RESULT both flow through the
+            // exact same alignment/rounding math a normal-only value
+            // already used, instead of needing a parallel code path.
+            // For any all-normal-operand case this is numerically
+            // IDENTICAL to the old unsigned math (sign-extending a value
+            // already in [0,32767] changes nothing arithmetically here).
+            logic signed [17:0] exp_a, exp_b, exp_hi, exp_lo, exp_diff;
             logic [66:0] mant_a, mant_b, mant_hi, mant_lo, mant_hi_al, mant_lo_al;
             logic        sign_hi, sign_lo;
             logic        same_sign;
             logic [66:0] sum67;
-            logic [14:0] result_exp;
+            logic signed [17:0] result_exp;
             logic        result_sign;
             logic [63:0] rounded_mant;
             logic        carry;
             logic [6:0]  shift;
             logic [6:0]  lz;
+            logic [63:0] eff_mant_a, eff_mant_b;
+            logic [6:0]  lz_a, lz_b;
+            logic signed [17:0] denorm_shift;
 
-            exp_a  = a.exp;
-            exp_b  = b.exp;
-            mant_a = {a.mant, 3'b0};
-            mant_b = {b.mant, 3'b0};
+            // Denormal INPUT normalization. A subtlety confirmed
+            // directly against Section 3.2/Figure 3-4's own NOTE, easy
+            // to miss: for extended precision SPECIFICALLY (unlike
+            // single/double), "an extended precision number with an
+            // exponent of zero MAY have an explicit integer bit equal
+            // to ONE, which results in a NORMALIZED number (even though
+            // the exponent is equal to the minimum value)" -- confirmed,
+            // via direct empirical cross-check against this project's
+            // own vendored Musashi (whose floatx80 arithmetic already
+            // implements IEEE-correct denormal handling, proven correct
+            // on every OTHER denormal vector tried), to mean this exact
+            // bit pattern is a REDUNDANT alternate encoding of the SAME
+            // value as the ordinary normal number at biased exponent 1
+            // with that same mantissa -- NOT a further extension of the
+            // normal range down to biased exponent 0. So a denormal's
+            // own effective exponent is anchored at 1 (the real normal
+            // minimum), the same as every other normal operand already
+            // uses, via ONE formula: effective_exponent = 1-lz, where lz
+            // = leading-zero-count of the raw mantissa (lz=0 exactly
+            // recovers the boundary/redundant-encoding case above with
+            // no special-casing needed; lz>0 extends below the normal
+            // floor for a true denormal, by exactly its own leading-zero
+            // count). Zero (mant==0) is left alone; is_zero_fpx already
+            // covers it and lzc64(0) would be a meaningless shift amount
+            // here. (Musashi ITSELF was empirically found to mishandle
+            // this one specific boundary bit pattern as an INPUT --
+            // doubling it via FADD spuriously gives zero instead of the
+            // correct doubled value -- so that one exact case was
+            // verified from the manual's own text plus hand-calculation
+            // instead of a Musashi cross-check, unlike everything else
+            // in this task.)
+            if (a.exp == 15'h0 && a.mant != 64'h0) begin
+                lz_a       = lzc64(a.mant);
+                eff_mant_a = a.mant << lz_a;
+            end else begin
+                lz_a       = 7'd0;
+                eff_mant_a = a.mant;
+            end
+            if (b.exp == 15'h0 && b.mant != 64'h0) begin
+                lz_b       = lzc64(b.mant);
+                eff_mant_b = b.mant << lz_b;
+            end else begin
+                lz_b       = 7'd0;
+                eff_mant_b = b.mant;
+            end
 
-            if ({exp_a, a.mant} >= {exp_b, b.mant}) begin
+            exp_a  = (a.exp == 15'h0 && a.mant != 64'h0) ?
+                     (18'sd1 - {11'b0, lz_a}) : $signed({3'b0, a.exp});
+            exp_b  = (b.exp == 15'h0 && b.mant != 64'h0) ?
+                     (18'sd1 - {11'b0, lz_b}) : $signed({3'b0, b.exp});
+            mant_a = {eff_mant_a, 3'b0};
+            mant_b = {eff_mant_b, 3'b0};
+
+            if ((exp_a > exp_b) || (exp_a == exp_b && eff_mant_a >= eff_mant_b)) begin
                 exp_hi = exp_a; mant_hi = mant_a; sign_hi = eff_a.sign;
                 exp_lo = exp_b; mant_lo = mant_b; sign_lo = b.sign;
             end else begin
@@ -216,8 +279,8 @@ package m68882_apu_pkg;
                 exp_lo = exp_a; mant_lo = mant_a; sign_lo = eff_a.sign;
             end
 
-            exp_diff = exp_hi - exp_lo;
-            shift    = (exp_diff > 15'd67) ? 7'd67 : exp_diff[6:0];
+            exp_diff = exp_hi - exp_lo; // always >= 0 by construction above
+            shift    = (exp_diff > 18'sd67) ? 7'd67 : exp_diff[6:0];
 
             mant_hi_al = mant_hi;
             // Shift the smaller operand right, folding shifted-out bits
@@ -259,7 +322,7 @@ package m68882_apu_pkg;
                     lost       = sum68[0];
                     sum68      = sum68 >> 1;
                     sum68[0]   = sum68[0] | lost;
-                    result_exp = exp_hi + 15'd1;
+                    result_exp = exp_hi + 18'sd1;
                 end
                 sum67 = sum68[66:0];
             end else begin
@@ -271,7 +334,7 @@ package m68882_apu_pkg;
             if (sum67 == 67'b0) begin
                 // exact cancellation -- Note 1: +0.0 except in RM (-0.0)
                 result_sign = (rmode == RND_MINF);
-                result_exp  = 15'h0;
+                result_exp  = 18'sd0;
                 result      = {result_sign, 15'h0, 16'h0, 64'h0};
                 flag_operr  = 1'b0;
             end else begin
@@ -280,20 +343,57 @@ package m68882_apu_pkg;
                     // mantissa -- renormalize by left-shifting out the
                     // leading zeros (the guard/round/sticky tail is
                     // still bits[2:0], the true j.f is bits[66:3]).
+                    // Phase 13: result_exp is now allowed to go negative
+                    // here (a valid denormal-range intermediate value) --
+                    // the old "collapse to zero if this would go below
+                    // the normal floor" special case is gone; the
+                    // unified gradual-underflow stage right below
+                    // handles denormalization (or true zero) uniformly
+                    // for every path that reaches it, not just this one.
                     lz = lzc64(sum67[66:3]);
                     if (lz != 7'd0) begin
-                        if ({15'b0, lz} >= {8'b0, result_exp}) begin
-                            // underflows through zero -- Phase 4a's own
-                            // documented denormal-free simplification:
-                            // collapse to a correctly signed zero.
-                            flag_unfl  = 1'b1;
-                            sum67      = 67'b0;
-                            result_exp = 15'h0;
-                        end else begin
-                            sum67      = sum67 << lz;
-                            result_exp = result_exp - {8'b0, lz};
-                        end
+                        sum67      = sum67 << lz;
+                        result_exp = result_exp - {11'b0, lz};
                     end
+                end
+
+                // Phase 13: gradual underflow (Section 6.1.5/4.5.5.2,
+                // confirmed directly) -- if the result's own true
+                // exponent is below the real normal floor (result_exp<1;
+                // ==1 is explicitly NOT underflow per the manual's own
+                // footnote, since extended precision's explicit integer
+                // bit already represents the smallest normal number
+                // exactly), shift the mantissa right -- folding
+                // shifted-out bits into the SAME
+                // guard/round/sticky tail already in sum67[2:0] --
+                // until it's aligned to the denormal scale, THEN round
+                // once (matching the manual's own "shift, then round"
+                // order -- rounding first and shifting after would
+                // double-round). round_mantissa's own existing
+                // RN/RZ/RM/RP logic already produces exactly the
+                // manual's own documented "smallest denormal vs. signed
+                // zero" table below for free when every bit shifts out
+                // -- no separate table needed here.
+                denorm_shift = (result_exp < 18'sd1) ? (18'sd1 - result_exp) : 18'sd0;
+                if (denorm_shift > 18'sd0) begin
+                    logic [66:0] dshifted;
+                    logic        dsticky;
+                    flag_unfl = 1'b1;
+                    if (denorm_shift >= 18'sd67) begin
+                        dshifted = 67'b0;
+                        dsticky  = |sum67;
+                    end else begin
+                        dshifted = sum67 >> denorm_shift;
+                        dsticky  = |(sum67 & ((67'b1 << denorm_shift) - 67'b1));
+                    end
+                    sum67      = dshifted;
+                    sum67[0]   = sum67[0] | dsticky;
+                    result_exp = 18'sd0; // the real denormal exponent FIELD
+                                         // value; a post-round carry below
+                                         // correctly bumps this to 1 (the
+                                         // smallest normal) if rounding
+                                         // carries the mantissa back up to
+                                         // a full leading 1.
                 end
 
                 flag_inex2 = (sum67[2:0] != 3'b0); // guard/round/sticky nonzero -> inexact
@@ -303,10 +403,10 @@ package m68882_apu_pkg;
 
                 if (carry) begin
                     rounded_mant = {1'b1, rounded_mant[63:1]};
-                    result_exp   = result_exp + 15'd1;
+                    result_exp   = result_exp + 18'sd1;
                 end
 
-                if (result_exp >= 15'h7FFF) begin
+                if (result_exp >= 18'sd32767) begin
                     // exponent overflow -- saturate to infinity (coarse
                     // OVFL substitute, see module header)
                     flag_ovfl = 1'b1;
@@ -314,7 +414,11 @@ package m68882_apu_pkg;
                 end else if (rounded_mant == 64'h0) begin
                     result = {result_sign, 15'h0, 16'h0, 64'h0};
                 end else begin
-                    result = {result_sign, result_exp, 16'h0, rounded_mant};
+                    // result_exp is guaranteed in [0,32766] here (0 or
+                    // above from the denormalization stage above, below
+                    // 32767 by the overflow check just above) -- safe to
+                    // truncate directly into the packed 15-bit field.
+                    result = {result_sign, result_exp[14:0], 16'h0, rounded_mant};
                 end
             end
         end
@@ -392,30 +496,73 @@ package m68882_apu_pkg;
         end else begin
             logic [127:0] product128;
             logic signed [17:0] exp_sum;
-            logic [63:0] mant64;
-            logic        guard, round_bit, sticky;
+            logic [66:0] prod67;
             logic [63:0] rounded_mant;
             logic        carry;
+            logic [63:0] eff_mant_a, eff_mant_b;
+            logic [6:0]  lz_a, lz_b;
+            logic signed [17:0] eff_exp_a, eff_exp_b;
+            logic signed [17:0] denorm_shift;
 
-            product128 = a.mant * b.mant;
-
-            if (product128[127]) begin
-                mant64    = product128[127:64];
-                guard     = product128[63];
-                round_bit = product128[62];
-                sticky    = |product128[61:0];
-                exp_sum   = $signed({3'b0, a.exp}) + $signed({3'b0, b.exp}) - 18'sd16383 + 18'sd1;
+            // Phase 13: denormal input normalization -- same "1-lz"
+            // convention fp_add_sub already established (empirically
+            // validated there against Musashi's own vendored floatx80
+            // arithmetic; see that task's own header comment for the
+            // full derivation, including the one confirmed Musashi
+            // limitation at the exp=0/explicit-bit-set boundary value).
+            if (a.exp == 15'h0 && a.mant != 64'h0) begin
+                lz_a       = lzc64(a.mant);
+                eff_mant_a = a.mant << lz_a;
+                eff_exp_a  = 18'sd1 - {11'b0, lz_a};
             end else begin
-                mant64    = product128[126:63];
-                guard     = product128[62];
-                round_bit = product128[61];
-                sticky    = |product128[60:0];
-                exp_sum   = $signed({3'b0, a.exp}) + $signed({3'b0, b.exp}) - 18'sd16383;
+                lz_a       = 7'd0;
+                eff_mant_a = a.mant;
+                eff_exp_a  = $signed({3'b0, a.exp});
+            end
+            if (b.exp == 15'h0 && b.mant != 64'h0) begin
+                lz_b       = lzc64(b.mant);
+                eff_mant_b = b.mant << lz_b;
+                eff_exp_b  = 18'sd1 - {11'b0, lz_b};
+            end else begin
+                lz_b       = 7'd0;
+                eff_mant_b = b.mant;
+                eff_exp_b  = $signed({3'b0, b.exp});
             end
 
-            flag_inex2 = guard || round_bit || sticky;
+            product128 = eff_mant_a * eff_mant_b;
 
-            round_mantissa(mant64, guard, round_bit, sticky, sign_r, rmode, rounded_mant, carry);
+            if (product128[127]) begin
+                prod67  = {product128[127:64], product128[63], product128[62], |product128[61:0]};
+                exp_sum = eff_exp_a + eff_exp_b - 18'sd16383 + 18'sd1;
+            end else begin
+                prod67  = {product128[126:63], product128[62], product128[61], |product128[60:0]};
+                exp_sum = eff_exp_a + eff_exp_b - 18'sd16383;
+            end
+
+            // Phase 13: gradual underflow (same shape as fp_add_sub's
+            // own -- shift right, folding into the guard/round/sticky
+            // tail, BEFORE rounding once, never round-then-shift).
+            denorm_shift = (exp_sum < 18'sd1) ? (18'sd1 - exp_sum) : 18'sd0;
+            if (denorm_shift > 18'sd0) begin
+                logic [66:0] dshifted;
+                logic        dsticky;
+                flag_unfl = 1'b1;
+                if (denorm_shift >= 18'sd67) begin
+                    dshifted = 67'b0;
+                    dsticky  = |prod67;
+                end else begin
+                    dshifted = prod67 >> denorm_shift;
+                    dsticky  = |(prod67 & ((67'b1 << denorm_shift) - 67'b1));
+                end
+                prod67  = dshifted;
+                prod67[0] = prod67[0] | dsticky;
+                exp_sum = 18'sd0;
+            end
+
+            flag_inex2 = (prod67[2:0] != 3'b0);
+
+            round_mantissa(prod67[66:3], prod67[2], prod67[1], prod67[0],
+                            sign_r, rmode, rounded_mant, carry);
             if (carry) begin
                 rounded_mant = {1'b1, rounded_mant[63:1]};
                 exp_sum      = exp_sum + 18'sd1;
@@ -426,10 +573,7 @@ package m68882_apu_pkg;
                 // own coarse OVFL substitute, same convention here)
                 flag_ovfl = 1'b1;
                 result = {sign_r, 15'h7FFF, 16'h0, 64'h8000_0000_0000_0000};
-            end else if (exp_sum <= 18'sd0 || rounded_mant == 64'h0) begin
-                // exponent underflow -- Phase 4a's own denormal-free
-                // simplification: collapse to a correctly signed zero
-                flag_unfl = (exp_sum <= 18'sd0);
+            end else if (rounded_mant == 64'h0) begin
                 result = {sign_r, 15'h0, 16'h0, 64'h0};
             end else begin
                 result = {sign_r, exp_sum[14:0], 16'h0, rounded_mant};
@@ -521,13 +665,37 @@ package m68882_apu_pkg;
             logic [199:0] dividend, divisor, quotient, remainder;
             logic [67:0]  q68, q_aligned;
             logic signed [17:0] exp_result;
-            logic [63:0] mant64;
-            logic        guard, round_bit, sticky;
+            logic [66:0] div67;
             logic [63:0] rounded_mant;
             logic        carry;
+            logic [63:0] eff_mant_a, eff_mant_b;
+            logic [6:0]  lz_a, lz_b;
+            logic signed [17:0] eff_exp_a, eff_exp_b;
+            logic signed [17:0] denorm_shift;
 
-            dividend = {136'b0, b.mant} << DIV_SHIFT;
-            divisor  = {136'b0, a.mant};
+            // Phase 13: denormal input normalization -- same "1-lz"
+            // convention fp_add_sub/fp_mul already established.
+            if (a.exp == 15'h0 && a.mant != 64'h0) begin
+                lz_a       = lzc64(a.mant);
+                eff_mant_a = a.mant << lz_a;
+                eff_exp_a  = 18'sd1 - {11'b0, lz_a};
+            end else begin
+                lz_a       = 7'd0;
+                eff_mant_a = a.mant;
+                eff_exp_a  = $signed({3'b0, a.exp});
+            end
+            if (b.exp == 15'h0 && b.mant != 64'h0) begin
+                lz_b       = lzc64(b.mant);
+                eff_mant_b = b.mant << lz_b;
+                eff_exp_b  = 18'sd1 - {11'b0, lz_b};
+            end else begin
+                lz_b       = 7'd0;
+                eff_mant_b = b.mant;
+                eff_exp_b  = $signed({3'b0, b.exp});
+            end
+
+            dividend = {136'b0, eff_mant_b} << DIV_SHIFT;
+            divisor  = {136'b0, eff_mant_a};
             quotient = dividend / divisor;
             remainder = dividend % divisor;
             q68 = quotient[67:0];
@@ -535,22 +703,42 @@ package m68882_apu_pkg;
             if (q68[67]) begin
                 // ratio >= 1: already aligned, top bit at 67
                 q_aligned  = q68;
-                exp_result = $signed({3'b0, b.exp}) - $signed({3'b0, a.exp}) + 18'sd16383;
+                exp_result = eff_exp_b - eff_exp_a + 18'sd16383;
             end else begin
                 // ratio < 1: shift left 1 to bring q68's own top bit
                 // (bit66) up to bit67 -- a pure left-shift, so q68's own
                 // bit0 lands at q_aligned[1], nothing is discarded
                 q_aligned  = {q68[66:0], 1'b0};
-                exp_result = $signed({3'b0, b.exp}) - $signed({3'b0, a.exp}) + 18'sd16383 - 18'sd1;
+                exp_result = eff_exp_b - eff_exp_a + 18'sd16383 - 18'sd1;
             end
 
-            mant64    = q_aligned[67:4];
-            guard     = q_aligned[3];
-            round_bit = q_aligned[2];
-            sticky    = q_aligned[1] | q_aligned[0] | (remainder != 200'b0);
-            flag_inex2 = guard || round_bit || sticky;
+            div67 = {q_aligned[67:4], q_aligned[3], q_aligned[2],
+                     q_aligned[1] | q_aligned[0] | (remainder != 200'b0)};
 
-            round_mantissa(mant64, guard, round_bit, sticky, sign_r, rmode, rounded_mant, carry);
+            // Phase 13: gradual underflow (same shape as fp_add_sub/
+            // fp_mul's own -- shift right, folding into the
+            // guard/round/sticky tail, BEFORE rounding once).
+            denorm_shift = (exp_result < 18'sd1) ? (18'sd1 - exp_result) : 18'sd0;
+            if (denorm_shift > 18'sd0) begin
+                logic [66:0] dshifted;
+                logic        dsticky;
+                flag_unfl = 1'b1;
+                if (denorm_shift >= 18'sd67) begin
+                    dshifted = 67'b0;
+                    dsticky  = |div67;
+                end else begin
+                    dshifted = div67 >> denorm_shift;
+                    dsticky  = |(div67 & ((67'b1 << denorm_shift) - 67'b1));
+                end
+                div67      = dshifted;
+                div67[0]   = div67[0] | dsticky;
+                exp_result = 18'sd0;
+            end
+
+            flag_inex2 = (div67[2:0] != 3'b0);
+
+            round_mantissa(div67[66:3], div67[2], div67[1], div67[0],
+                            sign_r, rmode, rounded_mant, carry);
             if (carry) begin
                 rounded_mant = {1'b1, rounded_mant[63:1]};
                 exp_result   = exp_result + 18'sd1;
@@ -559,8 +747,7 @@ package m68882_apu_pkg;
             if (exp_result >= 18'sd32767) begin
                 flag_ovfl = 1'b1;
                 result = {sign_r, 15'h7FFF, 16'h0, 64'h8000_0000_0000_0000};
-            end else if (exp_result <= 18'sd0 || rounded_mant == 64'h0) begin
-                flag_unfl = (exp_result <= 18'sd0);
+            end else if (rounded_mant == 64'h0) begin
                 result = {sign_r, 15'h0, 16'h0, 64'h0};
             end else begin
                 result = {sign_r, exp_result[14:0], 16'h0, rounded_mant};
@@ -688,35 +875,77 @@ package m68882_apu_pkg;
             logic [133:0] sqrt_n;
             logic [66:0]  root;
             logic [133:0] rem;
-            logic [63:0]  mant64;
-            logic         guard, round_bit, sticky;
+            logic [66:0]  sqrt67;
             logic [63:0]  rounded_mant;
             logic         carry;
             logic signed [17:0] exp_result;
+            logic [63:0]  eff_mant_a;
+            logic [6:0]   lz_a;
+            logic signed [17:0] eff_exp_a;
+            logic signed [17:0] denorm_shift;
 
-            real_exp = $signed({3'b0, a.exp}) - 18'sd16383;
+            // Phase 13: denormal input normalization -- same "1-lz"
+            // convention fp_add_sub/fp_mul/fp_div already established
+            // (fp_sqrt is monadic, so only one operand to normalize).
+            if (a.exp == 15'h0 && a.mant != 64'h0) begin
+                lz_a       = lzc64(a.mant);
+                eff_mant_a = a.mant << lz_a;
+                eff_exp_a  = 18'sd1 - {11'b0, lz_a};
+            end else begin
+                lz_a       = 7'd0;
+                eff_mant_a = a.mant;
+                eff_exp_a  = $signed({3'b0, a.exp});
+            end
+
+            real_exp = eff_exp_a - 18'sd16383;
             is_even  = !real_exp[0];
             half_exp = real_exp >>> 1;
 
-            sqrt_n = is_even ? ({70'b0, a.mant} << 69) : ({70'b0, a.mant} << 68);
+            sqrt_n = is_even ? ({70'b0, eff_mant_a} << 69) : ({70'b0, eff_mant_a} << 68);
 
             isqrt134(sqrt_n, root, rem);
 
             if (root[66]) begin
-                mant64     = root[66:3];
-                guard      = root[2];
-                round_bit  = root[1];
-                sticky     = root[0] | (rem != 134'b0);
+                sqrt67 = {root[66:3], root[2], root[1], root[0] | (rem != 134'b0)};
             end else begin
-                mant64     = root[65:2];
-                guard      = root[1];
-                round_bit  = root[0];
-                sticky     = (rem != 134'b0);
+                sqrt67 = {root[65:2], root[1], root[0], (rem != 134'b0)};
             end
             exp_result = half_exp + 18'sd16383;
-            flag_inex2 = guard || round_bit || sticky;
 
-            round_mantissa(mant64, guard, round_bit, sticky, 1'b0, rmode, rounded_mant, carry);
+            // Phase 13: gradual underflow (same shape as the other 3
+            // core arithmetic tasks -- shift right, folding into the
+            // guard/round/sticky tail, BEFORE rounding once). Kept for
+            // architectural symmetry with fp_add_sub/fp_mul/fp_div, but
+            // genuinely unreachable for any real operand: sqrt always
+            // roughly HALVES the magnitude of the real exponent, so even
+            // the smallest representable denormal (real exponent
+            // ~-16445) square-roots to a real exponent around -8222 --
+            // deep in ordinary normal range, nowhere near this branch's
+            // own <1 threshold. The denormal INPUT normalization above
+            // (eff_mant_a/eff_exp_a) is the part that's actually needed
+            // and reachable here; this output-side branch is defensive,
+            // not load-bearing.
+            denorm_shift = (exp_result < 18'sd1) ? (18'sd1 - exp_result) : 18'sd0;
+            if (denorm_shift > 18'sd0) begin
+                logic [66:0] dshifted;
+                logic        dsticky;
+                flag_unfl = 1'b1;
+                if (denorm_shift >= 18'sd67) begin
+                    dshifted = 67'b0;
+                    dsticky  = |sqrt67;
+                end else begin
+                    dshifted = sqrt67 >> denorm_shift;
+                    dsticky  = |(sqrt67 & ((67'b1 << denorm_shift) - 67'b1));
+                end
+                sqrt67     = dshifted;
+                sqrt67[0]  = sqrt67[0] | dsticky;
+                exp_result = 18'sd0;
+            end
+
+            flag_inex2 = (sqrt67[2:0] != 3'b0);
+
+            round_mantissa(sqrt67[66:3], sqrt67[2], sqrt67[1], sqrt67[0],
+                            1'b0, rmode, rounded_mant, carry);
             if (carry) begin
                 rounded_mant = {1'b1, rounded_mant[63:1]};
                 exp_result   = exp_result + 18'sd1;
@@ -725,8 +954,7 @@ package m68882_apu_pkg;
             if (exp_result >= 18'sd32767) begin
                 flag_ovfl = 1'b1;
                 result = {1'b0, 15'h7FFF, 16'h0, 64'h8000_0000_0000_0000};
-            end else if (exp_result <= 18'sd0 || rounded_mant == 64'h0) begin
-                flag_unfl = (exp_result <= 18'sd0);
+            end else if (rounded_mant == 64'h0) begin
                 result = {1'b0, 15'h0, 16'h0, 64'h0};
             end else begin
                 result = {1'b0, exp_result[14:0], 16'h0, rounded_mant};

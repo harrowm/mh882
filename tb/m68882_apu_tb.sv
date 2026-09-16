@@ -1111,6 +1111,133 @@ module m68882_apu_tb;
               "Phase 12: FADD overflow with OVFL trap ENABLED still stores the saturated +infinity result (Section 6.1.4 -- NOT suppressed like SNAN/OPERR/DZ)");
         u_top.u_proto.u_regfile.fpcr_r[12] = 1'b0;
 
+        // ── Phase 13: denormalized-number support ────────────────────
+        // Reference values cross-checked against tools/musashi_fpu_ref
+        // (its own vendored softfloat.c already implements IEEE-correct
+        // floatx80 denormal arithmetic) for every vector EXCEPT the
+        // last one below -- confirmed empirically that Musashi mishandles
+        // exp=0/mantissa=0x8000000000000000 specifically (the one exact
+        // bit pattern Section 3.2's own NOTE says is a valid NORMALIZED
+        // value at extended precision's own minimum exponent, not a
+        // denormal at all): Musashi's own FADD of that pattern to itself
+        // gives a spurious zero instead of the mathematically correct
+        // doubled value, so that one case is verified from the manual's
+        // own text directly instead.
+        begin
+            localparam logic [95:0] DENORM_HALF  = 96'h0000_0000_4000_0000_0000_0000; // 0.5*2^-16382 = 2^-16383
+            localparam logic [95:0] SMALLEST_NORM = 96'h0001_0000_8000_0000_0000_0000; // 2^-16382
+            localparam logic [95:0] DENORM_MIN   = 96'h0000_0000_0000_0000_0000_0001; // smallest denormal, 1 ULP
+            localparam logic [95:0] DENORM_QTR   = 96'h0000_0000_2000_0000_0000_0000; // 0.25*2^-16382
+            localparam logic [95:0] DENORM_3QTR  = 96'h0000_0000_6000_0000_0000_0000; // 0.75*2^-16382
+            localparam logic [95:0] DENORM_BOUNDARY = 96'h0000_0000_8000_0000_0000_0000; // exp=0,mant=0x8000... -- Section 3.2's own "still normalized" boundary value (== 2^-16382, a redundant encoding of SMALLEST_NORM), NOT a true denormal
+
+            load_fp(0, DENORM_HALF);
+            load_fp(1, DENORM_HALF);
+            dispatch(cmd_word(3'b000, 3'd0, 3'd1, 7'h22)); // FADD: 2 denormals -> a normal result
+            check(u_top.u_proto.u_regfile.fp_r[1] == SMALLEST_NORM,
+                  "Phase 13: FADD(2^-16383, 2^-16383) == 2^-16382 (smallest normal) -- denormal input normalization, carrying into the normal range");
+
+            load_fp(0, DENORM_HALF);
+            load_fp(1, SMALLEST_NORM);
+            dispatch(cmd_word(3'b000, 3'd0, 3'd1, 7'h22)); // FADD: mixed denormal + normal
+            check(u_top.u_proto.u_regfile.fp_r[1] == {1'b0, 15'd1, 16'h0, 64'hC000_0000_0000_0000},
+                  "Phase 13: FADD(2^-16383, 2^-16382) == 1.5*2^-16382 -- mixed denormal/normal addition");
+
+            load_fp(0, DENORM_MIN);
+            load_fp(1, DENORM_MIN);
+            dispatch(cmd_word(3'b000, 3'd0, 3'd1, 7'h22)); // FADD: smallest denormal doubled, still a denormal result
+            check(u_top.u_proto.u_regfile.fp_r[1] == 96'h0000_0000_0000_0000_0000_0002,
+                  "Phase 13: FADD(1 ULP denormal, 1 ULP denormal) == 2 ULP denormal (result stays denormal, exp field 0)");
+
+            load_fp(0, DENORM_QTR);
+            load_fp(1, DENORM_3QTR);
+            dispatch(cmd_word(3'b000, 3'd0, 3'd1, 7'h28)); // FSUB: pure denormal subtraction
+            check(u_top.u_proto.u_regfile.fp_r[1] == DENORM_HALF,
+                  "Phase 13: FSUB(0.75*2^-16382 denormal, 0.25*2^-16382 denormal) == 0.5*2^-16382 denormal");
+
+            load_fp(0, DENORM_MIN);
+            load_fp(1, DENORM_MIN);
+            dispatch(cmd_word(3'b000, 3'd0, 3'd1, 7'h28)); // FSUB: exact denormal self-cancellation
+            check(u_top.u_proto.u_regfile.fp_r[1] == 96'h0,
+                  "Phase 13: FSUB(1 ULP denormal, 1 ULP denormal) == exact +0.0");
+            check(u_top.u_proto.u_regfile.fpsr_r[26] == 1'b1, "Phase 13: FSUB denormal self-cancellation sets the Z condition code");
+
+            load_fp(0, DENORM_BOUNDARY);
+            load_fp(1, DENORM_BOUNDARY);
+            dispatch(cmd_word(3'b000, 3'd0, 3'd1, 7'h22)); // FADD: the exp=0/explicit-bit-set boundary value, doubled
+            check(u_top.u_proto.u_regfile.fp_r[1] == {1'b0, 15'd2, 16'h0, 64'h8000_0000_0000_0000},
+                  "Phase 13: FADD(2^-16382 boundary value, itself) == 2^-16381 (Section 3.2's own NOTE -- exp=0 with the explicit bit set is a REDUNDANT encoding of the SAME value as exp=1 with that mantissa, both = the smallest normal magnitude; Musashi itself gets this one wrong, confirmed empirically, not used as the reference here)");
+
+            // FMUL denormal support -- same "1-lz" input normalization,
+            // reference values Musashi-verified.
+            load_fp(0, EXT_2_0);
+            load_fp(1, DENORM_HALF);
+            dispatch(cmd_word(3'b000, 3'd0, 3'd1, 7'h23)); // FMUL: normal * denormal -> normal
+            check(u_top.u_proto.u_regfile.fp_r[1] == SMALLEST_NORM,
+                  "Phase 13: FMUL(2.0, 2^-16383 denormal) == 2^-16382 (smallest normal)");
+
+            load_fp(0, EXT_1_0);
+            load_fp(1, DENORM_HALF);
+            dispatch(cmd_word(3'b000, 3'd0, 3'd1, 7'h23)); // FMUL: 1.0 * denormal -> the same denormal
+            check(u_top.u_proto.u_regfile.fp_r[1] == DENORM_HALF,
+                  "Phase 13: FMUL(1.0, 2^-16383 denormal) == 2^-16383 denormal, unchanged");
+
+            load_fp(0, SMALLEST_NORM);
+            load_fp(1, DENORM_HALF);
+            dispatch(cmd_word(3'b000, 3'd0, 3'd1, 7'h23)); // FMUL: normal * denormal, product genuinely underflows past the smallest denormal
+            check(u_top.u_proto.u_regfile.fp_r[1] == 96'h0,
+                  "Phase 13: FMUL(2^-16382, 2^-16383 denormal) == +0.0 (product genuinely below the smallest representable denormal)");
+            check(u_top.u_proto.u_regfile.fpsr_r[11] == 1'b1, "Phase 13: FMUL underflow-past-smallest-denormal sets the UNFL exception-status bit");
+
+            load_fp(0, DENORM_HALF);
+            load_fp(1, DENORM_HALF);
+            dispatch(cmd_word(3'b000, 3'd0, 3'd1, 7'h23)); // FMUL: denormal * denormal, also underflows past the smallest denormal
+            check(u_top.u_proto.u_regfile.fp_r[1] == 96'h0,
+                  "Phase 13: FMUL(2^-16383 denormal, 2^-16383 denormal) == +0.0 (product genuinely below the smallest representable denormal)");
+
+            // FDIV denormal support -- same "1-lz" input normalization,
+            // applied to BOTH dividend and divisor; reference values
+            // Musashi-verified.
+            load_fp(0, EXT_2_0);
+            load_fp(1, DENORM_HALF);
+            dispatch(cmd_word(3'b000, 3'd0, 3'd1, 7'h20)); // FDIV: denormal dest / normal source -> smaller denormal
+            check(u_top.u_proto.u_regfile.fp_r[1] == DENORM_QTR,
+                  "Phase 13: FDIV(source=2.0, dest=2^-16383 denormal) == 2^-16384 (0.25*2^-16382) denormal");
+
+            load_fp(0, DENORM_HALF);
+            load_fp(1, EXT_1_0);
+            dispatch(cmd_word(3'b000, 3'd0, 3'd1, 7'h20)); // FDIV: normal dest / denormal source -> large normal result
+            check(u_top.u_proto.u_regfile.fp_r[1] == {1'b0, 15'h7FFE, 16'h0, 64'h8000_0000_0000_0000},
+                  "Phase 13: FDIV(source=2^-16383 denormal, dest=1.0) == 2^16383 (denormal SOURCE/divisor normalization)");
+
+            load_fp(0, SMALLEST_NORM);
+            load_fp(1, DENORM_HALF);
+            dispatch(cmd_word(3'b000, 3'd0, 3'd1, 7'h20)); // FDIV: two denormal-range values
+            check(u_top.u_proto.u_regfile.fp_r[1] == EXT_0_5,
+                  "Phase 13: FDIV(source=2^-16382, dest=2^-16383 denormal) == 0.5 (both operands normalize into the same scale correctly)");
+
+            // FSQRT denormal support -- same "1-lz" input normalization
+            // (fp_sqrt's own gradual-underflow OUTPUT path is genuinely
+            // unreachable -- sqrt roughly halves the exponent magnitude,
+            // so even the smallest denormal square-roots deep into
+            // normal range -- only the INPUT side is exercised here).
+            // Reference values Musashi-verified.
+            load_fp(0, DENORM_HALF);
+            dispatch(cmd_word(3'b000, 3'd0, 3'd1, 7'h04)); // FSQRT(2^-16383 denormal)
+            check(u_top.u_proto.u_regfile.fp_r[1] == {1'b0, 15'h1FFF, 16'h0, 64'hb504f333f9de6484},
+                  "Phase 13: FSQRT(2^-16383 denormal) == 2^-8192 * sqrt(2) (odd real exponent)");
+
+            load_fp(0, DENORM_MIN);
+            dispatch(cmd_word(3'b000, 3'd0, 3'd1, 7'h04)); // FSQRT(smallest possible denormal)
+            check(u_top.u_proto.u_regfile.fp_r[1] == {1'b0, 15'h1FE0, 16'h0, 64'hb504f333f9de6484},
+                  "Phase 13: FSQRT(smallest denormal, 1 ULP) normalizes correctly even at maximum leading-zero-count (lz=63)");
+
+            load_fp(0, DENORM_BOUNDARY);
+            dispatch(cmd_word(3'b000, 3'd0, 3'd1, 7'h04)); // FSQRT(the exp=0/explicit-bit-set boundary value)
+            check(u_top.u_proto.u_regfile.fp_r[1] == {1'b0, 15'h2000, 16'h0, 64'h8000_0000_0000_0000},
+                  "Phase 13: FSQRT(2^-16382 boundary value) == 2^-8191 exactly -- Musashi's own SQRT path (unlike its ADD path) handles this boundary consistently with this project's own formula");
+        end
+
         $display("---");
         $display("%0d passed, %0d failed", pass_count, fail_count);
         if (fail_count != 0) begin
