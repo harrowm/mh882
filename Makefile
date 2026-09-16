@@ -34,14 +34,45 @@ $(SIM)/frame: $(RTL_SRCS) tb/m68882_frame_tb.sv | $(SIM)
 $(SIM)/pipeline: $(RTL_SRCS) tb/m68882_pipeline_tb.sv | $(SIM)
 	$(IV) $(IVFLAGS) -o $@ $^
 
+# ── Phase 7: Musashi golden-reference cosim ─────────────────────────────────
+MUSASHI_DIR := tools/musashi
+MUSASHI_SRC := $(MUSASHI_DIR)/m68kcpu.c $(MUSASHI_DIR)/m68kdasm.c \
+               $(MUSASHI_DIR)/m68kops.c $(MUSASHI_DIR)/softfloat/softfloat.c
+MUSASHI_FLAGS := -O2 -DM68K_EMULATE_FC=1 -I$(MUSASHI_DIR) -lm
+
+$(MUSASHI_DIR)/m68kmake: $(MUSASHI_DIR)/m68kmake.c
+	gcc -o $@ $<
+
+$(MUSASHI_DIR)/m68kops.c $(MUSASHI_DIR)/m68kops.h: $(MUSASHI_DIR)/m68kmake
+	cd $(MUSASHI_DIR) && ./m68kmake
+
+tools/musashi_fpu_ref: tools/musashi_fpu_ref.c $(MUSASHI_SRC)
+	gcc $(MUSASHI_FLAGS) -o $@ $^
+
+tests/fpu_vectors.txt: scripts/gen_fpu_vectors.py
+	python3 $<
+
+tests/fpu_musashi_ref.txt: tools/musashi_fpu_ref tests/fpu_vectors.txt
+	./tools/musashi_fpu_ref tests/fpu_vectors.txt > $@
+
+$(SIM)/musashi_cosim: $(RTL_SRCS) tb/m68882_musashi_cosim_tb.sv | $(SIM)
+	$(IV) $(IVFLAGS) -o $@ $^
+
 .PHONY: test
-test: $(SIM)/biu_smoke $(SIM)/proto $(SIM)/apu $(SIM)/frame $(SIM)/pipeline
+test: $(SIM)/biu_smoke $(SIM)/proto $(SIM)/apu $(SIM)/frame $(SIM)/pipeline \
+      $(SIM)/musashi_cosim tests/fpu_musashi_ref.txt
 	$(VVP) $(SIM)/biu_smoke
 	$(VVP) $(SIM)/proto
 	$(VVP) $(SIM)/apu
 	$(VVP) $(SIM)/frame
 	$(VVP) $(SIM)/pipeline
+	$(VVP) $(SIM)/musashi_cosim
 
 .PHONY: clean
 clean:
 	rm -rf $(SIM)
+
+.PHONY: clean-musashi
+clean-musashi:
+	rm -f $(MUSASHI_DIR)/m68kmake $(MUSASHI_DIR)/m68kops.c $(MUSASHI_DIR)/m68kops.h
+	rm -f tools/musashi_fpu_ref

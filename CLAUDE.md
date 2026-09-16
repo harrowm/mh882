@@ -332,13 +332,35 @@ Same conventions as MH030: SystemVerilog (`always_ff`, `always_comb`,
 `typedef enum`, `struct`), `generate` loops for replicated structures
 (FP0-FP7), no combining two pipeline stages in one `always` block.
 
-## Verification Approach (planned, Phase 7)
+## Verification Approach (Phase 7, COMPLETE)
 
-Trace-driven co-simulation, mirroring MH030's own methodology: MH030's
-`tools/musashi/` already includes 68881/2 FPU emulation (softfloat-
-based) as a golden reference. Bus-cycle-log diffing plus a dedicated
-arithmetic-result comparison pass (MH030's own harness never needed this,
-since it only ever checked integer/bus correctness).
+Arithmetic-result cosim against Musashi's own 68881/2 FPU emulation
+(softfloat-based) — `tools/musashi/` is this project's OWN copy (not a
+cross-repo dependency on MH030's own checkout), matching plan.md's own
+documented option. `tools/musashi_fpu_ref.c` hand-assembles a real
+F-line general-instruction-format opcode (the exact same Table 4-11
+command word this project's own `cmd_word()`/`cmd_opclass`/`cmd_rx`/
+`cmd_ry`/`cmd_ext` already use) and runs it through Musashi's own real
+`m68k_execute()` decode path — not a hand-picked internal function call.
+`floatx80` (Musashi's own softfloat type) maps directly onto this
+project's own extended-precision format: `ext96 = {high, 16'h0, low}`.
+
+**Confirmed scope boundary** (direct grep of `m68kfpu.c`, not assumed):
+this Musashi version's FPU emulation only ever sets the FPSR condition-
+code byte — it never implements the exception-status/accrued-exception
+bytes at all. The cosim (`tb/m68882_musashi_cosim_tb.sv`, 63 checks
+across 31 vectors, `scripts/gen_fpu_vectors.py`) therefore only compares
+the full 80-bit result value and the condition-code byte; Phase 4d's own
+exception/accrued-byte semantics remain independently unconfirmed by
+this harness. One genuine, investigated, permanent divergence
+(FSQRT-of-negative's own default-NaN bit pattern — both sides agree it's
+a NaN, disagree on sign/payload, neither confirmed against the real
+manual) is documented and specially compared rather than silently
+special-cased away or left permanently red — see plan.md's own Phase 7
+writeup for the full derivation, including a real harness bug found and
+fixed along the way (Musashi's `float_rounding_mode` is only ever
+updated as a side effect of executing a real `FMOVE <ea>,FPCR`
+instruction — poking `m68ki_cpu.fpcr` directly never triggers it).
 
 ## Data Bus Lane Placement (Section 9.8 — easy to get wrong)
 
@@ -353,7 +375,7 @@ doesn't need to (and can't) account for.
 
 ## Current State
 
-**Phases 0-6 are complete** (see the Phase 6 closing paragraph a few
+**Phases 0-7 are complete** (see the Phase 6/7 closing paragraphs a few
 sections above and plan.md for the full writeup; Phases 0-3 below cover
 the earliest history in more detail).
 
@@ -593,12 +615,23 @@ same `automatic` task caused a genuine zero-simulation-time livelock —
 see plan.md for the full bisection). All 4 existing testbenches updated
 for the new mandatory-dispatch sequencing; a new `tb/m68882_pipeline_tb.sv`
 (32 checks) exercises the full 2-deep overlap, busy-reject, protocol-
-violation, AB, and XA/FSAVE sequences end to end. **146/146 across all
-five testbenches.**
+violation, AB, and XA/FSAVE sequences end to end. 146/146 across all
+five testbenches at the time.
 
-See `plan.md` for the full phased build plan. Phase 7 (verification
-harness) is next.
+**Phase 7 (Musashi golden-reference cosim) is also complete.** See the
+"Verification Approach" section above for the full summary and plan.md
+for the complete derivation (the F-line opcode hand-assembly, the
+`floatx80`-maps-directly-onto-this-project's-own-format finding, the
+`float_rounding_mode` side-effect bug found and fixed in the harness
+itself, the confirmed Musashi FPSR-exception-byte scope boundary, and
+the one genuine documented default-NaN-pattern divergence). New
+`tools/musashi_fpu_ref.c` (harness), `scripts/gen_fpu_vectors.py`
+(31-vector battery generator), `tb/m68882_musashi_cosim_tb.sv` (63
+checks). **209/209 across all six testbenches.**
+
+See `plan.md` for the full phased build plan. Phase 8 (companion
+integration example, optional) is next.
 
 ```bash
-make test   # builds and runs all five testbenches via Icarus Verilog
+make test   # builds and runs all six testbenches via Icarus Verilog
 ```

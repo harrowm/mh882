@@ -1,6 +1,6 @@
 # MC68882 FPU — Phased Scope Plan
 
-## Status: Phases 0-5 complete (4a/4b core arithmetic, transcendentals deferred; 4c L/S/D/X conversion, W/B/P remain; 4d exception/accrued-byte semantics; 5 state frame save/restore). Phase 6 (68882-specific pipelining) complete. Phase 7 (verification harness) is next.
+## Status: Phases 0-5 complete (4a/4b core arithmetic, transcendentals deferred; 4c L/S/D/X conversion, W/B/P remain; 4d exception/accrued-byte semantics; 5 state frame save/restore). Phase 6 (68882-specific pipelining) complete. Phase 7 (verification harness — Musashi golden-reference cosim) complete. Phase 8 (companion integration example, optional) is next.
 
 ## Origin
 
@@ -1079,15 +1079,128 @@ CU's own external-transfer dialog" sub-case remains theoretical without
 a genuine concurrent EA-transfer-plus-arithmetic scenario to test it
 against — noted as a real, still-open sub-case, not silently dropped.
 
-### Phase 7 — Verification harness
-Mirror MH030's own trace-driven co-simulation methodology. MH030's own
-`tools/musashi/` already includes 68881/2 FPU emulation (softfloat-
-based) — the natural golden reference, reusable without building a
-second one (this repo would need its own copy/build of Musashi, or a
-documented path to MH030's). Bus-cycle-log diffing the same way MH030's
-`run_harte.py`/`cosim_grp` already work, plus a dedicated arithmetic-
-result comparison pass MH030 never needed (its own harness only ever
-checked integer/bus correctness).
+### Phase 7 — Verification harness (Musashi golden-reference cosim), COMPLETE
+
+**Own copy, not a cross-repo dependency**: `tools/musashi/` is a direct
+copy of MH030's own `tools/musashi/` (MIT-style license, copyright
+notice preserved), matching plan.md's own previously-documented "own
+copy" option — this repo never reads from or depends on a `../MH030`
+checkout existing.
+
+**The harness (`tools/musashi_fpu_ref.c`)**: rather than write a second
+independent FPU emulator (pointless duplication) or try to call
+Musashi's internal opcode-handler functions directly (fragile, and them
+being `static` makes it impractical), the harness hand-assembles a REAL
+F-line "general instruction format" opcode and runs it through Musashi's
+own genuine `m68k_execute()` instruction-decode path — first word
+`0xF200` (CpID + an unused EA-mode/register field, since opclass 000
+register-to-register needs no EA at all), second word = the exact same
+Table 4-11 command-word encoding this project's own `cmd_word()` helper
+(every testbench) and `rtl/m68882_cir_pkg.sv::cmd_opclass/cmd_rx/cmd_ry/
+cmd_ext` already use — confirmed by direct inspection of Musashi's own
+`m68040_fpu_op0()`/`fpgen_rm_reg()` (`m68kfpu.c`) that it decodes the
+identical bit layout, not assumed. FP0 is always the source (RX), FP1
+always the pre-existing destination (RY), poked directly into Musashi's
+own `m68ki_cpu.fpr[]` (extern, confirmed accessible via `m68kcpu.h`)
+before executing exactly one instruction.
+
+**floatx80 maps directly onto this project's own extended-precision
+format** — confirmed from softfloat.h's own struct definition
+(`{bits16 high; bits64 low;}`), not assumed: `ext96 = {high, 16'h0,
+low}`, matching Table 3-3's own sign/exp/reserved/mantissa layout
+exactly. No conversion logic needed beyond the zero-insertion.
+
+**A real harness bug found and fixed while building this**: the first
+version produced IDENTICAL FDIV results across all 4 requested rounding
+modes. Root cause, confirmed by direct inspection of `m68kfpu.c`:
+Musashi's own `float_rounding_mode` (a softfloat-internal global) is
+ONLY ever updated as a side effect of executing a real `FMOVE <ea>,FPCR`
+instruction (`fmove_fpcr()`) — poking `m68ki_cpu.fpcr` directly (as the
+harness does, bypassing instruction execution) never triggers that, so
+the arithmetic core silently kept using whatever rounding mode was last
+active. Fixed by setting the softfloat-internal `float_rounding_mode`
+extern directly — confirmed its own enum (`float_round_nearest_even=0/
+to_zero=1/down=2/up=3`) matches this project's own `round_mode_t`/FPCR
+bits[5:4] encoding exactly, so this is a correct fix, not a workaround.
+Re-verified against a genuinely inexact division (1.0/3.0): the 4
+rounding modes now produce 4 correctly-different results
+(`...aaaaaaab`/`...aaaaaaaa`/`...aaaaaaaa`/`...aaaaaaab` for nearest/
+zero/-inf/+inf respectively — exactly the expected pattern for a
+positive inexact result).
+
+**A significant scope-boundary finding, confirmed by direct grep of
+`m68kfpu.c` (not assumed)**: this specific Musashi version's FPU
+emulation ONLY EVER sets the FPSR condition-code byte (`REG_FPSR |=
+FPCC_N/Z/I/NAN`, 4 call sites total in the whole file) — it never
+implements the exception-status or accrued-exception bytes at all
+(BSUN/SNAN/OPERR/OVFL/UNFL/DZ/INEX2/INEX1 never appear as an assignment
+target anywhere). Confirmed empirically too: an FDIV-by-zero vector
+correctly produced `+Infinity` with the I condition code set, but FPSR's
+DZ bit (both EXC bit10 and AEXC bit4) stayed zero. **This means Phase 4d's
+own exception/accrued-byte semantics remain independently unconfirmed**
+— the cosim harness (below) therefore only ever compares the full
+80-bit result value and the condition-code byte, never the exception-
+status/accrued-exception bytes, and says so in its own header comment
+rather than silently claiming broader coverage than it has.
+
+**Vector battery (`scripts/gen_fpu_vectors.py` → `tests/fpu_vectors.txt`,
+31 vectors)**: all 9 register-to-register opcodes (FADD/FSUB/FMUL/FDIV/
+FSQRT/FABS/FNEG/FCMP/FTST), covering normal-number pairs, zero,
+negative operands, +Infinity, and a quiet NaN, plus the 2 ops whose
+result actually depends on rounding (FADD/FDIV) repeated under all 4
+FPCR rounding modes. `tests/fpu_musashi_ref.txt` is the harness's own
+precomputed output for the identical vectors (`make` regenerates it
+from the harness + vector file; both are also committed directly, so a
+fresh checkout without `gcc` on `PATH` can still run the RTL-only test
+suite).
+
+**Cosim testbench (`tb/m68882_musashi_cosim_tb.sv`, 63 checks across the
+31 vectors)**: reads both files together with `$fgets`+`$sscanf` (NOT
+`$fscanf` directly on the file — an earlier attempt found `$fscanf`
+chokes on the vector file's own trailing `# comment` text, desyncing
+every subsequent line; `$fgets` naturally isolates one line at a time,
+sidestepping the issue entirely), drives each vector through the real
+Command+Instruction-Address CIR dialog (reusing `tb/m68882_apu_tb.sv`'s
+own pipeline-aware `dispatch()` polling pattern), and compares the
+committed FP1 result plus FPSR's condition-code byte against Musashi's
+own precomputed answer.
+
+**One genuine, investigated, permanent divergence found — NOT a bug in
+either side, documented rather than silently special-cased away**: FSQRT
+of a negative, nonzero, non-NaN operand is an invalid-operation (OPERR)
+condition whose real 68881/2 "default NaN" result BIT PATTERN is
+unconfirmed against the manual by EITHER side. This project's own
+`rtl/m68882_apu.sv` independently chose sign=0/exp=7FFF/mantissa=
+C000...0 (N=0); Musashi's own `m68kfpu.c` independently chose sign=1/
+exp=7FFF/mantissa=FFFF...F (N=1) — confirmed by direct inspection, not
+assumed. Both sides correctly agree the RESULT is a NaN and both
+correctly set the NAN condition code; only the specific default-NaN
+payload/sign differs. The cosim testbench special-cases exactly this one
+scenario (checked via the vector's own input fields, not a hardcoded
+vector index) to compare "is a NaN on both sides" instead of an exact
+bit match, with an extensive inline comment explaining why — mirroring
+MH030's own established precedent for a same-opcode-cross-check-
+confirmed corpus anomaly (the ASL.b Tom Harte finding) rather than
+either silently dropping the vector or leaving a permanently-red test.
+
+**146/146 across the pre-existing 5 testbenches (unaffected — no RTL
+changed this phase) + 63/63 across the 31 new Musashi-cosim checks =
+209/209 total.**
+
+**Deliberately not attempted, and why**: bus-cycle-log diffing (the
+OTHER half of MH030's own methodology, alongside its arithmetic-result
+comparison) doesn't have a natural analogue here — MH030's own bus logs
+capture a real CPU's instruction-fetch-and-execute bus traffic, but this
+project's own CIR dialog IS the bus traffic, already directly driven and
+checked cycle-by-cycle by every existing testbench since Phase 2 (the
+Musashi harness never drives THIS chip's own pins at all — it's a
+same-input arithmetic-result oracle, not a bus-trace source). Musashi's
+own 68030 CPU-side bus-cycle logging (`tools/m68ksim.c`'s own actual
+purpose in MH030) has no meaningful role here since this project has no
+CPU of its own to log. W/B/P-format conversion and the transcendental
+set remain untested by this harness for the same reason they remain
+unimplemented (Phase 4b/4c's own still-open scope) — the vector battery
+can be extended to cover them the moment those land.
 
 ### Phase 8 — Companion integration example (optional, last)
 A small external glue module (`FC=111 && A[19:16]=$2 && A[15:13]=CpID →
