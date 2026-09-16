@@ -222,6 +222,17 @@ for the round-to-nearest case.
 
 ---
 
+## See also
+
+A fourth, differently-kinded finding — not a logic bug like the three
+above, but a genuine precision/fidelity shortfall in `FSIN`/`FCOS`/
+`FSINCOS` (they compute via IEEE `double`, 53 significant bits, not the
+chip's own 64-bit extended precision) — is documented and filed
+separately in
+[`musashi_issue_sincos_precision.md`](musashi_issue_sincos_precision.md),
+since it doesn't fit the "one input, one clearly-wrong answer" shape
+the three bugs above share.
+
 ## How these were found
 
 All three were found via `tools/musashi_fpu_ref.c` in this repo — a
