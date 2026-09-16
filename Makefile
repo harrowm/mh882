@@ -58,15 +58,25 @@ tests/fpu_musashi_ref.txt: tools/musashi_fpu_ref tests/fpu_vectors.txt
 $(SIM)/musashi_cosim: $(RTL_SRCS) tb/m68882_musashi_cosim_tb.sv | $(SIM)
 	$(IV) $(IVFLAGS) -o $@ $^
 
+# ── Phase 8: companion integration example ──────────────────────────────────
+$(SIM)/glue: rtl/glue_cs_decode.sv tb/glue_cs_decode_tb.sv | $(SIM)
+	$(IV) $(IVFLAGS) -o $@ $^
+
+$(SIM)/example: $(RTL_SRCS) rtl/glue_cs_decode.sv example/mh882_companion_example.sv \
+                tb/mh882_companion_example_tb.sv | $(SIM)
+	$(IV) $(IVFLAGS) -I example -o $@ $^
+
 .PHONY: test
 test: $(SIM)/biu_smoke $(SIM)/proto $(SIM)/apu $(SIM)/frame $(SIM)/pipeline \
-      $(SIM)/musashi_cosim tests/fpu_musashi_ref.txt
+      $(SIM)/musashi_cosim tests/fpu_musashi_ref.txt $(SIM)/glue $(SIM)/example
 	$(VVP) $(SIM)/biu_smoke
 	$(VVP) $(SIM)/proto
 	$(VVP) $(SIM)/apu
 	$(VVP) $(SIM)/frame
 	$(VVP) $(SIM)/pipeline
 	$(VVP) $(SIM)/musashi_cosim
+	$(VVP) $(SIM)/glue
+	$(VVP) $(SIM)/example
 
 .PHONY: clean
 clean:

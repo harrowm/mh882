@@ -322,6 +322,15 @@ m68882_top            Pin-compatible top level. clk_4x is a plain port (Phase 1
                         the existing opclass 010/011 format-conversion dialog plus (Phase 6)
                         the real 2-deep APU pipeline staging logic, both genuinely CU-side
                         responsibilities that never needed their own module boundary.
+
+rtl/glue_cs_decode.sv          Phase 8: external CS# decode glue (FC=111 &&
+                                A[19:16]=0010 && A[15:13]=CpID, qualified by AS#) --
+                                NOT part of m68882_top's own hierarchy (a real system
+                                instantiates it separately, outside this chip).
+example/mh882_companion_example.sv  Phase 8: glue_cs_decode + m68882_top wired
+                                behind a host-side port list matching a real 68030's
+                                own CPU-space coprocessor cycle -- a usage example,
+                                not part of this chip's own required module tree.
 ```
 
 Keep each module under ~3000 lines, matching MH030's own guideline.
@@ -375,9 +384,10 @@ doesn't need to (and can't) account for.
 
 ## Current State
 
-**Phases 0-7 are complete** (see the Phase 6/7 closing paragraphs a few
-sections above and plan.md for the full writeup; Phases 0-3 below cover
-the earliest history in more detail).
+**Phases 0-8 are complete — plan.md's own original phased scope is
+closed in full** (see the Phase 6/7/8 closing paragraphs a few sections
+above and plan.md for the complete writeup; Phases 0-3 below cover the
+earliest history in more detail).
 
 - **Phase 0** (spec foundation): this file.
 - **Phase 1** (clock domain + pin-level BIU skeleton): `rtl/m68882_sync.sv`
@@ -627,11 +637,38 @@ itself, the confirmed Musashi FPSR-exception-byte scope boundary, and
 the one genuine documented default-NaN-pattern divergence). New
 `tools/musashi_fpu_ref.c` (harness), `scripts/gen_fpu_vectors.py`
 (31-vector battery generator), `tb/m68882_musashi_cosim_tb.sv` (63
-checks). **209/209 across all six testbenches.**
+checks). 209/209 across all six testbenches at the time.
 
-See `plan.md` for the full phased build plan. Phase 8 (companion
-integration example, optional) is next.
+**Phase 8 (companion integration example, optional) is also complete —
+this closes plan.md's own original phased scope in full.**
+`rtl/glue_cs_decode.sv` is the one piece of external logic a real
+68020+ host needs to attach this chip (`FC=111 && A[19:16]=0010 &&
+A[15:13]=CpID → CS_n`, qualified by AS#, confirmed against
+MC68030UM.pdf) — neither this project nor the sibling MH030 68030
+project has a dedicated coprocessor-select pin of its own.
+`example/mh882_companion_example.sv` instantiates the glue + `m68882_top`
+behind an external port list matching exactly what a real 68030's own
+CPU-space coprocessor bus cycle presents, so a real integrator connects
+it directly to their own 68030 — deliberately without instantiating
+MH030's own `m68030_top`, keeping this repo genuinely independent (the
+user's own original requirement that established it). `tb/glue_cs_decode_tb.sv`
+(12 checks) and `tb/mh882_companion_example_tb.sv` (2 checks, driving
+the assembled pair end to end: a matching CpID gets a real DSACK back,
+a non-matching one gets nothing at all — CS# never even asserts).
+**223/223 across all eight testbenches.**
+
+Closing MH030's own long-documented coprocessor-conditional-instruction
+gap (cpBcc/cpDBcc/cpScc/cpTRAPcc, Coprocessor Protocol Violation) is
+flagged as a genuine follow-on opportunity for that OTHER project — this
+repo is now the missing "real attached coprocessor" its own CLAUDE.md
+says that work has always needed — but doing it means modifying a
+different repository this session was never asked to touch, so it stays
+undone here, documented rather than silently skipped.
+
+See `plan.md` for the full phased build plan and the complete list of
+what remains deliberately out of scope (transcendentals, W/B/P formats,
+BSUN/INEX1, denormals, and the rest).
 
 ```bash
-make test   # builds and runs all six testbenches via Icarus Verilog
+make test   # builds and runs all eight testbenches via Icarus Verilog
 ```

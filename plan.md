@@ -1,6 +1,6 @@
 # MC68882 FPU — Phased Scope Plan
 
-## Status: Phases 0-5 complete (4a/4b core arithmetic, transcendentals deferred; 4c L/S/D/X conversion, W/B/P remain; 4d exception/accrued-byte semantics; 5 state frame save/restore). Phase 6 (68882-specific pipelining) complete. Phase 7 (verification harness — Musashi golden-reference cosim) complete. Phase 8 (companion integration example, optional) is next.
+## Status: Phases 0-8 complete (4a/4b core arithmetic, transcendentals deferred; 4c L/S/D/X conversion, W/B/P remain; 4d exception/accrued-byte semantics; 5 state frame save/restore; 6 68882-specific pipelining; 7 Musashi golden-reference cosim; 8 companion integration example). Every phase in this plan's own original scope is now closed — see the Phase 8 writeup below for what remains deliberately out of scope, and why.
 
 ## Origin
 
@@ -1202,16 +1202,65 @@ set remain untested by this harness for the same reason they remain
 unimplemented (Phase 4b/4c's own still-open scope) — the vector battery
 can be extended to cover them the moment those land.
 
-### Phase 8 — Companion integration example (optional, last)
-A small external glue module (`FC=111 && A[19:16]=$2 && A[15:13]=CpID →
-CS_n`) and example top-level wiring attaching this chip to the MH030
-project's own 68030 (as a sibling checkout or git submodule, never a
-code dependency) — demonstrating the "separate but able to work
-together" requirement concretely. Also the natural point to circle back
-and close MH030's own long-documented coprocessor-conditional-
-instruction gap, now that a real coprocessor exists to test against —
-flagged as a follow-on opportunity for that project, not required for
-this one to be complete.
+### Phase 8 — Companion integration example (optional, last), COMPLETE
+
+**`rtl/glue_cs_decode.sv`**: the one piece of external logic a real
+68020+ host needs to attach this chip — neither this project nor the
+sibling MH030 68030 project has a dedicated coprocessor-select output
+pin of its own (a standing, documented gap in both). Confirmed directly
+against MC68030UM.pdf (and MH030's own CLAUDE.md, "BIU Cycle Types"):
+`FC=111 && A[19:16]=0010 && A[15:13]=CpID → CS_n`, qualified by AS# (a
+real glue chip never asserts CS# from address/FC lines alone, since
+those can sit at arbitrary intermediate values between bus cycles).
+CPID is a compile-time parameter, matching how a real system wires each
+coprocessor's own glue instance to its own fixed slot. `tb/glue_cs_decode_tb.sv`
+(12 checks): the matching case, AS#-not-qualifying, wrong FC, wrong
+A[19:16] (specifically checking A[19:16]=1111, the IACK CPU-space
+sub-type, is correctly rejected), and all 7 OTHER CpID slots correctly
+staying deselected.
+
+**`example/mh882_companion_example.sv`**: instantiates `m68882_top` +
+the glue behind an external port list that IS exactly the shape a real
+68030's own CPU-space coprocessor bus cycle presents — a real integrator
+connects this module's own ports directly to their own 68030 (MH030's
+checkout, a real chip, or any other 68020+ implementation).
+Deliberately does NOT instantiate MH030's own `m68030_top` — this
+project stays its own independent repository with no code dependency on
+that one, matching the user's own original explicit requirement that
+established this repo in the first place. `tb/mh882_companion_example_tb.sv`
+(2 checks) drives the assembled glue+FPU pair through its own external
+host-side ports end to end: a matching-CpID Response CIR read genuinely
+gets a DSACK back from the FPU; a non-matching-CpID one gets NOTHING at
+all (CS# never asserts, so the FPU never even sees the cycle) — the
+real point of the glue module existing.
+
+**223/223 across all eight testbenches** (11+27+48+28+32+63+12+2).
+
+**Deliberately NOT attempted, and why**: MH030's own CLAUDE.md documents
+the coprocessor-conditional instructions (cpBcc/cpDBcc/cpScc/cpTRAPcc)
+and Coprocessor Protocol Violation (vector 13) as unimplemented there
+specifically because testing them needs a real attached coprocessor
+model — this repo is now genuinely that missing piece. Actually closing
+that gap means modifying MH030's own RTL and test suite though, a
+separate undertaking against a DIFFERENT git repository this session was
+never asked to touch (the standing instruction that drove this entire
+session's work was scoped to "continue through the [MH882] phases,"
+never to modify the sibling project). Flagged here, as plan.md's own
+prior draft already flagged it, as a real follow-on opportunity for
+MH030 specifically — this repository's own required scope is complete
+without it.
+
+**This closes plan.md's own original phased scope in full.** Everything
+from Phase 0 through Phase 8 is implemented, tested (223/223), committed,
+and pushed. The remaining, explicitly-still-open items are the ones each
+phase's own writeup above already named as deliberately deferred, not
+newly discovered here: the transcendental instruction set (~18
+functions, Phase 4b), Word/Byte Integer and Packed Decimal format
+conversion (Phase 4c), BSUN and INEX1 exception flags, actual trap-taking
+on FPCR ENABLE-byte-requested exceptions for the ops that don't yet check
+it, denormal support, real exponent-overflow trap semantics (currently
+coarse saturate-to-infinity), and the MH030-side coprocessor-conditional-
+instruction gap just described.
 
 ## Directory layout (this repo's own root)
 
