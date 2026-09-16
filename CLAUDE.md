@@ -781,9 +781,32 @@ same `fp_sincos` task Phase 9d built — no new numerical code, only new
 commit-path plumbing. **APU test grew 85→89 checks, `make test` 8/8
 suites clean, 310/310 total.**
 
+**Phase 9f (FETOX/FETOXM1/FTWOTOX/FTENTOX) is also complete — the
+exponential family, and the first Phase-9 sub-phase with NO Musashi
+reference at all** (that emulator doesn't implement any of the
+remaining 18 log/exp/hyperbolic/inverse-trig functions), so every
+reference value comes from an independent Python/`Decimal` computation
+instead. New shared `fp_exp_core` task computes `e^y` for arbitrary `y`
+(argument reduction `k=round(y/ln2)`, `r=y-k*ln2`, 16-term Horner series
+for `e^r`, then a biased-exponent-addition-with-saturation `2^k` scale
+— reusing `fp_scale`'s own already-established pattern rather than a
+second multiply, since this format carries an explicit binary
+exponent) — the same "one shared core, thin per-instruction wrappers"
+shape `fp_sincos` established. FETOX calls it directly; FTWOTOX/FTENTOX
+scale the input by `ln2`/`ln10` first (`e^(a·ln2)=2^a`); FETOXM1
+computes `e^a-1` via the SAME series minus its own leading term
+whenever `|a|<ln2/2` (avoiding the catastrophic cancellation a naive
+`e^a-1.0` subtraction would suffer for small `a`), falling back to an
+ordinary subtract-1 outside that range. New bit-exact check (not just
+tolerance): `FTWOTOX(1.0)==2.0` exactly, reasoned from first principles
+(an exact scaling multiply by 1.0 makes `k=1`,`r=0` exact) and confirmed
+empirically. **APU test grew 89→104 checks, `make test` 8/8 suites
+clean, 325/325 total**, measured accuracy 0-2 ULP across every numeric
+vector.
+
 See `plan.md` for the full phased build plan and the complete list of
-what remains deliberately out of scope (Phase 9f+ — the remaining 18
-log/exp/hyperbolic/inverse-trig functions — W/B/P formats, BSUN/INEX1,
+what remains deliberately out of scope (Phase 9g+ — the remaining 14
+log/hyperbolic/inverse-trig functions — W/B/P formats, BSUN/INEX1,
 denormals, and the rest).
 
 ```bash

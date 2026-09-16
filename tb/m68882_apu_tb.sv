@@ -156,6 +156,7 @@ module m68882_apu_tb;
     localparam logic [95:0] EXT_N4_0  = 96'hc001_0000_8000_0000_0000_0000;
     localparam logic [95:0] EXT_7_0   = 96'h4001_0000_e000_0000_0000_0000;
     localparam logic [95:0] EXT_10_0  = 96'h4002_0000_a000_0000_0000_0000;
+    localparam logic [95:0] EXT_0_001 = 96'h3ff5_0000_8312_6e97_8d4f_df3b;
 
     logic [31:0] rd;
 
@@ -707,6 +708,94 @@ module m68882_apu_tb;
                   $sformatf("Phase 9e: FSINCOS real Table 8-3 timing: %0d ticks (FSINCOS) - %0d ticks (FSIN) = %0d, want exactly 240 (the real 60-cycle Table 8-3 delta x4 -- the 2-tick dual-register commit landing on the real total, not one tick short or one tick over)",
                             fsincos_ticks, fsin_ticks, fsincos_ticks - fsin_ticks));
         end
+
+        // ── Phase 9f: FETOX/FETOXM1/FTWOTOX/FTENTOX (the exponential
+        // family, shared fp_exp_core) ───────────────────────────────
+        // Reference values independently computed in Python (80-digit
+        // Decimal Taylor series -- same methodology as FSIN/FCOS's own
+        // reference generation in Phase 9d).
+        load_fp(0, EXT_1_0);
+        dispatch(cmd_word(3'b000, 3'd0, 3'd1, 7'h10)); // FETOX(1.0) = e
+        check_close(u_top.u_proto.u_regfile.fp_r[1], 96'h4000_0000_adf85458a2bb4a9b,
+                    4096, "Phase 9f: FETOX(1.0) ~= e = 2.7182818285...");
+
+        load_fp(0, EXT_N1_0);
+        dispatch(cmd_word(3'b000, 3'd0, 3'd1, 7'h10)); // FETOX(-1.0) = 1/e
+        check_close(u_top.u_proto.u_regfile.fp_r[1], 96'h3ffd_0000_bc5ab1b16779be35,
+                    4096, "Phase 9f: FETOX(-1.0) ~= 1/e = 0.3678794412...");
+
+        load_fp(0, EXT_2_0);
+        dispatch(cmd_word(3'b000, 3'd0, 3'd1, 7'h10)); // FETOX(2.0), exercises k!=0 reduction
+        check_close(u_top.u_proto.u_regfile.fp_r[1], 96'h4001_0000_ec7325c6a6ed6e62,
+                    4096, "Phase 9f: FETOX(2.0) ~= e^2 = 7.3890560989... (k!=0 argument reduction)");
+
+        load_fp(0, 96'h0); // +0.0
+        dispatch(cmd_word(3'b000, 3'd0, 3'd1, 7'h10)); // FETOX(+0.0)
+        check(u_top.u_proto.u_regfile.fp_r[1] == EXT_1_0, "Phase 9f: FETOX(+0.0) == +1.0 exactly");
+
+        load_fp(0, 96'h7fff_0000_8000_0000_0000_0000); // +inf
+        dispatch(cmd_word(3'b000, 3'd0, 3'd1, 7'h10)); // FETOX(+inf)
+        check(u_top.u_proto.u_regfile.fp_r[1] == 96'h7fff_0000_8000_0000_0000_0000,
+              "Phase 9f: FETOX(+inf) == +inf (well-defined, unlike FSIN/FCOS's own undefined-at-infinity)");
+
+        load_fp(0, 96'hffff_0000_8000_0000_0000_0000); // -inf
+        dispatch(cmd_word(3'b000, 3'd0, 3'd1, 7'h10)); // FETOX(-inf)
+        check(u_top.u_proto.u_regfile.fp_r[1] == 96'h0, "Phase 9f: FETOX(-inf) == +0.0");
+
+        // FETOXM1: small-argument direct-series path (|x| < ln2/2) vs.
+        // ordinary subtract-1 path, both against independently-computed
+        // references -- confirms the small-a cancellation-avoidance
+        // branch (fp_etoxm1's own header comment) produces the right
+        // answer, not just that SOME answer comes out.
+        load_fp(0, EXT_0_001);
+        dispatch(cmd_word(3'b000, 3'd0, 3'd1, 7'h08)); // FETOXM1(0.001), small-a direct-series path
+        check_close(u_top.u_proto.u_regfile.fp_r[1], 96'h3ff5_0000_832336fdc679d031,
+                    4096, "Phase 9f: FETOXM1(0.001) ~= 0.0010005002... (small-a direct-series path, avoiding cancellation)");
+
+        load_fp(0, EXT_2_0);
+        dispatch(cmd_word(3'b000, 3'd0, 3'd1, 7'h08)); // FETOXM1(2.0), ordinary subtract-1 path
+        check_close(u_top.u_proto.u_regfile.fp_r[1], 96'h4001_0000_cc7325c6a6ed6e62,
+                    4096, "Phase 9f: FETOXM1(2.0) ~= e^2-1 = 6.3890560989... (ordinary subtract-1 path)");
+
+        load_fp(0, 96'h0); // +0.0
+        dispatch(cmd_word(3'b000, 3'd0, 3'd1, 7'h08)); // FETOXM1(+0.0)
+        check(u_top.u_proto.u_regfile.fp_r[1] == 96'h0, "Phase 9f: FETOXM1(+0.0) == +0.0 (sign of zero preserved)");
+
+        // FTWOTOX: 1.0 and 2.0 are exact powers of 2 -- k reduces to
+        // exactly the input itself with r==0, so the Horner series
+        // contributes only its own exact r^0==1.0 term and the result
+        // should be BIT-EXACT (0 ULP), not just close -- a genuine extra
+        // check beyond the ordinary tolerance-only ones.
+        load_fp(0, EXT_1_0);
+        dispatch(cmd_word(3'b000, 3'd0, 3'd1, 7'h11)); // FTWOTOX(1.0) = 2.0, exact
+        check(u_top.u_proto.u_regfile.fp_r[1] == EXT_2_0, "Phase 9f: FTWOTOX(1.0) == +2.0 exactly (r==0 after reduction)");
+
+        load_fp(0, EXT_0_5);
+        dispatch(cmd_word(3'b000, 3'd0, 3'd1, 7'h11)); // FTWOTOX(0.5) = sqrt(2)
+        check_close(u_top.u_proto.u_regfile.fp_r[1], 96'h3fff_0000_b504f333f9de6484,
+                    4096, "Phase 9f: FTWOTOX(0.5) ~= sqrt(2) = 1.4142135624...");
+
+        load_fp(0, 96'h0); // +0.0
+        dispatch(cmd_word(3'b000, 3'd0, 3'd1, 7'h11)); // FTWOTOX(+0.0)
+        check(u_top.u_proto.u_regfile.fp_r[1] == EXT_1_0, "Phase 9f: FTWOTOX(+0.0) == +1.0 exactly");
+
+        // FTENTOX: 1.0 and 2.0 are exact powers of 10 in real math, but
+        // NOT exact in this binary reduction (10 isn't a power of 2) --
+        // tolerance-based, same as everything but the FTWOTOX exact
+        // cases above.
+        load_fp(0, EXT_1_0);
+        dispatch(cmd_word(3'b000, 3'd0, 3'd1, 7'h12)); // FTENTOX(1.0) = 10.0
+        check_close(u_top.u_proto.u_regfile.fp_r[1], 96'h4002_0000_a000000000000000,
+                    4096, "Phase 9f: FTENTOX(1.0) ~= 10.0");
+
+        load_fp(0, EXT_2_0);
+        dispatch(cmd_word(3'b000, 3'd0, 3'd1, 7'h12)); // FTENTOX(2.0) = 100.0
+        check_close(u_top.u_proto.u_regfile.fp_r[1], 96'h4005_0000_c800000000000000,
+                    4096, "Phase 9f: FTENTOX(2.0) ~= 100.0");
+
+        load_fp(0, 96'h0); // +0.0
+        dispatch(cmd_word(3'b000, 3'd0, 3'd1, 7'h12)); // FTENTOX(+0.0)
+        check(u_top.u_proto.u_regfile.fp_r[1] == EXT_1_0, "Phase 9f: FTENTOX(+0.0) == +1.0 exactly");
 
         $display("---");
         $display("%0d passed, %0d failed", pass_count, fail_count);

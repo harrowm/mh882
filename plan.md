@@ -1690,16 +1690,99 @@ single destination register, not a second opmode-encoded one — not
 worth extending for a case whose numerical answer is already known to
 be Musashi-imprecise).
 
-### Phase 9f+ — The remaining log/exp/hyperbolic/inverse-trig set, NOT YET STARTED
+### Phase 9f — FETOX/FETOXM1/FTWOTOX/FTENTOX, COMPLETE (the exponential family)
 
-18 functions (FACOS/FASIN/FATAN/FATANH/FCOSH/FETOX/FETOXM1/FLOGN/
-FLOGNP1/FLOG10/FLOG2/FSINH/FTAN/FTANH/FTENTOX/FTWOTOX). Needs a genuine
-numerical algorithm per function (polynomial/rational minimax
-approximation, or argument-reduction + series the way FSIN/FCOS's own
-`fp_sincos` does) verified to the manual's own ~64 ULP typical / 4096
-ULP worst-case tolerance. None of these are Musashi-verifiable at all —
-that emulator's own printed version simply doesn't implement any of
-them (confirmed at Phase 9's own initial research) — so this phase
-needs Python/mpmath-generated reference vectors throughout, the same
-`check_close`-style tolerance comparison Phase 9d's own FSIN/FCOS
-tests established rather than bit-exact comparison.
+First of the remaining 18 (of the original ~28-function transcendental
+set) to land, and the first NOT Musashi-verifiable at all — that
+emulator's printed version simply doesn't implement any of the
+log/exp/hyperbolic/inverse-trig functions (confirmed at Phase 9's own
+initial research), so this phase's reference values come entirely from
+an independent Python/Decimal computation (same 80-digit-precision
+Taylor-series methodology Phase 9d's own FSIN/FCOS references used),
+not any cross-check tool.
+
+**Shared core, one task**: all four functions reduce to `e^y` for some
+`y` derived from the operand, so one new task, `fp_exp_core`, computes
+`e^y` for arbitrary `y` and every wrapper (`fp_etox`/`fp_twotox`/
+`fp_tentox`/`fp_etoxm1`) calls it rather than duplicating the reduction/
+series logic four times — the same "one shared numerical core, several
+thin per-instruction wrappers" shape `fp_sincos` already established.
+
+**Algorithm**: classic argument reduction, `k = round(y/ln2)`, `r = y -
+k*ln2` (`|r| <= ln2/2 ≈ 0.347`), `e^y = 2^k * e^r`. `e^r` evaluated via
+a 16-term (`r^0..r^15`) Horner series in `r` directly — independently
+verified in Python (`Decimal`, 80 digits) to have truncation error
+~1e-19 at the worst-case `|r|=ln2/2`, comfortably inside the ~6.9e-18
+target implied by the manual's own "~64 ULP typical" bound, same margin
+philosophy as `fp_sincos`'s own 9-term series. The `2^k` scaling is
+then just a biased-**exponent** addition with saturation — reusing
+`fp_scale`'s own already-established biased-exponent-arithmetic-with-
+saturation pattern directly, computed in a widened signed container
+(`logic signed [79:0]`) first so a pathologically large `k` (from the
+`n_mag` rounding logic's own existing saturation cap,
+`64'hFFFF_FFFF_FFFF_FFFF`, reused verbatim from `fp_sincos`/
+`fp_mod_rem`) can never wrap the addition before the saturation check
+sees it — no separate "is `y` absurdly large" pre-check needed, the
+existing machinery already handles it safely.
+
+**FETOX** ($10): `fp_exp_core(a)` directly. `e^(+inf)=+inf`,
+`e^(-inf)=+0.0` — both well-defined (unlike FSIN/FCOS's own
+undefined-at-infinity case), no OPERR.
+
+**FTWOTOX** ($11) / **FTENTOX** ($12): `e^(a*ln2)` / `e^(a*ln10)` — one
+scaling multiply (`LN2`/`LN10`, both independently re-derived and
+verified against known reference digits of ln(2)/ln(10)), then the same
+core. NaN/inf/zero operands skip the scaling multiply entirely and pass
+straight to `fp_exp_core` on the RAW operand instead (avoiding any risk
+of the multiply perturbing an already-exact special-case result). New
+BIT-EXACT test (not just tolerance): `FTWOTOX(1.0) == 2.0` exactly —
+reasoned from first principles (the `y=a*ln2` scaling multiply by
+`a=1.0` is exact, so `y` equals the very same `LN2` constant the
+reduction then divides by, giving `k=1`, `r=0` exactly, and an exact
+`r^0` Horner result scaled by an exact `+1` exponent step) and confirmed
+empirically, not just assumed — a genuinely stronger check than
+tolerance alone gives.
+
+**FETOXM1** ($08): `e^a - 1`, computed via the SAME series MINUS its
+own leading (`r^0`) term whenever `|a| < ln2/2` (i.e. whenever
+`fp_exp_core`'s own reduction would take `k=0` and evaluate the Horner
+series on `a` directly) — exact cancellation of the "-1" by
+construction, avoiding the catastrophic-cancellation precision loss a
+naive `e^a - 1.0` subtraction would suffer for small `a`. Outside that
+range, an ordinary `fp_exp_core(a)` then subtract-1 is used instead
+(no cancellation risk there, since the result isn't close to zero).
+Both paths tested against independent references
+(`FETOXM1(0.001)` for the small-`a` direct path,
+`FETOXM1(2.0)` for the ordinary subtract-1 path).
+
+**Testing**: 15 new checks in `tb/m68882_apu_tb.sv` (numeric
+`check_close` against independent references for each of the 4
+functions across a small representative operand set, plus special-case
+exact checks: `±0.0→1.0`, `FETOX(+inf)→+inf`, `FETOX(-inf)→+0.0`,
+`FETOXM1(+0.0)→+0.0`, the `FTWOTOX(1.0)==2.0` bit-exact case above).
+Measured accuracy 0-2 ULP across every numeric vector — comfortably
+inside the documented `ulp_tol=4096` gate. **APU test grew 89→104
+checks, `make test` 8/8 suites clean, 325/325 total.**
+
+### Phase 9g+ — The remaining log/hyperbolic/inverse-trig set, NOT YET STARTED
+
+14 functions (FACOS/FASIN/FATAN/FATANH/FCOSH/FLOGN/FLOGNP1/FLOG10/
+FLOG2/FSINH/FTAN/FTANH). Needs a genuine numerical algorithm per
+function — the log family (FLOGN/FLOGNP1/FLOG10/FLOG2) via its own
+argument-reduction-plus-series (or a rational/minimax approximation);
+the hyperbolic family (FSINH/FCOSH/FTANH) trivially reuses Phase 9f's
+own `fp_exp_core` (`sinh(x)=(e^x-e^-x)/2`, `cosh(x)=(e^x+e^-x)/2`,
+`tanh(x)=sinh/cosh`, needing `fp_exp_core` called twice per op — with
+two DIFFERENT arguments (`a` and `-a`), not the same "one call site,
+many textual invocations" livelock risk this project's own established
+discipline actually guards against, so this is expected to be safe,
+but should still be empirically re-confirmed the same way `fp_mod_rem`
+and `fp_sincos` each were); FTAN trivially reuses `fp_sincos`
+(`tan(x)=sin(x)/cos(x)`); FACOS/FASIN/FATAN/FATANH need their own
+argument-reduction-plus-series or identity-based approach (e.g.
+`atan` via its own series with range reduction, `asin(x)=atan(x/
+sqrt(1-x^2))`, `acos(x)=pi/2-asin(x)`, `atanh(x)=0.5*ln((1+x)/(1-x))`
+once a log core exists). All verified to the manual's own ~64 ULP
+typical / 4096 ULP worst-case tolerance via the same Python/Decimal
+reference-vector + `check_close` methodology Phase 9d/9f established
+(none of these 14 are Musashi-verifiable either).

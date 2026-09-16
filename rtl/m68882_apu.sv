@@ -1719,4 +1719,331 @@ package m68882_apu_pkg;
         end
     endtask
 
+    // ── Phase 9f: FETOX ($10) / FETOXM1 ($08) / FTWOTOX ($11) /
+    // FTENTOX ($12) -- the exponential family, all built on one shared
+    // `fp_exp_core` task (e^y for arbitrary y) the same way Phase 9d's
+    // FSIN/FCOS shared `fp_sincos`. Like FSIN/FCOS, these are genuinely
+    // APPROXIMATED, not exact (Section 4.3's own "~64 ULP typical /
+    // 4096 ULP worst-case" bound applies here too, not IEEE 0.5 ULP).
+    //
+    // Algorithm: classic argument reduction, k = round(y/ln2), r = y -
+    // k*ln2 (|r| <= ln2/2 ~= 0.347), e^y = 2^k * e^r. e^r evaluated via
+    // a 16-term (r^0..r^15) Horner series in r directly (NOT split into
+    // even/odd sub-series the way cos/sin's own r^2-Horner was -- e^r
+    // has no such symmetry to exploit); independently verified in
+    // Python (Decimal, 80 digits) to have truncation error ~1e-19 at
+    // |r|=ln2/2 (the worst case), comfortably inside the ~6.9e-18
+    // target implied by the manual's own "~64 ULP typical" bound, same
+    // margin philosophy as FSIN/FCOS's own 9-term series. The 2^k
+    // scaling is then just a biased-EXPONENT addition with saturation
+    // (identical pattern to `fp_scale`'s own already-established
+    // biased-exponent arithmetic) -- no second multiply needed, since
+    // this project's own internal format carries an explicit binary
+    // exponent.
+    localparam logic [95:0] LN2  = 96'h3ffe_0000_b17217f7d1cf79ac;
+    localparam logic [95:0] LN10 = 96'h4000_0000_935d8dddaaa8ac17;
+
+    // e^r = sum_{k=0}^{15} EXP_C[k] * r^k -- stored highest-degree first
+    // (index 0 = r^15 coefficient) for direct Horner evaluation, same
+    // convention as COS_C/SIN_C above.
+    localparam logic [95:0] EXP_C0  = 96'h3fd6_0000_d73f9f399dc0f88f; // r^15
+    localparam logic [95:0] EXP_C1  = 96'h3fda_0000_c9cba54603e4e906; // r^14
+    localparam logic [95:0] EXP_C2  = 96'h3fde_0000_b092309d43684be5; // r^13
+    localparam logic [95:0] EXP_C3  = 96'h3fe2_0000_8f76c77fc6c4bdaa; // r^12
+    localparam logic [95:0] EXP_C4  = 96'h3fe5_0000_d7322b3faa271c7f; // r^11
+    localparam logic [95:0] EXP_C5  = 96'h3fe9_0000_93f27dbbc4fae397; // r^10
+    localparam logic [95:0] EXP_C6  = 96'h3fec_0000_b8ef1d2ab6399c7d; // r^9
+    localparam logic [95:0] EXP_C7  = 96'h3fef_0000_d00d00d00d00d00d; // r^8
+    localparam logic [95:0] EXP_C8  = 96'h3ff2_0000_d00d00d00d00d00d; // r^7
+    localparam logic [95:0] EXP_C9  = 96'h3ff5_0000_b60b60b60b60b60b; // r^6
+    localparam logic [95:0] EXP_C10 = 96'h3ff8_0000_8888888888888889; // r^5
+    localparam logic [95:0] EXP_C11 = 96'h3ffa_0000_aaaaaaaaaaaaaaab; // r^4
+    localparam logic [95:0] EXP_C12 = 96'h3ffc_0000_aaaaaaaaaaaaaaab; // r^3
+    localparam logic [95:0] EXP_C13 = 96'h3ffe_0000_8000000000000000; // r^2
+    localparam logic [95:0] EXP_C14 = 96'h3fff_0000_8000000000000000; // r^1
+    localparam logic [95:0] EXP_C15 = 96'h3fff_0000_8000000000000000; // r^0
+
+    task automatic fp_exp_core(
+        input  logic [95:0]  y_raw,
+        output logic [95:0]  result,
+        output logic         flag_z,
+        output logic         flag_n,
+        output logic         flag_i,
+        output logic         flag_nan,
+        output logic         flag_ovfl,
+        output logic         flag_unfl
+    );
+        fpx_t y;
+        logic y_nan, y_inf, y_zero;
+
+        y = unpack_fpx(y_raw);
+        y_nan  = is_nan_fpx(y);
+        y_inf  = is_inf_fpx(y);
+        y_zero = is_zero_fpx(y);
+        flag_ovfl = 1'b0;
+        flag_unfl = 1'b0;
+
+        if (y_nan) begin
+            result = y_raw;
+        end else if (y_inf) begin
+            // e^(+inf) = +inf; e^(-inf) = +0.0 -- both well-defined,
+            // unlike FSIN/FCOS's own undefined-at-infinity case; no
+            // OPERR here.
+            result = y.sign ? 96'h0 : {1'b0, 15'h7FFF, 16'h0, 64'h8000_0000_0000_0000};
+        end else if (y_zero) begin
+            result = {1'b0, 15'd16383, 16'h0, 64'h8000_0000_0000_0000}; // e^0 = +1.0, sign of zero irrelevant
+        end else begin
+            logic [95:0] q_ext, k_ext, prod, r, acc, tmp;
+            logic [95:0] exp_coeff [0:15];
+            logic        qz, qn, qi, qnan, qoperr, qdz, qovfl, qunfl, qinex2;
+            logic        pz, pn, pi_, pnan, poperr, povfl, punfl, pinex2;
+            logic        rz, rn, ri, rnan, roperr, rovfl, runfl, rinex2;
+            logic        k_sign;
+            logic [63:0] n_mag;
+            logic signed [17:0] real_exp;
+            logic signed [79:0] new_exp_wide;
+            int          i;
+
+            exp_coeff = '{EXP_C0, EXP_C1, EXP_C2, EXP_C3, EXP_C4, EXP_C5, EXP_C6, EXP_C7,
+                          EXP_C8, EXP_C9, EXP_C10, EXP_C11, EXP_C12, EXP_C13, EXP_C14, EXP_C15};
+
+            // ── Argument reduction: k = round(y / ln2), r = y - k*ln2 --
+            // identical shape to fp_sincos's own k=round(a/(pi/2))
+            // derivation (fp_div's own convention is divisor-first,
+            // dividend-second: fp_div(LN2, y_raw) = y_raw/LN2). ──────
+            fp_div(LN2, y_raw, RND_NEAREST, q_ext, qz, qn, qi, qnan, qoperr, qdz, qovfl, qunfl, qinex2);
+
+            k_sign = qn;
+            if (qz) begin
+                n_mag = 64'h0;
+            end else begin
+                fpx_t qx;
+                qx = unpack_fpx(q_ext);
+                real_exp = $signed({3'b0, qx.exp}) - 18'sd16383;
+                if (real_exp < 18'sd0) begin
+                    logic round_to_1;
+                    round_to_1 = (real_exp == -18'sd1) && (qx.mant[62:0] != 63'h0);
+                    n_mag = round_to_1 ? 64'd1 : 64'd0;
+                end else if (real_exp >= 18'sd63) begin
+                    n_mag = 64'hFFFF_FFFF_FFFF_FFFF; // saturate -- see fp_mod_rem/fp_sincos's own identical note
+                end else begin
+                    logic [6:0]  frac_bits;
+                    logic [63:0] int_part, sticky_mask;
+                    logic        guard, round_bit, sticky, round_up, carry;
+
+                    frac_bits   = 7'(63 - real_exp);
+                    int_part    = qx.mant >> frac_bits;
+                    guard       = (frac_bits >= 7'd1) ? ((qx.mant >> (frac_bits - 7'd1)) & 64'h1) : 1'b0;
+                    round_bit   = (frac_bits >= 7'd2) ? ((qx.mant >> (frac_bits - 7'd2)) & 64'h1) : 1'b0;
+                    sticky_mask = (frac_bits >= 7'd3) ? ((64'h1 << (frac_bits - 7'd2)) - 64'h1) : 64'h0;
+                    sticky      = |(qx.mant & sticky_mask);
+                    round_up    = guard && (round_bit || sticky || int_part[0]);
+                    {carry, int_part} = {1'b0, int_part} + (round_up ? 65'd1 : 65'd0);
+                    n_mag = int_part;
+                end
+            end
+
+            if (n_mag == 64'h0) begin
+                r = y_raw;
+            end else begin
+                logic [6:0] n_lz;
+                n_lz  = lzc64(n_mag);
+                k_ext = {k_sign, 15'd16383 + (15'd63 - {8'b0, n_lz}), 16'h0, n_mag << n_lz};
+                fp_mul(k_ext, LN2, RND_NEAREST, prod, pz, pn, pi_, pnan, poperr, povfl, punfl, pinex2);
+                fp_add_sub(prod, y_raw, 1'b1, RND_NEAREST, r, rz, rn, ri, rnan, roperr, rovfl, runfl, rinex2);
+            end
+
+            // ── Polynomial core: e^r, a 16-term Horner evaluation in r
+            // directly (not r^2 -- no even/odd split available here),
+            // one shared fp_mul/fp_add_sub call-site pair for the loop. ──
+            acc = exp_coeff[0];
+            for (i = 1; i < 16; i++) begin
+                fp_mul(acc, r, RND_NEAREST, tmp, pz, pn, pi_, pnan, poperr, povfl, punfl, pinex2);
+                fp_add_sub(exp_coeff[i], tmp, 1'b0, RND_NEAREST, acc, rz, rn, ri, rnan, roperr, rovfl, runfl, rinex2);
+            end
+
+            // ── 2^k scaling: add k to acc's own biased exponent field,
+            // with saturation -- identical shape to fp_scale's own
+            // already-established biased-exponent arithmetic, just
+            // computed in a wide signed container first (n_mag can in
+            // principle be as large as the saturated 64'hFFFF...FFFF
+            // above) so the add itself never wraps before the
+            // saturation check gets to see it. ─────────────────────────
+            begin
+                fpx_t acc_x;
+                acc_x = unpack_fpx(acc);
+                new_exp_wide = $signed({65'b0, acc_x.exp})
+                             + (k_sign ? -$signed({16'b0, n_mag}) : $signed({16'b0, n_mag}));
+                if (new_exp_wide >= 80'sd32767) begin
+                    flag_ovfl = 1'b1;
+                    result = {1'b0, 15'h7FFF, 16'h0, 64'h8000_0000_0000_0000};
+                end else if (new_exp_wide <= 80'sd0) begin
+                    flag_unfl = 1'b1;
+                    result = 96'h0;
+                end else begin
+                    result = {1'b0, new_exp_wide[14:0], 16'h0, acc_x.mant};
+                end
+            end
+        end
+
+        begin
+            fpx_t r_out;
+            r_out = unpack_fpx(result);
+            flag_z   = is_zero_fpx(r_out);
+            flag_n   = 1'b0; // e^y is never negative
+            flag_i   = is_inf_fpx(r_out);
+            flag_nan = is_nan_fpx(r_out);
+        end
+    endtask
+
+    // FETOX ($10): e^a, direct.
+    task automatic fp_etox(
+        input  logic [95:0]  a_raw,
+        output logic [95:0]  result,
+        output logic         flag_z, flag_n, flag_i, flag_nan, flag_ovfl, flag_unfl
+    );
+        fp_exp_core(a_raw, result, flag_z, flag_n, flag_i, flag_nan, flag_ovfl, flag_unfl);
+    endtask
+
+    // FTWOTOX ($11): 2^a = e^(a*ln2). Real-hardware-equivalent scaling
+    // multiply, then the same core.
+    task automatic fp_twotox(
+        input  logic [95:0]  a_raw,
+        output logic [95:0]  result,
+        output logic         flag_z, flag_n, flag_i, flag_nan, flag_ovfl, flag_unfl
+    );
+        logic [95:0] y;
+        logic        mz, mn, mi, mnan, moperr, movfl, munfl, minex2;
+        fpx_t a;
+        a = unpack_fpx(a_raw);
+        if (is_nan_fpx(a) || is_inf_fpx(a) || is_zero_fpx(a)) begin
+            // fp_exp_core's own special cases already handle NaN/inf/
+            // zero identically for e^y as real hardware wants for 2^a
+            // at these same operand classes (2^(+-inf)=+inf/+0,
+            // 2^0=1) -- skip the LN2 scaling multiply entirely rather
+            // than risk it producing something other than an exact
+            // NaN/inf/zero passthrough.
+            fp_exp_core(a_raw, result, flag_z, flag_n, flag_i, flag_nan, flag_ovfl, flag_unfl);
+        end else begin
+            fp_mul(a_raw, LN2, RND_NEAREST, y, mz, mn, mi, mnan, moperr, movfl, munfl, minex2);
+            fp_exp_core(y, result, flag_z, flag_n, flag_i, flag_nan, flag_ovfl, flag_unfl);
+        end
+    endtask
+
+    // FTENTOX ($12): 10^a = e^(a*ln10). Same shape as FTWOTOX.
+    task automatic fp_tentox(
+        input  logic [95:0]  a_raw,
+        output logic [95:0]  result,
+        output logic         flag_z, flag_n, flag_i, flag_nan, flag_ovfl, flag_unfl
+    );
+        logic [95:0] y;
+        logic        mz, mn, mi, mnan, moperr, movfl, munfl, minex2;
+        fpx_t a;
+        a = unpack_fpx(a_raw);
+        if (is_nan_fpx(a) || is_inf_fpx(a) || is_zero_fpx(a)) begin
+            fp_exp_core(a_raw, result, flag_z, flag_n, flag_i, flag_nan, flag_ovfl, flag_unfl);
+        end else begin
+            fp_mul(a_raw, LN10, RND_NEAREST, y, mz, mn, mi, mnan, moperr, movfl, munfl, minex2);
+            fp_exp_core(y, result, flag_z, flag_n, flag_i, flag_nan, flag_ovfl, flag_unfl);
+        end
+    endtask
+
+    // FETOXM1 ($08): e^a - 1, computed directly (not e^a then subtract
+    // 1) whenever |a| < ln2/2 -- i.e. whenever fp_exp_core's own
+    // argument reduction would find k=0 and evaluate the Horner series
+    // on a itself. In that case e^a-1 is just the SAME Horner series
+    // minus its own leading (r^0) term -- exact cancellation of the
+    // "-1" by construction, no precision lost to catastrophic
+    // cancellation the way naively computing (e^a - 1.0) as a separate
+    // subtraction would for small a. Outside that range (|a| >= ln2/2),
+    // e^a itself is not close to 1 (or is exactly 0/inf), so an
+    // ordinary e^a-1 subtraction has no cancellation problem and is
+    // used instead -- reusing fp_exp_core as-is rather than duplicating
+    // its own reduction/Horner logic a second time.
+    task automatic fp_etoxm1(
+        input  logic [95:0]  a_raw,
+        output logic [95:0]  result,
+        output logic         flag_z, flag_n, flag_i, flag_nan, flag_ovfl, flag_unfl
+    );
+        fpx_t a;
+        logic a_nan, a_inf, a_zero;
+
+        a = unpack_fpx(a_raw);
+        a_nan  = is_nan_fpx(a);
+        a_inf  = is_inf_fpx(a);
+        a_zero = is_zero_fpx(a);
+        flag_ovfl = 1'b0;
+        flag_unfl = 1'b0;
+
+        if (a_nan) begin
+            result = a_raw;
+        end else if (a_inf) begin
+            result = a.sign ? {1'b1, 15'd16383, 16'h0, 64'h8000_0000_0000_0000} // e^-inf - 1 = -1.0
+                             : {1'b0, 15'h7FFF, 16'h0, 64'h8000_0000_0000_0000}; // e^+inf - 1 = +inf
+        end else if (a_zero) begin
+            result = a_raw; // e^0 - 1 = 0, sign of zero preserved
+        end else begin
+            logic [95:0] q_ext;
+            logic        qz, qn, qi, qnan, qoperr, qdz, qovfl, qunfl, qinex2;
+            fp_div(LN2, a_raw, RND_NEAREST, q_ext, qz, qn, qi, qnan, qoperr, qdz, qovfl, qunfl, qinex2);
+            // small_a: does round-to-nearest-even(a/ln2) == 0, i.e. does
+            // fp_exp_core's own reduction take k=0 for this a (in which
+            // case r==a exactly and the series-minus-leading-term path
+            // below is exact)? True iff |a/ln2| <= 0.5 (an EXACT 0.5
+            // rounds to 0 too, being even) -- q_ext's own real exponent
+            // < -2 covers magnitude < 0.25..0.5 range trivially; the
+            // boundary real_exp==-1 (value in [0.5,1.0)) is small_a only
+            // at the exact endpoint (mantissa's own explicit-integer-bit
+            // convention means mantissa==0x8000...0000 there is exactly
+            // 0.5, nothing smaller is representable at that exponent).
+            begin
+                fpx_t qx;
+                logic small_a;
+                logic signed [17:0] q_real_exp;
+                qx = unpack_fpx(q_ext);
+                q_real_exp = $signed({3'b0, qx.exp}) - 18'sd16383;
+                small_a = qz || (q_real_exp <= -18'sd2) ||
+                          ((q_real_exp == -18'sd1) && (qx.mant == 64'h8000_0000_0000_0000));
+                if (small_a) begin
+                    logic [95:0] acc, tmp, r;
+                    logic [95:0] exp_coeff [0:15];
+                    logic pz, pn, pi_, pnan, poperr, povfl, punfl, pinex2;
+                    logic rz, rn, ri, rnan, roperr, rovfl, runfl, rinex2;
+                    int i;
+                    exp_coeff = '{EXP_C0, EXP_C1, EXP_C2, EXP_C3, EXP_C4, EXP_C5, EXP_C6, EXP_C7,
+                                  EXP_C8, EXP_C9, EXP_C10, EXP_C11, EXP_C12, EXP_C13, EXP_C14, EXP_C15};
+                    r = a_raw; // k=0, so r == a exactly
+                    acc = exp_coeff[0];
+                    for (i = 1; i < 15; i++) begin // stop BEFORE the r^0 term (index 15) -- that's the "-1" being dropped
+                        fp_mul(acc, r, RND_NEAREST, tmp, pz, pn, pi_, pnan, poperr, povfl, punfl, pinex2);
+                        fp_add_sub(exp_coeff[i], tmp, 1'b0, RND_NEAREST, acc, rz, rn, ri, rnan, roperr, rovfl, runfl, rinex2);
+                    end
+                    // acc is now sum_{k=1}^{15} EXP_C[k]*r^(15-k) == the
+                    // r^1..r^15 terms only, i.e. e^r - 1 directly, one
+                    // final multiply by r itself away (mirrors sin(r)'s
+                    // own "series is really f(r)/r, multiply by r once
+                    // at the end" shape in fp_sincos).
+                    fp_mul(acc, r, RND_NEAREST, result, pz, pn, pi_, pnan, poperr, povfl, punfl, pinex2);
+                end else begin
+                    logic [95:0] etox_result, one_ext;
+                    logic ez, en, ei, enan, eovfl, eunfl;
+                    logic sz, sn, si, snan, soperr, sdz, sovfl, sunfl, sinex2;
+                    one_ext = {1'b0, 15'd16383, 16'h0, 64'h8000_0000_0000_0000};
+                    fp_exp_core(a_raw, etox_result, ez, en, ei, enan, eovfl, eunfl);
+                    fp_add_sub(one_ext, etox_result, 1'b1, RND_NEAREST, result, sz, sn, si, snan, soperr, sovfl, sunfl, sinex2);
+                    flag_ovfl = eovfl;
+                end
+            end
+        end
+
+        begin
+            fpx_t r_out;
+            r_out = unpack_fpx(result);
+            flag_z   = is_zero_fpx(r_out);
+            flag_n   = r_out.sign && !flag_z;
+            flag_i   = is_inf_fpx(r_out);
+            flag_nan = is_nan_fpx(r_out);
+        end
+    endtask
+
 endpackage
