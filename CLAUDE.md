@@ -281,10 +281,11 @@ m68882_top            Pin-compatible top level. clk_4x is a plain port (Phase 1
 │                       6 opclasses; arithmetic/format-conversion stubbed, see Current State)
 ├── m68882_regfile      FP0-FP7 (96-bit each), FPCR, FPSR, FPIAR (IMPLEMENTED, Phase 3)
 ├── m68882_cu           Conversion unit (format conversion, 68882-only pipeline stage) (Phase 6)
-├── m68882_apu          Arithmetic processing unit. FADD/FSUB/FMUL register-to-register
-│                       IMPLEMENTED (Phase 4a/4b, real extended-precision add/subtract/
-│                       multiply, all 4 rounding modes); DIV/SQRT/transcendentals and
-│                       format conversion still Phase 4b/4c (see Current State/plan.md)
+├── m68882_apu          Arithmetic processing unit. FADD/FSUB/FMUL/FDIV register-to-
+│                       register IMPLEMENTED (Phase 4a/4b, real extended-precision
+│                       add/subtract/multiply/divide, all 4 rounding modes); SQRT/
+│                       transcendentals/FABS/FNEG/FCMP/FTST and format conversion
+│                       still Phase 4b/4c (see Current State/plan.md)
 └── m68882_frame        FSAVE/FRESTORE state-frame generation and parsing (Phase 5)
 ```
 
@@ -420,24 +421,31 @@ integer-bit position as if it were a carry-out flag, silently double-
 counting the exponent bump on every addition (1.0+2.0 computed as 7.5).
 Fixed by adding one genuine carry-out bit to the adder.
 
-**FMUL ($23) is also implemented** (`m68882_apu_pkg::fp_mul`): a real
-64x64->128-bit mantissa multiply, renormalizing into the same 64-bit
-window convention `fp_add_sub` uses, rounded through the identical
-`round_mantissa` task. All 6 new `tb/m68882_apu_tb.sv` checks (15/15
-total) passed on the first run — Phase 4a's own carry-out fix
-generalized cleanly, no second instance of that bug.
+**FMUL ($23) and FDIV ($20) are also implemented**
+(`m68882_apu_pkg::fp_mul`/`fp_div`): FMUL is a real 64x64->128-bit
+mantissa multiply; FDIV a real long division (dividend scaled left 67
+bits, Verilog's own `/`/`%` used behaviorally, same house style as
+`+`/`-`/`*` elsewhere in this file). Both renormalize into the same
+64-bit window convention `fp_add_sub` established and round through the
+identical `round_mantissa` task. FDIV also wires up FPSR's DZ bit (bit10
+of the exception-status byte, the first exception-status bit this
+project actually sets — OR'd in, not overwritten, a narrow first step
+toward Phase 4d's own real accrued-exception-byte semantics). All 12 new
+`tb/m68882_apu_tb.sv` checks (21/21 total) passed on the first run —
+Phase 4a's own carry-out fix generalized cleanly to both, no repeat of
+that bug.
 
-**NOT yet implemented** (explicitly, not silently): FDIV/FSQRT/
-transcendentals (Phase 4b, remaining — extension-field opcodes already
-confirmed); real B/W/L/S/D/X/P-to-extended format conversion for
-external operands (Phase 4c — opclass 010/011 can still only move raw
-bytes, not numbers); denormals (underflow collapses to signed zero);
-real exponent-overflow trap semantics (coarse saturate-to-infinity); the
-FPSR accrued-exception/exception-status bytes beyond a bare OPERR bit
-(Phase 4d).
+**NOT yet implemented** (explicitly, not silently): FSQRT/
+transcendentals/FABS/FNEG/FCMP/FTST (Phase 4b, remaining — extension-
+field opcodes already confirmed); real B/W/L/S/D/X/P-to-extended format
+conversion for external operands (Phase 4c — opclass 010/011 can still
+only move raw bytes, not numbers); denormals (underflow collapses to
+signed zero); real exponent-overflow trap semantics (coarse saturate-to-
+infinity); the rest of the FPSR accrued-exception/exception-status bytes
+beyond OPERR/DZ (Phase 4d).
 
-See `plan.md` for the full phased build plan. Phase 4b (FDIV/FSQRT) is
-next.
+See `plan.md` for the full phased build plan. Phase 4b (FSQRT next, then
+transcendentals/FABS/FNEG/FCMP/FTST) continues.
 
 ```bash
 make test   # builds and runs all three testbenches via Icarus Verilog

@@ -1,6 +1,6 @@
 # MC68882 FPU — Phased Scope Plan
 
-## Status: Phases 0-3 complete. Phase 4a (FADD/FSUB) complete. Phase 4b in progress (FMUL done; DIV/SQRT/transcendentals next).
+## Status: Phases 0-3 complete. Phase 4a (FADD/FSUB) complete. Phase 4b in progress (FMUL, FDIV done; SQRT/transcendentals/FABS/FNEG/FCMP/FTST next).
 
 ## Origin
 
@@ -501,6 +501,36 @@ arithmetic doesn't wrap). All 6 passed on the FIRST run — the carry-out
 fix Phase 4a's own FADD/FSUB bug required (widening the adder by one
 true carry-out bit) turned out to generalize correctly to FMUL's own
 renormalization logic without needing a second, independent fix.
+
+**FDIV ($20), COMPLETE**: `m68882_apu_pkg::fp_div` (`rtl/m68882_apu.sv`).
+A real long-division algorithm: both mantissas are 64-bit fixed-point
+values in [1,2), so their true ratio lands in (0.5,2). Scaling the
+dividend left by 67 bits before an unsigned integer divide (Verilog's
+own `/`/`%` operators, used behaviorally here exactly as `+`/`-`/`*`
+already are elsewhere in this file — consistent with this project's own
+established house style of behavioral-but-cycle-accurate RTL, not
+gate-level arithmetic) produces a quotient landing in [2^66,2^68); a
+single conditional 1-bit left-shift normalizes the ratio-<1 case
+(quotient in [2^66,2^67)) to the same "integer bit at a fixed position"
+convention `fp_add_sub`/`fp_mul` both already use, after which rounding
+reuses the identical `round_mantissa` task unchanged. Special cases:
+NaN propagation; Infinity/Infinity and 0/0 both set OPERR (undefined);
+finite/Infinity = signed zero; Infinity/finite = signed Infinity;
+x/0 (x nonzero) sets a new DZ flag and produces a signed Infinity.
+
+**New for this task**: DZ is the first FPSR *exception-status byte* bit
+this project actually wires up (bit10, confirmed same-relative-position
+as FPCR's own ENABLE byte per Section 2.2.1's explicit "occupy the same
+positions within each byte" statement) — `rtl/m68882_proto.sv`'s own
+FPSR update now OR's DZ in rather than overwriting it, a deliberate,
+narrow first step toward real accrued-exception-byte semantics (Phase
+4d's own remaining scope), not yet a general mechanism.
+
+**Verified**: `tb/m68882_apu_tb.sv` gained 6 more checks (21/21 total) —
+4.0/2.0=2.0 (ratio>=1 branch, exact), 3.0/2.0=1.5 (ratio<1 branch on the
+mantissa divide, the trickier of the two normalization paths), 6.0/2.0=
+3.0, -6.0/2.0=-3.0 (sign combination), and 1.0/0.0 → +Infinity with the
+DZ bit set. All 6 passed on the first run.
 
 #### Phase 4c — External-operand format conversion (not started)
 Phase 3's own Operand CIR transfer path is still a raw-bytes stub (no

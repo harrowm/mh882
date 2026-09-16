@@ -219,6 +219,43 @@ module m68882_apu_tb;
         repeat (2) @(posedge clk_4x);
         check(u_top.u_proto.u_regfile.fp_r[1] == EXT_0_25, "FMUL: 0.5 * 0.5 == 0.25");
 
+        // ── FDIV: 4.0 / 2.0 = 2.0 (exact, ratio >= 1 branch) ─────────────
+        load_fp(0, EXT_2_0);
+        load_fp(1, EXT_4_0);
+        run_cycle(CIR_COMMAND, 1'b1, cmd_word(3'b000, 3'd0, 3'd1, 7'h20), rd); // FDIV
+        repeat (2) @(posedge clk_4x);
+        check(u_top.u_proto.u_regfile.fp_r[1] == EXT_2_0, "FDIV: 4.0 / 2.0 == 2.0");
+
+        // ── FDIV: 3.0 / 2.0 = 1.5 (ratio < 1 branch on the mantissa divide) ──
+        load_fp(0, EXT_2_0);
+        load_fp(1, EXT_3_0);
+        run_cycle(CIR_COMMAND, 1'b1, cmd_word(3'b000, 3'd0, 3'd1, 7'h20), rd); // FDIV
+        repeat (2) @(posedge clk_4x);
+        check(u_top.u_proto.u_regfile.fp_r[1] == EXT_1_5, "FDIV: 3.0 / 2.0 == 1.5");
+
+        // ── FDIV: 6.0 / 2.0 = 3.0 ────────────────────────────────────────
+        load_fp(0, EXT_2_0);
+        load_fp(1, EXT_6_0);
+        run_cycle(CIR_COMMAND, 1'b1, cmd_word(3'b000, 3'd0, 3'd1, 7'h20), rd); // FDIV
+        repeat (2) @(posedge clk_4x);
+        check(u_top.u_proto.u_regfile.fp_r[1] == EXT_3_0, "FDIV: 6.0 / 2.0 == 3.0");
+
+        // ── FDIV: -6.0 / 2.0 = -3.0 (sign combination) ──────────────────
+        load_fp(0, EXT_2_0);
+        load_fp(1, {1'b1, EXT_6_0[94:0]}); // -6.0
+        run_cycle(CIR_COMMAND, 1'b1, cmd_word(3'b000, 3'd0, 3'd1, 7'h20), rd); // FDIV
+        repeat (2) @(posedge clk_4x);
+        check(u_top.u_proto.u_regfile.fp_r[1] == EXT_N3_0, "FDIV: -6.0 / 2.0 == -3.0");
+
+        // ── FDIV: 1.0 / 0.0 -> signed Infinity, DZ flag set ──────────────
+        load_fp(0, 96'h0); // +0.0
+        load_fp(1, EXT_1_0);
+        run_cycle(CIR_COMMAND, 1'b1, cmd_word(3'b000, 3'd0, 3'd1, 7'h20), rd); // FDIV
+        repeat (2) @(posedge clk_4x);
+        check(u_top.u_proto.u_regfile.fp_r[1] == {1'b0, 15'h7FFF, 16'h0, 64'h8000_0000_0000_0000},
+              "FDIV: 1.0 / 0.0 == +Infinity");
+        check(u_top.u_proto.u_regfile.fpsr_r[10] == 1'b1, "FDIV: DZ exception-status bit set for divide-by-zero");
+
         $display("---");
         $display("%0d passed, %0d failed", pass_count, fail_count);
         if (fail_count != 0) begin

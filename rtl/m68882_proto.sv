@@ -164,19 +164,24 @@ module m68882_proto (
     wire is_fadd = (c_ext == 7'h22);
     wire is_fsub = (c_ext == 7'h28);
     wire is_fmul = (c_ext == 7'h23);
+    wire is_fdiv = (c_ext == 7'h20);
 
-    logic [95:0] addsub_result, mul_result;
+    logic [95:0] addsub_result, mul_result, div_result;
     logic        addsub_z, addsub_n, addsub_i, addsub_nan, addsub_operr;
     logic        mul_z, mul_n, mul_i, mul_nan, mul_operr;
+    logic        div_z, div_n, div_i, div_nan, div_operr, div_dz;
     logic [95:0] apu_result;
-    logic        apu_flag_z, apu_flag_n, apu_flag_i, apu_flag_nan, apu_flag_operr;
+    logic        apu_flag_z, apu_flag_n, apu_flag_i, apu_flag_nan, apu_flag_operr, apu_flag_dz;
 
     always_comb begin
         fp_add_sub(apu_a_rd, apu_b_rd, is_fsub, round_mode_t'(fpcr_o[5:4]),
                    addsub_result, addsub_z, addsub_n, addsub_i, addsub_nan, addsub_operr);
         fp_mul(apu_a_rd, apu_b_rd, round_mode_t'(fpcr_o[5:4]),
                mul_result, mul_z, mul_n, mul_i, mul_nan, mul_operr);
+        fp_div(apu_a_rd, apu_b_rd, round_mode_t'(fpcr_o[5:4]),
+               div_result, div_z, div_n, div_i, div_nan, div_operr, div_dz);
 
+        apu_flag_dz = 1'b0;
         if (is_fmul) begin
             apu_result     = mul_result;
             apu_flag_z     = mul_z;
@@ -184,6 +189,14 @@ module m68882_proto (
             apu_flag_i     = mul_i;
             apu_flag_nan   = mul_nan;
             apu_flag_operr = mul_operr;
+        end else if (is_fdiv) begin
+            apu_result     = div_result;
+            apu_flag_z     = div_z;
+            apu_flag_n     = div_n;
+            apu_flag_i     = div_i;
+            apu_flag_nan   = div_nan;
+            apu_flag_operr = div_operr;
+            apu_flag_dz    = div_dz;
         end else begin
             apu_result     = addsub_result;
             apu_flag_z     = addsub_z;
@@ -296,14 +309,19 @@ module m68882_proto (
                                 ca_r    <= 1'b0;
                                 prim_r  <= PRIM_NULL;
                                 state_r <= ST_IDLE;
-                                if (is_fadd || is_fsub || is_fmul) begin
+                                if (is_fadd || is_fsub || is_fmul || is_fdiv) begin
                                     apu_wr_en     <= 1'b1;
                                     apu_wr_sel    <= c_ry;
                                     apu_wr_data   <= apu_result;
                                     ctrl_wr_en    <= 1'b1;
                                     ctrl_wr_sel_r <= 2'd1; // FPSR
+                                    // CC byte overwritten fresh each op (Section 4.5.5.1);
+                                    // DZ (bit10 of the exception-status byte) is OR'd in,
+                                    // not overwritten -- Phase 4a/4d's own documented
+                                    // simplification (no real sticky/accrued-byte model yet)
                                     ctrl_wr_data  <= {4'b0, apu_flag_n, apu_flag_z, apu_flag_i,
-                                                       apu_flag_nan, fpsr_o[23:0]};
+                                                       apu_flag_nan,
+                                                       fpsr_o[23:11], (fpsr_o[10] | apu_flag_dz), fpsr_o[9:0]};
                                 end
                             end
                             3'b010: if (c_rx == 3'b111) begin // move constant to FPn

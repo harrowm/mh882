@@ -417,4 +417,126 @@ package m68882_apu_pkg;
         end
     endtask
 
+    // FDIV (extension-field opcode $20, Table 4-13) -- Phase 4b.
+    // result = FPn / source (b/a in this task's own a/b naming, matching
+    // FADD/FSUB's own "Source + FPn" / "FPn - Source" convention).
+    //
+    // Mantissa divide: a.mant/b.mant are each a 64-bit unsigned integer
+    // representing a value in [1,2) (fixed point, binary point after
+    // bit63). Their true ratio b.mant/a.mant therefore lands in (0.5,2).
+    // Scale the dividend left by DIV_SHIFT=67 bits (3 more than the
+    // 64-bit mantissa window needs, for a guard/round/sticky tail
+    // matching fp_add_sub/fp_mul's own convention) before dividing by
+    // a.mant: quotient = floor((b.mant << 67) / a.mant) lands in
+    // [2^66, 2^68) -- i.e. either bit67 or bit66 is the new integer bit,
+    // depending on whether the ratio is >=1 or <1. A single conditional
+    // 1-bit left-shift (folding the displaced bit into the sticky tail)
+    // normalizes both cases to "integer bit at position 67" uniformly,
+    // the same shape fp_add_sub/fp_mul's own normalization step uses.
+    localparam int DIV_SHIFT = 67;
+
+    task automatic fp_div(
+        input  logic [95:0]  a_raw,
+        input  logic [95:0]  b_raw,
+        input  round_mode_t  rmode,
+        output logic [95:0]  result,
+        output logic         flag_z,
+        output logic         flag_n,
+        output logic         flag_i,
+        output logic         flag_nan,
+        output logic         flag_operr,
+        output logic         flag_dz
+    );
+        fpx_t a, b;
+        logic sign_r;
+        logic a_nan, b_nan, a_inf, b_inf, a_zero, b_zero;
+
+        a = unpack_fpx(a_raw);
+        b = unpack_fpx(b_raw);
+        sign_r = a.sign ^ b.sign;
+
+        a_nan  = is_nan_fpx(a);
+        b_nan  = is_nan_fpx(b);
+        a_inf  = is_inf_fpx(a);
+        b_inf  = is_inf_fpx(b);
+        a_zero = is_zero_fpx(a);
+        b_zero = is_zero_fpx(b);
+
+        flag_operr = 1'b0;
+        flag_dz    = 1'b0;
+
+        if (a_nan) begin
+            result = a_raw;
+        end else if (b_nan) begin
+            result = b_raw;
+        end else if ((a_inf && b_inf) || (a_zero && b_zero)) begin
+            flag_operr = 1'b1; // Infinity/Infinity or 0/0 is undefined
+            result = {1'b0, 15'h7FFF, 16'h0, 64'hC000_0000_0000_0000};
+        end else if (a_zero) begin
+            flag_dz = 1'b1; // divide by zero (dividend nonzero, confirmed above)
+            result  = {sign_r, 15'h7FFF, 16'h0, 64'h8000_0000_0000_0000};
+        end else if (a_inf) begin
+            // finite / Infinity = signed zero
+            result = {sign_r, 15'h0, 16'h0, 64'h0};
+        end else if (b_inf) begin
+            result = {sign_r, 15'h7FFF, 16'h0, 64'h8000_0000_0000_0000};
+        end else if (b_zero) begin
+            result = {sign_r, 15'h0, 16'h0, 64'h0};
+        end else begin
+            logic [199:0] dividend, divisor, quotient, remainder;
+            logic [67:0]  q68, q_aligned;
+            logic signed [17:0] exp_result;
+            logic [63:0] mant64;
+            logic        guard, round_bit, sticky;
+            logic [63:0] rounded_mant;
+            logic        carry;
+
+            dividend = {136'b0, b.mant} << DIV_SHIFT;
+            divisor  = {136'b0, a.mant};
+            quotient = dividend / divisor;
+            remainder = dividend % divisor;
+            q68 = quotient[67:0];
+
+            if (q68[67]) begin
+                // ratio >= 1: already aligned, top bit at 67
+                q_aligned  = q68;
+                exp_result = $signed({3'b0, b.exp}) - $signed({3'b0, a.exp}) + 18'sd16383;
+            end else begin
+                // ratio < 1: shift left 1 to bring q68's own top bit
+                // (bit66) up to bit67 -- a pure left-shift, so q68's own
+                // bit0 lands at q_aligned[1], nothing is discarded
+                q_aligned  = {q68[66:0], 1'b0};
+                exp_result = $signed({3'b0, b.exp}) - $signed({3'b0, a.exp}) + 18'sd16383 - 18'sd1;
+            end
+
+            mant64    = q_aligned[67:4];
+            guard     = q_aligned[3];
+            round_bit = q_aligned[2];
+            sticky    = q_aligned[1] | q_aligned[0] | (remainder != 200'b0);
+
+            round_mantissa(mant64, guard, round_bit, sticky, sign_r, rmode, rounded_mant, carry);
+            if (carry) begin
+                rounded_mant = {1'b1, rounded_mant[63:1]};
+                exp_result   = exp_result + 18'sd1;
+            end
+
+            if (exp_result >= 18'sd32767) begin
+                result = {sign_r, 15'h7FFF, 16'h0, 64'h8000_0000_0000_0000};
+            end else if (exp_result <= 18'sd0 || rounded_mant == 64'h0) begin
+                result = {sign_r, 15'h0, 16'h0, 64'h0};
+            end else begin
+                result = {sign_r, exp_result[14:0], 16'h0, rounded_mant};
+            end
+        end
+
+        begin
+            fpx_t r;
+            r = unpack_fpx(result);
+            flag_z   = is_zero_fpx(r);
+            flag_n   = r.sign && !flag_z;
+            flag_i   = is_inf_fpx(r);
+            flag_nan = is_nan_fpx(r);
+        end
+    endtask
+
 endpackage
