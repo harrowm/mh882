@@ -489,17 +489,32 @@ mantissa came out completely correct — a reminder to check the FULL
 result, not just the part that looks right at a glance. 12 more
 `tb/m68882_proto_tb.sv` checks (27/27 total).
 
-**NOT yet implemented** (explicitly, not silently): the transcendental
-set (Phase 4b's own remaining scope — extension-field opcodes already
-confirmed); Word/Byte Integer and Packed Decimal formats (Phase 4c's own
-remaining scope — W/B are the same class as the already-done L, just
-narrower; P is a genuinely harder BCD-based format); denormals
-(underflow collapses to signed zero); real exponent-overflow trap
-semantics (coarse saturate-to-infinity); the rest of the FPSR accrued-
-exception/exception-status bytes beyond OPERR/DZ (Phase 4d).
+**Phase 4d (real exception-status + accrued-exception-byte semantics) is
+also complete**: the confirmed AEXC OR-accumulation formulas (Section
+2.3.4/Figure 2-7 — note `AEXC(UNFL) |= EXC(UNFL & INEX2)` is an AND
+against INEX2, not a plain OR) and the signaling-vs-quiet-NaN bit
+convention (bit62, the leading fraction bit) are both wired for real.
+All 4 arithmetic tasks now also report `flag_ovfl`/`flag_unfl`/
+`flag_inex2` (derived from logic that already existed for Phase 4a-4c's
+own result computation); a new `is_snan_fpx` checks raw inputs directly
+in `rtl/m68882_proto.sv`. The EXC byte is overwritten fresh each op (not
+sticky, per the manual); AEXC only grows until an explicit host write or
+reset. 12 more `tb/m68882_apu_tb.sv` checks (48/48 total), including a
+direct confirmation that AEXC's own stickiness survives an unrelated
+later operation while the non-sticky EXC byte does not.
 
-See `plan.md` for the full phased build plan. Phase 4d (exception/
-accrued-byte semantics) is next.
+**NOT yet implemented** (explicitly, not silently): the transcendental
+set (Phase 4b's own remaining scope); Word/Byte Integer and Packed
+Decimal formats (Phase 4c's own remaining scope); denormals (underflow
+collapses to signed zero); real exponent-overflow trap semantics (coarse
+saturate-to-infinity); BSUN (needs the still-stubbed conditional
+predicates) and INEX1 (Packed-Decimal-only); and actually TAKING a trap
+when FPCR's ENABLE byte requests one for a set EXC bit — a natural
+Phase 6 candidate, since that's where the Response Primitive selection
+logic (Take-Pre/Mid-Instruction-Exception) already lives.
+
+See `plan.md` for the full phased build plan. Phase 5 (state frame
+save/restore) is next.
 
 ```bash
 make test   # builds and runs all three testbenches via Icarus Verilog

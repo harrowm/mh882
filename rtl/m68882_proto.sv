@@ -199,12 +199,19 @@ module m68882_proto (
                                     : {!apu_a_rd[95], apu_a_rd[94:0]};
 
     logic [95:0] addsub_result, mul_result, div_result, sqrt_result;
-    logic        addsub_z, addsub_n, addsub_i, addsub_nan, addsub_operr;
-    logic        mul_z, mul_n, mul_i, mul_nan, mul_operr;
-    logic        div_z, div_n, div_i, div_nan, div_operr, div_dz;
-    logic        sqrt_z, sqrt_n, sqrt_i, sqrt_nan, sqrt_operr;
+    logic        addsub_z, addsub_n, addsub_i, addsub_nan, addsub_operr, addsub_ovfl, addsub_unfl, addsub_inex2;
+    logic        mul_z, mul_n, mul_i, mul_nan, mul_operr, mul_ovfl, mul_unfl, mul_inex2;
+    logic        div_z, div_n, div_i, div_nan, div_operr, div_dz, div_ovfl, div_unfl, div_inex2;
+    logic        sqrt_z, sqrt_n, sqrt_i, sqrt_nan, sqrt_operr, sqrt_ovfl, sqrt_unfl, sqrt_inex2;
     logic [95:0] apu_result;
-    logic        apu_flag_z, apu_flag_n, apu_flag_i, apu_flag_nan, apu_flag_operr, apu_flag_dz;
+    logic        apu_flag_z, apu_flag_n, apu_flag_i, apu_flag_nan;
+    logic        apu_flag_operr, apu_flag_dz, apu_flag_ovfl, apu_flag_unfl, apu_flag_inex2;
+
+    // Phase 4d: SNAN is detected directly from the RAW input operands
+    // (not a task output) -- Section 4.5.4.2: "If either operand to an
+    // operation is a signaling NAN, then the SNAN bit is set." Applies
+    // uniformly regardless of which arithmetic op is selected.
+    wire apu_flag_snan = is_snan_fpx(unpack_fpx(apu_a_rd)) || is_snan_fpx(unpack_fpx(apu_b_rd));
 
     always_comb begin
         // FCMP reuses the identical subtraction fp_add_sub already
@@ -212,13 +219,14 @@ module m68882_proto (
         // "as if" FPn-source were computed) -- only the register write
         // is skipped for FCMP, further down.
         fp_add_sub(apu_a_rd, apu_b_rd, (is_fsub || is_fcmp), round_mode_t'(fpcr_o[5:4]),
-                   addsub_result, addsub_z, addsub_n, addsub_i, addsub_nan, addsub_operr);
+                   addsub_result, addsub_z, addsub_n, addsub_i, addsub_nan, addsub_operr,
+                   addsub_ovfl, addsub_unfl, addsub_inex2);
         fp_mul(apu_a_rd, apu_b_rd, round_mode_t'(fpcr_o[5:4]),
-               mul_result, mul_z, mul_n, mul_i, mul_nan, mul_operr);
+               mul_result, mul_z, mul_n, mul_i, mul_nan, mul_operr, mul_ovfl, mul_unfl, mul_inex2);
         fp_div(apu_a_rd, apu_b_rd, round_mode_t'(fpcr_o[5:4]),
-               div_result, div_z, div_n, div_i, div_nan, div_operr, div_dz);
+               div_result, div_z, div_n, div_i, div_nan, div_operr, div_dz, div_ovfl, div_unfl, div_inex2);
         fp_sqrt(apu_a_rd, round_mode_t'(fpcr_o[5:4]),
-                sqrt_result, sqrt_z, sqrt_n, sqrt_i, sqrt_nan, sqrt_operr);
+                sqrt_result, sqrt_z, sqrt_n, sqrt_i, sqrt_nan, sqrt_operr, sqrt_ovfl, sqrt_unfl, sqrt_inex2);
 
         apu_flag_dz = 1'b0;
         if (is_fmul) begin
@@ -228,6 +236,9 @@ module m68882_proto (
             apu_flag_i     = mul_i;
             apu_flag_nan   = mul_nan;
             apu_flag_operr = mul_operr;
+            apu_flag_ovfl  = mul_ovfl;
+            apu_flag_unfl  = mul_unfl;
+            apu_flag_inex2 = mul_inex2;
         end else if (is_fdiv) begin
             apu_result     = div_result;
             apu_flag_z     = div_z;
@@ -236,6 +247,9 @@ module m68882_proto (
             apu_flag_nan   = div_nan;
             apu_flag_operr = div_operr;
             apu_flag_dz    = div_dz;
+            apu_flag_ovfl  = div_ovfl;
+            apu_flag_unfl  = div_unfl;
+            apu_flag_inex2 = div_inex2;
         end else if (is_fabs || is_fneg) begin
             apu_result     = absneg_result;
             apu_flag_z     = is_zero_fpx(unpack_fpx(absneg_result));
@@ -243,6 +257,9 @@ module m68882_proto (
             apu_flag_i     = is_inf_fpx(unpack_fpx(absneg_result));
             apu_flag_nan   = is_nan_fpx(unpack_fpx(absneg_result));
             apu_flag_operr = 1'b0;
+            apu_flag_ovfl  = 1'b0;
+            apu_flag_unfl  = 1'b0;
+            apu_flag_inex2 = 1'b0;
         end else if (is_ftst) begin
             apu_result     = apu_a_rd; // unused (FTST never writes a register)
             apu_flag_z     = ftst_z;
@@ -250,6 +267,9 @@ module m68882_proto (
             apu_flag_i     = ftst_i;
             apu_flag_nan   = ftst_nan;
             apu_flag_operr = 1'b0;
+            apu_flag_ovfl  = 1'b0;
+            apu_flag_unfl  = 1'b0;
+            apu_flag_inex2 = 1'b0;
         end else if (is_fsqrt) begin
             apu_result     = sqrt_result;
             apu_flag_z     = sqrt_z;
@@ -257,6 +277,9 @@ module m68882_proto (
             apu_flag_i     = sqrt_i;
             apu_flag_nan   = sqrt_nan;
             apu_flag_operr = sqrt_operr;
+            apu_flag_ovfl  = sqrt_ovfl;
+            apu_flag_unfl  = sqrt_unfl;
+            apu_flag_inex2 = sqrt_inex2;
         end else begin
             // FADD, FSUB, and FCMP (condition codes only, see above)
             apu_result     = addsub_result;
@@ -265,6 +288,9 @@ module m68882_proto (
             apu_flag_i     = addsub_i;
             apu_flag_nan   = addsub_nan;
             apu_flag_operr = addsub_operr;
+            apu_flag_ovfl  = addsub_ovfl;
+            apu_flag_unfl  = addsub_unfl;
+            apu_flag_inex2 = addsub_inex2;
         end
     end
 
@@ -449,20 +475,33 @@ module m68882_proto (
                                     end
                                     ctrl_wr_en    <= 1'b1;
                                     ctrl_wr_sel_r <= 2'd1; // FPSR
-                                    // CC byte overwritten fresh each op (Section 4.5.5.1);
-                                    // OPERR (bit13) and DZ (bit10) of the exception-status
-                                    // byte are OR'd in, not overwritten -- Phase 4a/4d's own
-                                    // documented simplification (no real sticky/accrued-byte
-                                    // model yet). NOTE: apu_flag_operr was computed by every
-                                    // arithmetic task from Phase 4a onward but never actually
-                                    // reached FPSR until this fix -- found while writing up
-                                    // this phase's own documentation, not by a failing test
-                                    // (no test had checked OPERR until this same change added
-                                    // one).
-                                    ctrl_wr_data  <= {4'b0, apu_flag_n, apu_flag_z, apu_flag_i,
-                                                       apu_flag_nan,
-                                                       fpsr_o[23:14], (fpsr_o[13] | apu_flag_operr),
-                                                       fpsr_o[12:11], (fpsr_o[10] | apu_flag_dz), fpsr_o[9:0]};
+                                    // Phase 4d: CC byte and the EXC (exception-status)
+                                    // byte are both overwritten FRESH each op (Section
+                                    // 4.5.5.1/2.3.3 -- EXC is not sticky). The AEXC
+                                    // (accrued-exception) byte instead uses the manual's
+                                    // own confirmed OR-accumulation formulas (Section
+                                    // 2.3.4, Figure 2-7):
+                                    //   AEXC(IOP)  |= EXC(BSUN|SNAN|OPERR)
+                                    //   AEXC(OVFL) |= EXC(OVFL)
+                                    //   AEXC(UNFL) |= EXC(UNFL & INEX2)
+                                    //   AEXC(DZ)   |= EXC(DZ)
+                                    //   AEXC(INEX) |= EXC(INEX1|INEX2|OVFL)
+                                    // BSUN and INEX1 are not yet implemented (BSUN needs
+                                    // the still-stubbed conditional-predicate set;
+                                    // INEX1 only applies to Packed-Decimal input, not yet
+                                    // implemented -- Phase 4c) -- both wired as a
+                                    // constant 0 rather than silently omitted from the
+                                    // formulas above.
+                                    ctrl_wr_data  <= {4'b0, apu_flag_n, apu_flag_z, apu_flag_i, apu_flag_nan,
+                                                       fpsr_o[23:16],
+                                                       1'b0, apu_flag_snan, apu_flag_operr, apu_flag_ovfl,
+                                                       apu_flag_unfl, apu_flag_dz, apu_flag_inex2, 1'b0,
+                                                       (fpsr_o[7] | apu_flag_snan | apu_flag_operr),
+                                                       (fpsr_o[6] | apu_flag_ovfl),
+                                                       (fpsr_o[5] | (apu_flag_unfl && apu_flag_inex2)),
+                                                       (fpsr_o[4] | apu_flag_dz),
+                                                       (fpsr_o[3] | apu_flag_inex2 | apu_flag_ovfl),
+                                                       fpsr_o[2:0]};
                                 end
                             end
                             3'b010: if (c_rx == 3'b111) begin // move constant to FPn

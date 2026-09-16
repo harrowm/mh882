@@ -1,6 +1,6 @@
 # MC68882 FPU — Phased Scope Plan
 
-## Status: Phases 0-3 complete. Phase 4a complete. Phase 4b: FADD/FSUB/FMUL/FDIV/FABS/FNEG/FCMP/FTST/FSQRT done; the transcendental set (~18 functions) is explicitly deferred. Phase 4c (L/S/D/X format conversion) complete; W/B/P remain. Phase 4d (full exception/accrued-byte semantics) next.
+## Status: Phases 0-3 complete. Phase 4a/4b (core arithmetic, transcendentals deferred)/4c (L/S/D/X conversion, W/B/P remain)/4d (exception/accrued-byte semantics) all complete. Phase 5 (state frame save/restore) is next.
 
 ## Origin
 
@@ -703,12 +703,64 @@ BCD, a static-or-dynamic k-factor controlling output rounding) requiring
 meaningfully more work than any format implemented so far. Both are
 left as a documented remainder of this phase, not a silent gap.
 
-#### Phase 4d — Exception flags and the accrued-exception byte (not started)
-Phase 4a only sets the FPSR condition-code byte and a coarse OPERR flag.
-Real exception-byte semantics (BSUN/SNAN/OPERR/OVFL/UNFL/DZ/INEX2/INEX1,
-the accrued-exception byte's own OR-accumulation rules, and actually
-taking a trap when FPCR's own ENABLE byte requests one) are deferred
-here.
+#### Phase 4d — Exception flags and the accrued-exception byte (COMPLETE, except BSUN/INEX1/traps)
+Confirmed directly from the manual (Section 2.3.4/Figure 2-7) the real
+accrued-exception-byte (AEXC) OR-accumulation formulas, rather than
+guessing them:
+```
+AEXC(IOP)  |= EXC(BSUN|SNAN|OPERR)
+AEXC(OVFL) |= EXC(OVFL)
+AEXC(UNFL) |= EXC(UNFL & INEX2)   -- note the AND, not OR, against INEX2
+AEXC(DZ)   |= EXC(DZ)
+AEXC(INEX) |= EXC(INEX1|INEX2|OVFL)
+```
+and the signaling-vs-quiet-NaN bit convention (Section 3.5.4, confirmed:
+"NANs with a leading fraction bit [bit62, immediately after the explicit
+integer bit] equal to one are non-signaling; equal to zero are
+signaling").
+
+**Implementation**: all 4 arithmetic tasks (`fp_add_sub`/`fp_mul`/
+`fp_div`/`fp_sqrt`) gained 3 new output flags each — `flag_ovfl`
+(set exactly when the existing exponent-overflow-saturate-to-infinity
+branch fires), `flag_unfl` (set exactly when the existing exponent-
+underflow-flush-to-zero branch fires), `flag_inex2` (set whenever the
+guard/round/sticky bits feeding `round_mantissa` were nonzero, i.e. the
+result was genuinely rounded) — all derived from logic that ALREADY
+existed for Phase 4a-4c's own result computation, not new detection
+machinery. `is_snan_fpx` (a new package function) is checked directly
+against the raw input operands in `rtl/m68882_proto.sv`, not inside the
+arithmetic tasks, since SNAN detection only needs to inspect inputs.
+`rtl/m68882_proto.sv`'s own FPSR-update expression was rewritten to
+build a real 8-bit EXC byte (overwritten fresh each op, matching the
+manual's own "not sticky" framing for this byte) and a real AEXC byte
+(the confirmed sticky-OR formulas above, only ever growing until an
+explicit host write or reset — matching "the AEXC byte is cleared by
+the FPCP only by a reset or a restore of the null state").
+
+**Verified**: `tb/m68882_apu_tb.sv` gained 12 more checks (48/48 total)
+— SNAN detection (and its own IOP contribution to AEXC) from a
+signaling-NaN operand; INEX2 (and AEXC's own INEX bit) from an
+inexact FDIV (1.0/3.0); OVFL (and AEXC's own OVFL bit, plus the
++Infinity saturation result) from an FADD deliberately pushed past the
+maximum exponent; UNFL from an FMUL pushed below the minimum exponent;
+and AEXC's own STICKY behavior confirmed across two separate,
+unrelated operations (DZ stays set in AEXC after a later, unrelated
+FADD, while the non-sticky EXC byte itself is correctly cleared by
+that same later operation) — all 12 passed on the first run.
+
+**NOT yet implemented** (explicitly, not silently, and genuinely out of
+this phase's own reasonable scope): BSUN (needs the still-stubbed
+30-of-32 conditional predicates from Phase 3 to be real first); INEX1
+(only applies to Packed-Decimal input, which Phase 4c never
+implemented); and actually TAKING a trap (vectoring to an exception
+handler) when FPCR's own ENABLE byte requests one for a set EXC bit —
+this project has no trap-taking mechanism of any kind yet, since that's
+really a HOST-CPU-side concern (the FPCP's own role is just to report
+via the Response Primitive protocol, specifically the Take-Pre-
+Instruction-Exception/Take-Mid-Instruction-Exception primitives Phase 3
+already catalogued but never wired to fire) — a natural candidate for
+Phase 6's own pipelining work, where the primitive-selection logic
+already lives.
 
 ### Phase 5 — State frame save/restore
 FSAVE/FRESTORE Null/Idle/Busy frame generation and parsing, both

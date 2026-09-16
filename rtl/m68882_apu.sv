@@ -72,6 +72,15 @@ package m68882_apu_pkg;
         return (x.exp == 15'h7FFF) && (x.mant != 64'h8000_0000_0000_0000);
     endfunction
 
+    // Signaling vs non-signaling (quiet) NaN (Section 3.5.4, confirmed
+    // directly): "NANs with a leading fraction bit equal to one are
+    // non-signaling NANs; NANs with a leading fraction bit equal to
+    // zero are signaling NANs" -- the leading fraction bit is bit62 (the
+    // bit immediately after the explicit integer bit at bit63).
+    function automatic logic is_snan_fpx(fpx_t x);
+        return is_nan_fpx(x) && !x.mant[62];
+    endfunction
+
     // Rounding-mode encoding (Section 1.2's own Mode Control byte
     // bits[5:4]): 00=Nearest, 01=Toward-Zero, 10=Toward-(-Inf),
     // 11=Toward-(+Inf).
@@ -138,7 +147,10 @@ package m68882_apu_pkg;
         output logic         flag_n,
         output logic         flag_i,
         output logic         flag_nan,
-        output logic         flag_operr
+        output logic         flag_operr,
+        output logic         flag_ovfl,
+        output logic         flag_unfl,
+        output logic         flag_inex2
     );
         fpx_t a, b, eff_a;
         logic a_nan, b_nan, a_inf, b_inf, a_zero, b_zero;
@@ -156,6 +168,9 @@ package m68882_apu_pkg;
         b_zero = is_zero_fpx(b);
 
         flag_operr = 1'b0;
+        flag_ovfl  = 1'b0;
+        flag_unfl  = 1'b0;
+        flag_inex2 = 1'b0;
 
         if (a_nan) begin
             result = a_raw;
@@ -271,6 +286,7 @@ package m68882_apu_pkg;
                             // underflows through zero -- Phase 4a's own
                             // documented denormal-free simplification:
                             // collapse to a correctly signed zero.
+                            flag_unfl  = 1'b1;
                             sum67      = 67'b0;
                             result_exp = 15'h0;
                         end else begin
@@ -279,6 +295,8 @@ package m68882_apu_pkg;
                         end
                     end
                 end
+
+                flag_inex2 = (sum67[2:0] != 3'b0); // guard/round/sticky nonzero -> inexact
 
                 round_mantissa(sum67[66:3], sum67[2], sum67[1], sum67[0],
                                 result_sign, rmode, rounded_mant, carry);
@@ -291,6 +309,7 @@ package m68882_apu_pkg;
                 if (result_exp >= 15'h7FFF) begin
                     // exponent overflow -- saturate to infinity (coarse
                     // OVFL substitute, see module header)
+                    flag_ovfl = 1'b1;
                     result = {result_sign, 15'h7FFF, 16'h0, 64'h8000_0000_0000_0000};
                 end else if (rounded_mant == 64'h0) begin
                     result = {result_sign, 15'h0, 16'h0, 64'h0};
@@ -334,7 +353,10 @@ package m68882_apu_pkg;
         output logic         flag_n,
         output logic         flag_i,
         output logic         flag_nan,
-        output logic         flag_operr
+        output logic         flag_operr,
+        output logic         flag_ovfl,
+        output logic         flag_unfl,
+        output logic         flag_inex2
     );
         fpx_t a, b;
         logic sign_r;
@@ -352,6 +374,9 @@ package m68882_apu_pkg;
         b_zero = is_zero_fpx(b);
 
         flag_operr = 1'b0;
+        flag_ovfl  = 1'b0;
+        flag_unfl  = 1'b0;
+        flag_inex2 = 1'b0;
 
         if (a_nan) begin
             result = a_raw;
@@ -388,6 +413,8 @@ package m68882_apu_pkg;
                 exp_sum   = $signed({3'b0, a.exp}) + $signed({3'b0, b.exp}) - 18'sd16383;
             end
 
+            flag_inex2 = guard || round_bit || sticky;
+
             round_mantissa(mant64, guard, round_bit, sticky, sign_r, rmode, rounded_mant, carry);
             if (carry) begin
                 rounded_mant = {1'b1, rounded_mant[63:1]};
@@ -397,10 +424,12 @@ package m68882_apu_pkg;
             if (exp_sum >= 18'sd32767) begin
                 // exponent overflow -- saturate to infinity (Phase 4a's
                 // own coarse OVFL substitute, same convention here)
+                flag_ovfl = 1'b1;
                 result = {sign_r, 15'h7FFF, 16'h0, 64'h8000_0000_0000_0000};
             end else if (exp_sum <= 18'sd0 || rounded_mant == 64'h0) begin
                 // exponent underflow -- Phase 4a's own denormal-free
                 // simplification: collapse to a correctly signed zero
+                flag_unfl = (exp_sum <= 18'sd0);
                 result = {sign_r, 15'h0, 16'h0, 64'h0};
             end else begin
                 result = {sign_r, exp_sum[14:0], 16'h0, rounded_mant};
@@ -445,7 +474,10 @@ package m68882_apu_pkg;
         output logic         flag_i,
         output logic         flag_nan,
         output logic         flag_operr,
-        output logic         flag_dz
+        output logic         flag_dz,
+        output logic         flag_ovfl,
+        output logic         flag_unfl,
+        output logic         flag_inex2
     );
         fpx_t a, b;
         logic sign_r;
@@ -464,6 +496,9 @@ package m68882_apu_pkg;
 
         flag_operr = 1'b0;
         flag_dz    = 1'b0;
+        flag_ovfl  = 1'b0;
+        flag_unfl  = 1'b0;
+        flag_inex2 = 1'b0;
 
         if (a_nan) begin
             result = a_raw;
@@ -513,6 +548,7 @@ package m68882_apu_pkg;
             guard     = q_aligned[3];
             round_bit = q_aligned[2];
             sticky    = q_aligned[1] | q_aligned[0] | (remainder != 200'b0);
+            flag_inex2 = guard || round_bit || sticky;
 
             round_mantissa(mant64, guard, round_bit, sticky, sign_r, rmode, rounded_mant, carry);
             if (carry) begin
@@ -521,8 +557,10 @@ package m68882_apu_pkg;
             end
 
             if (exp_result >= 18'sd32767) begin
+                flag_ovfl = 1'b1;
                 result = {sign_r, 15'h7FFF, 16'h0, 64'h8000_0000_0000_0000};
             end else if (exp_result <= 18'sd0 || rounded_mant == 64'h0) begin
+                flag_unfl = (exp_result <= 18'sd0);
                 result = {sign_r, 15'h0, 16'h0, 64'h0};
             end else begin
                 result = {sign_r, exp_result[14:0], 16'h0, rounded_mant};
@@ -598,7 +636,10 @@ package m68882_apu_pkg;
         output logic         flag_n,
         output logic         flag_i,
         output logic         flag_nan,
-        output logic         flag_operr
+        output logic         flag_operr,
+        output logic         flag_ovfl,
+        output logic         flag_unfl,
+        output logic         flag_inex2
     );
         fpx_t a;
         logic a_nan, a_inf, a_zero;
@@ -609,6 +650,9 @@ package m68882_apu_pkg;
         a_zero = is_zero_fpx(a);
 
         flag_operr = 1'b0;
+        flag_ovfl  = 1'b0;
+        flag_unfl  = 1'b0;
+        flag_inex2 = 1'b0;
 
         if (a_nan) begin
             result = a_raw;
@@ -670,6 +714,7 @@ package m68882_apu_pkg;
                 sticky     = (rem != 134'b0);
             end
             exp_result = half_exp + 18'sd16383;
+            flag_inex2 = guard || round_bit || sticky;
 
             round_mantissa(mant64, guard, round_bit, sticky, 1'b0, rmode, rounded_mant, carry);
             if (carry) begin
@@ -678,8 +723,10 @@ package m68882_apu_pkg;
             end
 
             if (exp_result >= 18'sd32767) begin
+                flag_ovfl = 1'b1;
                 result = {1'b0, 15'h7FFF, 16'h0, 64'h8000_0000_0000_0000};
             end else if (exp_result <= 18'sd0 || rounded_mant == 64'h0) begin
+                flag_unfl = (exp_result <= 18'sd0);
                 result = {1'b0, 15'h0, 16'h0, 64'h0};
             end else begin
                 result = {1'b0, exp_result[14:0], 16'h0, rounded_mant};

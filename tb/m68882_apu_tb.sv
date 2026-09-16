@@ -342,6 +342,66 @@ module m68882_apu_tb;
         repeat (2) @(posedge clk_4x);
         check(u_top.u_proto.u_regfile.fp_r[1] == 96'h0, "FSQRT: sqrt(+0.0) == +0.0");
 
+        // ── Phase 4d: SNAN detection ──────────────────────────────────────
+        // Signaling NaN: exp=0x7FFF, mantissa leading fraction bit (bit62)
+        // clear (Section 3.5.4) -- 0x8000000000000001 (bit63=1, bit62=0,
+        // a nonzero fraction bit to distinguish from Infinity).
+        load_fp(0, {1'b0, 15'h7FFF, 16'h0, 64'h8000_0000_0000_0001}); // sNaN
+        load_fp(1, EXT_1_0);
+        run_cycle(CIR_COMMAND, 1'b1, cmd_word(3'b000, 3'd0, 3'd1, 7'h22), rd); // FADD
+        repeat (2) @(posedge clk_4x);
+        check(u_top.u_proto.u_regfile.fpsr_r[14] == 1'b1, "Phase 4d: SNAN exception-status bit set for a signaling NaN input");
+        check(u_top.u_proto.u_regfile.fpsr_r[7] == 1'b1, "Phase 4d: AEXC IOP bit set (SNAN contributes to IOP)");
+
+        repeat (4) @(posedge clk_4x);
+
+        // ── Phase 4d: INEX2 (inexact result) via FDIV 1.0/3.0 ────────────
+        load_fp(0, {1'b0, 15'h3FFF + 15'd1, 16'h0, 64'hC000_0000_0000_0000}); // 3.0 (source)
+        load_fp(1, EXT_1_0); // FPn (dest)
+        run_cycle(CIR_COMMAND, 1'b1, cmd_word(3'b000, 3'd0, 3'd1, 7'h20), rd); // FDIV: FP1 = 1.0/3.0
+        repeat (2) @(posedge clk_4x);
+        check(u_top.u_proto.u_regfile.fpsr_r[9] == 1'b1, "Phase 4d: INEX2 exception-status bit set for an inexact FDIV result");
+        check(u_top.u_proto.u_regfile.fpsr_r[3] == 1'b1, "Phase 4d: AEXC INEX bit set (INEX2 contributes to AEXC INEX)");
+
+        repeat (4) @(posedge clk_4x);
+
+        // ── Phase 4d: OVFL via FADD pushing the exponent past 32767 ──────
+        load_fp(0, {1'b0, 15'd32766, 16'h0, 64'h8000_0000_0000_0000});
+        load_fp(1, {1'b0, 15'd32766, 16'h0, 64'h8000_0000_0000_0000});
+        run_cycle(CIR_COMMAND, 1'b1, cmd_word(3'b000, 3'd0, 3'd1, 7'h22), rd); // FADD (doubles -> exponent+1 overflow)
+        repeat (2) @(posedge clk_4x);
+        check(u_top.u_proto.u_regfile.fpsr_r[12] == 1'b1, "Phase 4d: OVFL exception-status bit set on exponent overflow");
+        check(u_top.u_proto.u_regfile.fpsr_r[6] == 1'b1, "Phase 4d: AEXC OVFL bit set");
+        check(u_top.u_proto.u_regfile.fp_r[1] == {1'b0, 15'h7FFF, 16'h0, 64'h8000_0000_0000_0000},
+              "Phase 4d: overflowed result saturates to +Infinity");
+
+        repeat (4) @(posedge clk_4x);
+
+        // ── Phase 4d: UNFL (+ INEX2) via FMUL pushing the exponent below 1 ──
+        load_fp(0, {1'b0, 15'd10, 16'h0, 64'hC000_0000_0000_0001}); // tiny, non-power-of-2 mantissa
+        load_fp(1, {1'b0, 15'd10, 16'h0, 64'hC000_0000_0000_0001});
+        run_cycle(CIR_COMMAND, 1'b1, cmd_word(3'b000, 3'd0, 3'd1, 7'h23), rd); // FMUL
+        repeat (2) @(posedge clk_4x);
+        check(u_top.u_proto.u_regfile.fpsr_r[11] == 1'b1, "Phase 4d: UNFL exception-status bit set on exponent underflow");
+        check(u_top.u_proto.u_regfile.fp_r[1] == 96'h0, "Phase 4d: underflowed result flushes to zero");
+
+        repeat (4) @(posedge clk_4x);
+
+        // ── Phase 4d: AEXC is sticky across separate, unrelated operations ──
+        load_fp(0, 96'h0); // +0.0
+        load_fp(1, EXT_1_0);
+        run_cycle(CIR_COMMAND, 1'b1, cmd_word(3'b000, 3'd0, 3'd1, 7'h20), rd); // FDIV 1.0/0.0 -> DZ
+        repeat (2) @(posedge clk_4x);
+        check(u_top.u_proto.u_regfile.fpsr_r[4] == 1'b1, "Phase 4d: AEXC DZ bit set after a divide-by-zero");
+        load_fp(0, EXT_1_0);
+        load_fp(1, EXT_2_0);
+        run_cycle(CIR_COMMAND, 1'b1, cmd_word(3'b000, 3'd0, 3'd1, 7'h22), rd); // an unrelated, exact FADD
+        repeat (2) @(posedge clk_4x);
+        check(u_top.u_proto.u_regfile.fpsr_r[4] == 1'b1,
+              "Phase 4d: AEXC DZ bit stays set (sticky) after a later, unrelated operation");
+        check(u_top.u_proto.u_regfile.fpsr_r[10] == 1'b0,
+              "Phase 4d: EXC DZ bit itself is NOT sticky -- cleared by the later, unrelated operation");
+
         $display("---");
         $display("%0d passed, %0d failed", pass_count, fail_count);
         if (fail_count != 0) begin
