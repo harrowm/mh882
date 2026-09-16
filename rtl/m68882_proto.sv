@@ -934,6 +934,20 @@ module m68882_proto (
                            (fpcr_o[12] && slotA_flag_ovfl)  || (fpcr_o[11] && slotA_flag_unfl)  ||
                            (fpcr_o[10] && slotA_flag_dz)    || (fpcr_o[9]  && slotA_flag_inex2);
 
+    // Phase 12: Section 6.1.2 (SNAN) / 6.1.3 (Operand Error) / 6.1.6
+    // (Divide-by-Zero) each say, for a floating-point-register
+    // destination specifically, "the register is not modified" /
+    // "the destination floating-point data register is not modified"
+    // when THAT exception's own trap is enabled -- confirmed directly,
+    // the opposite of OVFL/UNFL's own text (Section 6.1.4/6.1.5), which
+    // says the result IS stored, same as trap-disabled. Only these 3
+    // exceptions suppress the write; OVFL/UNFL/INEX2 keep writing
+    // exactly as they always have (their own Trap-Enabled text already
+    // matches current behavior).
+    wire slotA_exc_trap_suppress = (fpcr_o[14] && slotA_flag_snan) ||
+                                    (fpcr_o[13] && slotA_flag_operr) ||
+                                    (fpcr_o[10] && slotA_flag_dz);
+
     // ── Phase 4c: external-operand format conversion (opclass 010/011)
     // -- unchanged in substance from Phase 4c/5, just retargeted onto the
     // registered cmd_rx_r/cmd_ry_r fields (dispatch now fires a tick
@@ -1577,10 +1591,16 @@ module m68882_proto (
                     // from the host's own point of view until BOTH
                     // registers have landed. apu_busy_cnt_r is re-armed
                     // to 1 rather than decremented, buying exactly one
-                    // more tick through this same branch.
-                    apu_wr_en   <= 1'b1;
-                    apu_wr_sel  <= slotA_dest_r;
-                    apu_wr_data <= slotA_result; // == slotA_sin_result, via the mux above
+                    // more tick through this same branch. Phase 12: SNAN/
+                    // OPERR (the only two of the 3 suppressing exceptions
+                    // FSINCOS can ever raise -- it never divides) also
+                    // suppress this write when trap-enabled, same as
+                    // every other op's own commit path.
+                    if (!slotA_exc_trap_suppress) begin
+                        apu_wr_en   <= 1'b1;
+                        apu_wr_sel  <= slotA_dest_r;
+                        apu_wr_data <= slotA_result; // == slotA_sin_result, via the mux above
+                    end
                     ctrl_wr_en    <= 1'b1;
                     ctrl_wr_sel_r <= 2'd1; // FPSR
                     ctrl_wr_data  <= slotA_fpsr_next_val;
@@ -1594,16 +1614,25 @@ module m68882_proto (
                         // against Musashi's own `REG_FP[opmode&7]`). FPSR
                         // was already finalized on tick 1; don't re-touch
                         // it here.
-                        apu_wr_en   <= 1'b1;
-                        apu_wr_sel  <= slotA_op_r[2:0];
-                        apu_wr_data <= slotA_cos_result;
+                        // Phase 12: same trap-enabled write suppression
+                        // as tick 1 -- if the whole instruction is being
+                        // suppressed, neither register lands, not just
+                        // the first one.
+                        if (!slotA_exc_trap_suppress) begin
+                            apu_wr_en   <= 1'b1;
+                            apu_wr_sel  <= slotA_op_r[2:0];
+                            apu_wr_data <= slotA_cos_result;
+                        end
                         slotA_sincos_pending_r <= 1'b0;
                     end else begin
                         // Section 4.5.5.1: FCMP compares "as if" FPn-source
                         // were computed, but FPn itself is never written.
                         // FTST likewise never writes (source-only, condition
-                        // codes only).
-                        if (slotA_op_r != 7'h38 && slotA_op_r != 7'h3A) begin
+                        // codes only). Phase 12: SNAN/OPERR/DZ additionally
+                        // suppress the write whenever THAT exception's own
+                        // trap is enabled (slotA_exc_trap_suppress's own
+                        // header comment).
+                        if (slotA_op_r != 7'h38 && slotA_op_r != 7'h3A && !slotA_exc_trap_suppress) begin
                             apu_wr_en   <= 1'b1;
                             apu_wr_sel  <= slotA_dest_r;
                             apu_wr_data <= slotA_result;

@@ -1063,6 +1063,54 @@ module m68882_apu_tb;
         check(u_top.u_proto.u_regfile.fpsr_r[24] == 1'b1, "Phase 9i: FATANH(2.0) NAN condition code set (|x|>1)");
         check(u_top.u_proto.u_regfile.fpsr_r[13] == 1'b1, "Phase 9i: FATANH(2.0) OPERR exception-status bit set (|x|>1)");
 
+        // ── Phase 12: trap-enabled destination-register-write
+        // suppression for SNAN/OPERR/DZ -- confirmed directly from
+        // Section 6.1.2/6.1.3/6.1.6's own "Trap Enabled Results" text:
+        // a floating-point-register destination is left UNMODIFIED for
+        // these 3 exceptions specifically when their own FPCR trap-
+        // enable bit is set (the opposite of OVFL/UNFL, Section
+        // 6.1.4/6.1.5, whose own text says the result IS stored
+        // regardless -- tested below too, to confirm the asymmetry
+        // isn't over-corrected).
+        u_top.u_proto.u_regfile.fpcr_r[13] = 1'b1; // OPERR trap enable
+        load_fp(0, EXT_N4_0);
+        load_fp(1, EXT_2_0); // sentinel -- must survive untouched
+        dispatch(cmd_word(3'b000, 3'd0, 3'd1, 7'h04)); // FSQRT(-4.0) -> OPERR
+        check(u_top.u_proto.u_regfile.fpsr_r[13] == 1'b1, "Phase 12: FSQRT(-4.0) OPERR trap-enabled: OPERR exception-status bit still set");
+        check(u_top.u_proto.u_regfile.fp_r[1] == EXT_2_0,
+              "Phase 12: FSQRT(-4.0) with OPERR trap ENABLED leaves the destination register UNMODIFIED (Section 6.1.3)");
+        u_top.u_proto.u_regfile.fpcr_r[13] = 1'b0;
+
+        u_top.u_proto.u_regfile.fpcr_r[10] = 1'b1; // DZ trap enable
+        load_fp(0, 96'h0); // +0.0 source
+        load_fp(1, EXT_1_0); // sentinel
+        dispatch(cmd_word(3'b000, 3'd0, 3'd1, 7'h20)); // FDIV 1.0/0.0 -> DZ
+        check(u_top.u_proto.u_regfile.fpsr_r[10] == 1'b1, "Phase 12: FDIV 1.0/0.0 DZ trap-enabled: DZ exception-status bit still set");
+        check(u_top.u_proto.u_regfile.fp_r[1] == EXT_1_0,
+              "Phase 12: FDIV 1.0/0.0 with DZ trap ENABLED leaves the destination register UNMODIFIED (Section 6.1.6)");
+        u_top.u_proto.u_regfile.fpcr_r[10] = 1'b0;
+
+        u_top.u_proto.u_regfile.fpcr_r[14] = 1'b1; // SNAN trap enable
+        load_fp(0, {1'b0, 15'h7FFF, 16'h0, 64'h8000_0000_0000_0001}); // sNaN
+        load_fp(1, EXT_3_0); // sentinel
+        dispatch(cmd_word(3'b000, 3'd0, 3'd1, 7'h22)); // FADD with an sNaN source
+        check(u_top.u_proto.u_regfile.fpsr_r[14] == 1'b1, "Phase 12: FADD(sNaN) SNAN trap-enabled: SNAN exception-status bit still set");
+        check(u_top.u_proto.u_regfile.fp_r[1] == EXT_3_0,
+              "Phase 12: FADD(sNaN) with SNAN trap ENABLED leaves the destination register UNMODIFIED (Section 6.1.2)");
+        u_top.u_proto.u_regfile.fpcr_r[14] = 1'b0;
+
+        // Contrast: OVFL keeps writing regardless (Section 6.1.4's own
+        // "the result stored in the destination is the SAME as the
+        // result stored when the trap is disabled").
+        u_top.u_proto.u_regfile.fpcr_r[12] = 1'b1; // OVFL trap enable
+        load_fp(0, {1'b0, 15'h7FFE, 16'h0, 64'h8000_0000_0000_0000}); // near-max exponent
+        load_fp(1, {1'b0, 15'h7FFE, 16'h0, 64'h8000_0000_0000_0000}); // same -- doubling overflows
+        dispatch(cmd_word(3'b000, 3'd0, 3'd1, 7'h22)); // FADD -> OVFL
+        check(u_top.u_proto.u_regfile.fpsr_r[12] == 1'b1, "Phase 12: FADD overflow, OVFL trap-enabled: OVFL exception-status bit set");
+        check(u_top.u_proto.u_regfile.fp_r[1] == {1'b0, 15'h7FFF, 16'h0, 64'h8000_0000_0000_0000},
+              "Phase 12: FADD overflow with OVFL trap ENABLED still stores the saturated +infinity result (Section 6.1.4 -- NOT suppressed like SNAN/OPERR/DZ)");
+        u_top.u_proto.u_regfile.fpcr_r[12] = 1'b0;
+
         $display("---");
         $display("%0d passed, %0d failed", pass_count, fail_count);
         if (fail_count != 0) begin

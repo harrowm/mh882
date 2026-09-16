@@ -2040,14 +2040,41 @@ existing Long-Word-Integer checks exactly, confirming the MSB-
 justified alignment on both the RECEIVE and SUPPLY sides. **`make
 test`: 9/9 suites clean.**
 
-## Phase 12 — Trap-enabled destination-register-write suppression for SNAN/OPERR/DZ, NOT YET STARTED
+## Phase 12 — Trap-enabled destination-register-write suppression for SNAN/OPERR/DZ (COMPLETE)
 
-Next in the gap-closure plan. Section 6.1.2/6.1.3/6.1.6's own "Trap
-Enabled Results" text (confirmed directly, transcribed in full in
-`wobbly-honking-cascade.md`) says a floating-point-register destination
-is left UNMODIFIED for SNAN/OPERR/DZ when that exception's trap is
-enabled — the opposite of OVFL/UNFL, whose own text says the result
-IS stored regardless. Current RTL writes `apu_wr_data<=slotA_result`
-unconditionally; fix gates that write on
-`!(slotA_exc_trap && (slotA_flag_snan || slotA_flag_operr ||
-slotA_flag_dz))`.
+Section 6.1.2/6.1.3/6.1.6's own "Trap Enabled Results" text (confirmed
+directly, transcribed in full in `wobbly-honking-cascade.md`) says a
+floating-point-register destination is left UNMODIFIED for SNAN/
+OPERR/DZ when that exception's own trap is enabled — the opposite of
+OVFL/UNFL, whose own text says the result IS stored regardless (Section
+6.1.4/6.1.5). New `slotA_exc_trap_suppress` wire (narrower than the
+existing `slotA_exc_trap`, which drives primitive reporting for ALL 6
+trappable exceptions) gates the destination write specifically:
+`(fpcr_o[14] && slotA_flag_snan) || (fpcr_o[13] && slotA_flag_operr) ||
+(fpcr_o[10] && slotA_flag_dz)`.
+
+**Three write sites needed the gate, not one** — found by grepping
+every `apu_wr_en<=1'b1` in the commit path, not assumed from the
+single main site: the ordinary single-tick commit (`slotA_result` →
+`slotA_dest_r`), and BOTH of FSINCOS's own two-tick commit writes (sin
+on tick 1, cos on tick 2 — since FSINCOS can raise SNAN/OPERR too, and
+if the whole instruction is suppressed neither register should land,
+not just the first one to execute).
+
+**Testing**: 8 new checks in `tb/m68882_apu_tb.sv` — for each of
+SNAN/OPERR/DZ, a sentinel value pre-loaded into the destination survives
+untouched when that exception's trap is enabled and fires (FSQRT(-4.0)
+for OPERR, FDIV 1.0/0.0 for DZ, FADD with a signaling-NaN source for
+SNAN); a contrasting OVFL case (FADD overflow with OVFL trap enabled)
+confirms the destination STILL gets the saturated result, verifying
+the 3-vs-2 asymmetry lands exactly as documented, not over-corrected
+in either direction. **`make test`: 9/9 suites clean, APU test grew
+164→172.**
+
+## Phase 13 — Denormalized-number support, NOT YET STARTED
+
+Next in the gap-closure plan, and the highest-risk item in it — touches
+`fp_add_sub`/`fp_mul`/`fp_div`/`fp_sqrt` directly. See
+`wobbly-honking-cascade.md` for the full derivation (real semantics,
+verification strategy via Musashi's own vendored `softfloat.c`, and the
+one-task-at-a-time regression discipline this phase will follow).

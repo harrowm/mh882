@@ -896,10 +896,20 @@ these operands live in the TOP 16/8 bits of the chunk, not the
 bottom). `tb/m68882_proto_tb.sv` gained 6 checks (27→33, Word/Byte
 round trips for ±5). **`make test`: 9/9 suites clean.**
 
+**Phase 12 (trap-enabled destination-write suppression) is complete.**
+Section 6.1.2/6.1.3/6.1.6 (SNAN/OPERR/DZ) say a floating-point-register
+destination is left unmodified when that exception's own trap is
+enabled — the opposite of OVFL/UNFL (6.1.4/6.1.5), which always store
+the result. New `slotA_exc_trap_suppress` wire gates 3 separate write
+sites (the ordinary commit, and both of FSINCOS's own two-tick writes).
+8 new checks in `tb/m68882_apu_tb.sv` confirm both the suppression and
+the OVFL contrast case. **`make test`: 9/9 suites clean, APU test grew
+164→172.**
+
 See `plan.md` for the full phased build plan, including the remaining
-gap-closure phases (Packed Decimal, denormals, trap-enabled
-destination-write semantics, and — cross-repo — MH030's own
-coprocessor-conditional instructions).
+gap-closure phases (denormals — the highest-risk item, touching the
+4 core arithmetic tasks directly — Packed Decimal, and, cross-repo,
+MH030's own coprocessor-conditional instructions).
 
 ```bash
 make test   # builds and runs all nine testbenches via Icarus Verilog
