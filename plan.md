@@ -1764,25 +1764,63 @@ Measured accuracy 0-2 ULP across every numeric vector — comfortably
 inside the documented `ulp_tol=4096` gate. **APU test grew 89→104
 checks, `make test` 8/8 suites clean, 325/325 total.**
 
-### Phase 9g+ — The remaining log/hyperbolic/inverse-trig set, NOT YET STARTED
+### Phase 9g — FSINH/FCOSH/FTANH/FTAN, COMPLETE (hyperbolic family + tangent)
 
-14 functions (FACOS/FASIN/FATAN/FATANH/FCOSH/FLOGN/FLOGNP1/FLOG10/
-FLOG2/FSINH/FTAN/FTANH). Needs a genuine numerical algorithm per
-function — the log family (FLOGN/FLOGNP1/FLOG10/FLOG2) via its own
-argument-reduction-plus-series (or a rational/minimax approximation);
-the hyperbolic family (FSINH/FCOSH/FTANH) trivially reuses Phase 9f's
-own `fp_exp_core` (`sinh(x)=(e^x-e^-x)/2`, `cosh(x)=(e^x+e^-x)/2`,
-`tanh(x)=sinh/cosh`, needing `fp_exp_core` called twice per op — with
-two DIFFERENT arguments (`a` and `-a`), not the same "one call site,
-many textual invocations" livelock risk this project's own established
-discipline actually guards against, so this is expected to be safe,
-but should still be empirically re-confirmed the same way `fp_mod_rem`
-and `fp_sincos` each were); FTAN trivially reuses `fp_sincos`
-(`tan(x)=sin(x)/cos(x)`); FACOS/FASIN/FATAN/FATANH need their own
-argument-reduction-plus-series or identity-based approach (e.g.
-`atan` via its own series with range reduction, `asin(x)=atan(x/
-sqrt(1-x^2))`, `acos(x)=pi/2-asin(x)`, `atanh(x)=0.5*ln((1+x)/(1-x))`
-once a log core exists). All verified to the manual's own ~64 ULP
-typical / 4096 ULP worst-case tolerance via the same Python/Decimal
-reference-vector + `check_close` methodology Phase 9d/9f established
-(none of these 14 are Musashi-verifiable either).
+Pure composition of already-verified building blocks — no new
+numerical core needed. `fp_sinh`/`fp_cosh` each call `fp_exp_core`
+TWICE (once for `+a`, once for `-a` — genuinely different arguments,
+not the same textual-call-site shape the project's own Icarus livelock
+finding actually warns about) then combine via `fp_add_sub`+`fp_mul`
+(`sinh(x)=(e^x-e^-x)/2`, `cosh(x)=(e^x+e^-x)/2`); empirically
+re-confirmed safe the same way `fp_mod_rem`/`fp_sincos` each were —
+full `make test`, no hang. Both get correct `±infinity` results with
+**no explicit overflow special-casing at all**: `fp_exp_core`'s own
+already-established saturation (Phase 9f) makes `e^(large)` come out as
+exactly `±inf`/`+0.0`, and `fp_add_sub`/`fp_mul`'s own already-proven
+infinity arithmetic does the rest by composition alone.
+
+`fp_tanh` computes `sinh(a)/cosh(a)` via `fp_div`, with one real special
+case: for `|a|` large enough that `cosh`'s own `e^|a|` term overflows,
+`sinh` and `cosh` BOTH saturate to the same-sign infinity, and a literal
+`fp_div` there would hit `inf/inf` (IEEE-indeterminate, NaN) instead of
+the real, well-defined asymptotic limit `±1.0` (matching the Operation
+Table's own `FTANH(±inf)=±1`) — detected via `fp_cosh`'s own `flag_i`
+output and short-circuited directly rather than let the division
+produce a spurious NaN. `FSINH`/`FTANH` (odd functions) explicitly
+preserve the sign of a zero input (`sinh(-0.0)=-0.0`); `FCOSH` (even)
+needs no such case.
+
+`fp_tan` reuses `fp_sincos` directly (`tan(x)=sin(x)/cos(x)`) — an
+infinite source reuses `fp_sincos`'s own NaN(OPERR) result, since that's
+already the right TAN answer for the same undefined-at-infinity reason
+sin/cos share. One known, documented simplification: an exact zero in
+`cos(r)` (odd multiples of π/2) surfaces as `flag_i` via `fp_div`'s own
+divide-by-zero path rather than the manual's own documented OPERR at
+that exact boundary — never actually reached by any discrete test
+input, since this project's finite-Taylor-series `cos(r)` essentially
+never lands on exactly 0.0 by coincidence.
+
+**Testing**: 15 new checks (numeric `check_close` against independent
+Python/`Decimal` references for all 4 functions, plus odd/even-function
+sign-of-zero checks for FSINH/FCOSH/FTANH and the FTAN(+inf)
+NaN+OPERR check). Measured accuracy 0-10 ULP, comfortably inside
+`ulp_tol=4096`. **APU test grew 104→119 checks, `make test` 8/8 suites
+clean, 340/340 total.**
+
+### Phase 9h+ — The remaining log/inverse-trig set, NOT YET STARTED
+
+10 functions (FACOS/FASIN/FATAN/FATANH/FLOGN/FLOGNP1/FLOG10/FLOG2).
+Needs a genuine numerical algorithm per function — the log family
+(FLOGN/FLOGNP1/FLOG10/FLOG2) via its own argument-reduction-plus-series
+(e.g. reduce to `y` near 1 via the SAME `k=round(log2(a))`-style
+exponent extraction `fp_getexp`/`fp_scale` already do, then a series
+for `ln(mantissa)`, with `FLOG10`/`FLOG2` scaling the result by
+`1/ln(10)`/`1/ln(2)` the way `fp_twotox`/`fp_tentox` scaled their INPUT
+by `ln2`/`ln10`); FACOS/FASIN/FATAN/FATANH need their own
+argument-reduction-plus-series or identity-based approach (e.g. `atan`
+via its own series with range reduction, `asin(x)=atan(x/sqrt(1-x^2))`,
+`acos(x)=pi/2-asin(x)`, `atanh(x)=0.5*ln((1+x)/(1-x))` once a log core
+exists). All verified to the manual's own ~64 ULP typical / 4096 ULP
+worst-case tolerance via the same Python/Decimal reference-vector +
+`check_close` methodology Phase 9d/9f/9g established (none of these 10
+are Musashi-verifiable either).

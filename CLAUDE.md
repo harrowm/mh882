@@ -804,10 +804,26 @@ empirically. **APU test grew 89→104 checks, `make test` 8/8 suites
 clean, 325/325 total**, measured accuracy 0-2 ULP across every numeric
 vector.
 
+**Phase 9g (FSINH/FCOSH/FTANH/FTAN) is also complete — pure composition
+of already-verified building blocks, no new numerical core.**
+`fp_sinh`/`fp_cosh` each call `fp_exp_core` TWICE (for `+a` and `-a`)
+then combine via `fp_add_sub`+`fp_mul`; both get correct `±infinity`
+results with no explicit overflow handling at all, purely from
+`fp_exp_core`'s own already-established saturation composing correctly
+through already-proven infinity arithmetic. `fp_tanh` computes
+`sinh/cosh` via `fp_div`, with one real special case: when `cosh`'s own
+`e^|a|` term overflows, both sinh and cosh saturate to the same-sign
+infinity, and a literal division would hit IEEE's indeterminate
+`inf/inf` instead of the correct asymptotic `±1.0` — detected via
+`fp_cosh`'s own `flag_i` and short-circuited directly. `fp_tan` reuses
+`fp_sincos` directly (`tan=sin/cos`). **APU test grew 104→119 checks,
+`make test` 8/8 suites clean, 340/340 total**, measured accuracy 0-10
+ULP.
+
 See `plan.md` for the full phased build plan and the complete list of
-what remains deliberately out of scope (Phase 9g+ — the remaining 14
-log/hyperbolic/inverse-trig functions — W/B/P formats, BSUN/INEX1,
-denormals, and the rest).
+what remains deliberately out of scope (Phase 9h+ — the remaining 10
+log/inverse-trig functions — W/B/P formats, BSUN/INEX1, denormals, and
+the rest).
 
 ```bash
 make test   # builds and runs all eight testbenches via Icarus Verilog

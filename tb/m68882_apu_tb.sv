@@ -797,6 +797,79 @@ module m68882_apu_tb;
         dispatch(cmd_word(3'b000, 3'd0, 3'd1, 7'h12)); // FTENTOX(+0.0)
         check(u_top.u_proto.u_regfile.fp_r[1] == EXT_1_0, "Phase 9f: FTENTOX(+0.0) == +1.0 exactly");
 
+        // ── Phase 9g: FSINH/FCOSH/FTANH/FTAN ─────────────────────────
+        // FSINH/FCOSH/FTANH built directly on fp_exp_core; FTAN reuses
+        // fp_sincos. References independently computed in Python
+        // (80-digit Decimal series, same methodology as Phase 9d/9f).
+        load_fp(0, EXT_0_5);
+        dispatch(cmd_word(3'b000, 3'd0, 3'd1, 7'h02)); // FSINH(0.5)
+        check_close(u_top.u_proto.u_regfile.fp_r[1], 96'h3ffe_0000_8566807f31dcb652,
+                    4096, "Phase 9g: FSINH(0.5) ~= 0.5210953055...");
+
+        load_fp(0, EXT_1_0);
+        dispatch(cmd_word(3'b000, 3'd0, 3'd1, 7'h02)); // FSINH(1.0)
+        check_close(u_top.u_proto.u_regfile.fp_r[1], 96'h3fff_0000_966cfe2275cc12d4,
+                    4096, "Phase 9g: FSINH(1.0) ~= 1.1752011936...");
+
+        load_fp(0, EXT_N1_0);
+        dispatch(cmd_word(3'b000, 3'd0, 3'd1, 7'h02)); // FSINH(-1.0), odd function sign check
+        check_close(u_top.u_proto.u_regfile.fp_r[1], 96'hbfff_0000_966cfe2275cc12d4,
+                    4096, "Phase 9g: FSINH(-1.0) ~= -1.1752011936... (odd function)");
+
+        load_fp(0, 96'h8000_0000_0000_0000_0000_0000); // -0.0
+        dispatch(cmd_word(3'b000, 3'd0, 3'd1, 7'h02)); // FSINH(-0.0)
+        check(u_top.u_proto.u_regfile.fp_r[1] == 96'h8000_0000_0000_0000_0000_0000,
+              "Phase 9g: FSINH(-0.0) == -0.0 (sign preserved, odd function)");
+
+        load_fp(0, EXT_1_0);
+        dispatch(cmd_word(3'b000, 3'd0, 3'd1, 7'h19)); // FCOSH(1.0)
+        check_close(u_top.u_proto.u_regfile.fp_r[1], 96'h3fff_0000_c583aa8ecfaa8261,
+                    4096, "Phase 9g: FCOSH(1.0) ~= 1.5430806348...");
+
+        load_fp(0, EXT_N1_0);
+        dispatch(cmd_word(3'b000, 3'd0, 3'd1, 7'h19)); // FCOSH(-1.0), even function
+        check_close(u_top.u_proto.u_regfile.fp_r[1], 96'h3fff_0000_c583aa8ecfaa8261,
+                    4096, "Phase 9g: FCOSH(-1.0) == FCOSH(1.0) (even function)");
+
+        load_fp(0, 96'h0); // +0.0
+        dispatch(cmd_word(3'b000, 3'd0, 3'd1, 7'h19)); // FCOSH(+0.0)
+        check(u_top.u_proto.u_regfile.fp_r[1] == EXT_1_0, "Phase 9g: FCOSH(+0.0) == +1.0 exactly");
+
+        load_fp(0, EXT_1_0);
+        dispatch(cmd_word(3'b000, 3'd0, 3'd1, 7'h09)); // FTANH(1.0)
+        check_close(u_top.u_proto.u_regfile.fp_r[1], 96'h3ffe_0000_c2f7d5a8a79ca2ac,
+                    4096, "Phase 9g: FTANH(1.0) ~= 0.7615941560...");
+
+        load_fp(0, EXT_10_0);
+        dispatch(cmd_word(3'b000, 3'd0, 3'd1, 7'h09)); // FTANH(10.0), close to the +1.0 asymptote
+        check_close(u_top.u_proto.u_regfile.fp_r[1], 96'h3ffe_0000_ffffffee4b79aaa9,
+                    4096, "Phase 9g: FTANH(10.0) ~= 0.9999999959... (near the +1.0 asymptote)");
+
+        load_fp(0, 96'h8000_0000_0000_0000_0000_0000); // -0.0
+        dispatch(cmd_word(3'b000, 3'd0, 3'd1, 7'h09)); // FTANH(-0.0)
+        check(u_top.u_proto.u_regfile.fp_r[1] == 96'h8000_0000_0000_0000_0000_0000,
+              "Phase 9g: FTANH(-0.0) == -0.0 (sign preserved, odd function)");
+
+        load_fp(0, EXT_0_5);
+        dispatch(cmd_word(3'b000, 3'd0, 3'd1, 7'h0F)); // FTAN(0.5)
+        check_close(u_top.u_proto.u_regfile.fp_r[1], 96'h3ffe_0000_8bda7adf9a3a5219,
+                    4096, "Phase 9g: FTAN(0.5) ~= 0.5463024898...");
+
+        load_fp(0, EXT_2_0);
+        dispatch(cmd_word(3'b000, 3'd0, 3'd1, 7'h0F)); // FTAN(2.0), negative result past pi/2
+        check_close(u_top.u_proto.u_regfile.fp_r[1], 96'hc000_0000_8bd7b1704a87c1db,
+                    4096, "Phase 9g: FTAN(2.0) ~= -2.1850398633... (past pi/2)");
+
+        load_fp(0, EXT_10_0);
+        dispatch(cmd_word(3'b000, 3'd0, 3'd1, 7'h0F)); // FTAN(10.0), argument reduction exercised
+        check_close(u_top.u_proto.u_regfile.fp_r[1], 96'h3ffe_0000_a5faf9a5f1bc12f0,
+                    4096, "Phase 9g: FTAN(10.0) ~= 0.6483608275... (argument reduction)");
+
+        load_fp(0, 96'h7fff_0000_8000_0000_0000_0000); // +inf
+        dispatch(cmd_word(3'b000, 3'd0, 3'd1, 7'h0F)); // FTAN(+inf)
+        check(u_top.u_proto.u_regfile.fpsr_r[24] == 1'b1, "Phase 9g: FTAN(+inf) NAN condition code set");
+        check(u_top.u_proto.u_regfile.fpsr_r[13] == 1'b1, "Phase 9g: FTAN(+inf) OPERR exception-status bit set");
+
         $display("---");
         $display("%0d passed, %0d failed", pass_count, fail_count);
         if (fail_count != 0) begin

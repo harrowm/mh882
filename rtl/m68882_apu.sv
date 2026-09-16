@@ -2046,4 +2046,194 @@ package m68882_apu_pkg;
         end
     endtask
 
+    // ── Phase 9g: FSINH ($02) / FCOSH ($19) / FTANH ($09) -- the
+    // hyperbolic family, built directly on Phase 9f's own fp_exp_core:
+    // sinh(x)=(e^x-e^-x)/2, cosh(x)=(e^x+e^-x)/2, tanh(x)=sinh(x)/
+    // cosh(x). No new numerical core needed -- pure composition of
+    // already-verified building blocks.
+    //
+    // fp_sinh/fp_cosh each call fp_exp_core TWICE (once for +a, once
+    // for -a -- genuinely different arguments, not the same textual-
+    // call-site shape the project's own Icarus livelock finding warns
+    // about) -- empirically re-confirmed safe the same way fp_mod_rem
+    // and fp_sincos each were (full `make test`, no hang). Both
+    // naturally get correct +-infinity results with NO explicit
+    // overflow/underflow special-casing needed at all: fp_exp_core's
+    // own already-established saturation (Phase 9f) makes e^(large
+    // positive) come out as exactly +inf and e^(large negative) as
+    // exactly +0.0, and fp_add_sub/fp_mul's own already-proven
+    // infinity arithmetic (Phase 4a) does the rest correctly by
+    // composition alone.
+    localparam logic [95:0] HALF = 96'h3ffe_0000_8000000000000000;
+
+    task automatic fp_sinh(
+        input  logic [95:0]  a_raw,
+        output logic [95:0]  result,
+        output logic         flag_z, flag_n, flag_i, flag_nan
+    );
+        fpx_t a;
+        logic a_nan, a_zero;
+        a = unpack_fpx(a_raw);
+        a_nan  = is_nan_fpx(a);
+        a_zero = is_zero_fpx(a);
+
+        if (a_nan) begin
+            result = a_raw;
+        end else if (a_zero) begin
+            result = a_raw; // sinh is odd: sinh(-0.0) = -0.0, sign preserved
+        end else begin
+            logic [95:0] neg_a, ep, en, diff;
+            logic        ez, en1, ei, enan, eovfl, eunfl;
+            logic        fz, fn1, fi, fnan, fovfl, funfl;
+            logic        sz, sn, si, snan, soperr, sovfl, sunfl, sinex2;
+            logic        mz, mn, mi, mnan, moperr, movfl, munfl, minex2;
+            neg_a = {!a_raw[95], a_raw[94:0]};
+            fp_exp_core(a_raw, ep, ez, en1, ei, enan, eovfl, eunfl);
+            fp_exp_core(neg_a, en, fz, fn1, fi, fnan, fovfl, funfl);
+            fp_add_sub(en, ep, 1'b1, RND_NEAREST, diff, sz, sn, si, snan, soperr, sovfl, sunfl, sinex2); // ep - en
+            fp_mul(diff, HALF, RND_NEAREST, result, mz, mn, mi, mnan, moperr, movfl, munfl, minex2);
+        end
+
+        begin
+            fpx_t r_out;
+            r_out = unpack_fpx(result);
+            flag_z   = is_zero_fpx(r_out);
+            flag_n   = r_out.sign && !flag_z;
+            flag_i   = is_inf_fpx(r_out);
+            flag_nan = is_nan_fpx(r_out);
+        end
+    endtask
+
+    task automatic fp_cosh(
+        input  logic [95:0]  a_raw,
+        output logic [95:0]  result,
+        output logic         flag_z, flag_n, flag_i, flag_nan
+    );
+        fpx_t a;
+        logic a_nan;
+        a = unpack_fpx(a_raw);
+        a_nan = is_nan_fpx(a);
+
+        if (a_nan) begin
+            result = a_raw;
+        end else begin
+            logic [95:0] neg_a, ep, en, sum;
+            logic        ez, en1, ei, enan, eovfl, eunfl;
+            logic        fz, fn1, fi, fnan, fovfl, funfl;
+            logic        sz, sn, si, snan, soperr, sovfl, sunfl, sinex2;
+            logic        mz, mn, mi, mnan, moperr, movfl, munfl, minex2;
+            neg_a = {!a_raw[95], a_raw[94:0]};
+            fp_exp_core(a_raw, ep, ez, en1, ei, enan, eovfl, eunfl);
+            fp_exp_core(neg_a, en, fz, fn1, fi, fnan, fovfl, funfl);
+            fp_add_sub(en, ep, 1'b0, RND_NEAREST, sum, sz, sn, si, snan, soperr, sovfl, sunfl, sinex2); // ep + en
+            fp_mul(sum, HALF, RND_NEAREST, result, mz, mn, mi, mnan, moperr, movfl, munfl, minex2);
+        end
+
+        begin
+            fpx_t r_out;
+            r_out = unpack_fpx(result);
+            flag_z   = is_zero_fpx(r_out);
+            flag_n   = r_out.sign && !flag_z; // never true in practice: cosh(x) >= 1.0 always
+            flag_i   = is_inf_fpx(r_out);
+            flag_nan = is_nan_fpx(r_out);
+        end
+    endtask
+
+    task automatic fp_tanh(
+        input  logic [95:0]  a_raw,
+        output logic [95:0]  result,
+        output logic         flag_z, flag_n, flag_i, flag_nan
+    );
+        fpx_t a;
+        logic a_nan, a_zero;
+        a = unpack_fpx(a_raw);
+        a_nan  = is_nan_fpx(a);
+        a_zero = is_zero_fpx(a);
+
+        if (a_nan) begin
+            result = a_raw;
+        end else if (a_zero) begin
+            result = a_raw; // tanh is odd: tanh(-0.0) = -0.0, sign preserved
+        end else begin
+            logic [95:0] sinh_r, cosh_r;
+            logic        shz, shn, shi, shnan, chz, chn, chi, chnan;
+            logic        dz, dn, di, dnan, doperr, ddz, dovfl, dunfl, dinex2;
+            fp_sinh(a_raw, sinh_r, shz, shn, shi, shnan);
+            fp_cosh(a_raw, cosh_r, chz, chn, chi, chnan);
+            if (chi) begin
+                // |a| large enough that e^|a| itself overflowed inside
+                // fp_exp_core -- cosh AND sinh both saturate to the
+                // SAME-SIGN infinity, so a literal division would hit
+                // fp_div's own inf/inf (indeterminate, NaN) case instead
+                // of the real, well-defined asymptotic limit +-1.0
+                // (matches the Operation Table's own FTANH(+-inf)=+-1).
+                // Short-circuit directly rather than let the division
+                // produce a spurious NaN.
+                result = a.sign ? {1'b1, 15'd16383, 16'h0, 64'h8000_0000_0000_0000}
+                                 : {1'b0, 15'd16383, 16'h0, 64'h8000_0000_0000_0000};
+            end else begin
+                fp_div(cosh_r, sinh_r, RND_NEAREST, result, dz, dn, di, dnan, doperr, ddz, dovfl, dunfl, dinex2);
+            end
+        end
+
+        begin
+            fpx_t r_out;
+            r_out = unpack_fpx(result);
+            flag_z   = is_zero_fpx(r_out);
+            flag_n   = r_out.sign && !flag_z;
+            flag_i   = is_inf_fpx(r_out);
+            flag_nan = is_nan_fpx(r_out);
+        end
+    endtask
+
+    // ── Phase 9g: FTAN ($0F) -- reuses fp_sincos directly (tan(x) =
+    // sin(x)/cos(x)), no new series of its own. ─────────────────────
+    task automatic fp_tan(
+        input  logic [95:0]  a_raw,
+        output logic [95:0]  result,
+        output logic         flag_z, flag_n, flag_i, flag_nan, flag_operr
+    );
+        fpx_t a;
+        a = unpack_fpx(a_raw);
+
+        if (is_nan_fpx(a)) begin
+            result = a_raw;
+            flag_operr = 1'b0;
+        end else begin
+            logic [95:0] sin_r, cos_r;
+            logic        sc_operr;
+            logic        dz, dn, di, dnan, doperr, ddz, dovfl, dunfl, dinex2;
+            fp_sincos(a_raw, sin_r, cos_r, sc_operr);
+            if (sc_operr) begin
+                // Infinite source: fp_sincos's own NaN(OPERR) pattern
+                // (identical for sin_r/cos_r in that case) is already
+                // the right TAN result too -- same undefined-at-
+                // infinity shape every trig function here shares.
+                result = sin_r;
+                flag_operr = 1'b1;
+            end else begin
+                // Divide-by-zero at odd multiples of pi/2 (where cos_r
+                // is exactly zero) surfaces as flag_i (infinity) via
+                // fp_div's own DZ path rather than the manual's own
+                // documented OPERR at that exact boundary -- a known
+                // simplification, not silently unhandled: in practice
+                // this project's own finite-Taylor-series cos(r) only
+                // ever reaches exactly 0.0 for a source that reduces to
+                // r's own exact analytic zero, which no discrete test
+                // input coincides with.
+                fp_div(cos_r, sin_r, RND_NEAREST, result, dz, dn, di, dnan, doperr, ddz, dovfl, dunfl, dinex2);
+                flag_operr = 1'b0;
+            end
+        end
+
+        begin
+            fpx_t r_out;
+            r_out = unpack_fpx(result);
+            flag_z   = is_zero_fpx(r_out);
+            flag_n   = r_out.sign && !flag_z;
+            flag_i   = is_inf_fpx(r_out);
+            flag_nan = is_nan_fpx(r_out);
+        end
+    endtask
+
 endpackage
