@@ -54,7 +54,21 @@ module m68882_regfile (
     // Direct debug/condition-evaluation read ports (Phase 3's own
     // Condition CIR logic needs FPSR's condition-code byte without going
     // through the chunked ctrl_sel port)
-    output logic [31:0] fpsr_o
+    output logic [31:0] fpsr_o,
+    output logic [31:0] fpcr_o,
+
+    // Whole-register FP0-7 ports for the APU (Phase 4) -- arithmetic
+    // needs both source operands available combinationally in the SAME
+    // cycle (unlike the chunked Operand CIR path above, which only ever
+    // moves one 32-bit slice at a time), and writes a complete 96-bit
+    // result in one cycle rather than three chunked writes.
+    input  logic [2:0]  apu_a_sel,
+    input  logic [2:0]  apu_b_sel,
+    output logic [95:0] apu_a_rd,
+    output logic [95:0] apu_b_rd,
+    input  logic         apu_wr_en,
+    input  logic [2:0]  apu_wr_sel,
+    input  logic [95:0] apu_wr_data
 );
 
     logic [95:0] fp_r [0:7];
@@ -62,7 +76,10 @@ module m68882_regfile (
     logic [31:0] fpsr_r;
     logic [31:0] fpiar_r;
 
-    assign fpsr_o = fpsr_r;
+    assign fpsr_o   = fpsr_r;
+    assign fpcr_o   = fpcr_r;
+    assign apu_a_rd = fp_r[apu_a_sel];
+    assign apu_b_rd = fp_r[apu_b_sel];
 
     always_ff @(posedge clk_4x or negedge rst_n) begin
         if (!rst_n) begin
@@ -71,7 +88,9 @@ module m68882_regfile (
             fpsr_r  <= '0;
             fpiar_r <= '0;
         end else begin
-            if (fp_wr_en) begin
+            if (apu_wr_en) begin
+                fp_r[apu_wr_sel] <= apu_wr_data;
+            end else if (fp_wr_en) begin
                 unique case (fp_wr_chunk)
                     2'd0: fp_r[fp_wr_sel][95:64] <= fp_wr_data;
                     2'd1: fp_r[fp_wr_sel][63:32] <= fp_wr_data;

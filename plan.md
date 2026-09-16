@@ -1,6 +1,6 @@
 # MC68882 FPU — Phased Scope Plan
 
-## Status: Phases 0-3 complete. Phase 4 (real arithmetic core) is next.
+## Status: Phases 0-3 complete. Phase 4a (register-to-register FADD/FSUB) complete. Phase 4b (MUL/DIV/SQRT/transcendentals) is next.
 
 ## Origin
 
@@ -405,16 +405,90 @@ cpBcc/cpDBcc/cpScc/cpTRAPcc gap (see integration note above) — not
 itself required here.
 
 ### Phase 4 — Real arithmetic core (APU)
+
 Extended-precision datapath: format conversion, add/sub/mul/div/sqrt,
 the full transcendental set, rounding modes, all 8 exception flags. The
-largest phase; needs its own sub-phasing (basic arithmetic first,
-transcendentals second). **Open scoping question, to resolve before
-starting this phase**: real 68881/68882 silicon's transcendental results
-follow Motorola's own specific approximation algorithms, which can
-diverge from a generic IEEE-correct softfloat implementation in the last
-bit or two — decide up front whether the target is "matches real chip
-output bit-for-bit" or "IEEE-correct," since it changes both the
-implementation effort and the Phase 7 reference-model choice.
+largest phase; sub-phased as originally planned.
+
+**Decision on the open scoping question** (real 68881/68882 transcendental
+results vs. a generic IEEE-correct softfloat implementation): resolved as
+**IEEE-correct**, not bit-for-bit real-silicon-matching. Reverse-
+engineering Motorola's own specific transcendental approximation
+algorithms would need the real microcode ROM (not available from the
+manual), and the companion MH030 68030 project has no dependency on
+exact transcendental bit patterns either. Revisit only if a future
+verification pass against real hardware or a cycle-exact emulator turns
+up a concrete need.
+
+#### Phase 4a — Register-to-register FADD/FSUB (COMPLETE)
+`rtl/m68882_apu.sv` (new `m68882_apu_pkg`): a real extended-precision
+adder/subtractor operating on the confirmed internal format (Table 3-3:
+sign(1)/exponent(15,bias 16383)/reserved(16)/j.f-mantissa(64), an
+explicit-integer-bit x87-style layout, not IEEE's implicit-1
+convention). Wired into `rtl/m68882_proto.sv`'s own opclass-000
+(register-to-register) command decode — extension-field opcodes $22
+(FADD) and $28 (FSUB), confirmed directly from Table 4-13; every other
+extension-field value is still a no-op stub, matching Table 4-13 Note 1's
+own confirmation that even a register-to-register arithmetic instruction
+issues a Null primitive first (no external transfer needed), which
+Phase 3 had already modeled correctly by coincidence.
+
+**Scope, deliberately bounded for this first slice** (documented in
+`m68882_apu.sv`'s own header): handles normal finite operands, signed
+zero, infinity, and NaN (propagated, not manufactured); all 4 FPCR
+rounding modes via a real guard/round/sticky tail, including the
+round-to-nearest-even tie-break and the manual's own explicit "+0.0 in
+RN/RZ/RP, -0.0 in RM" rule for exact cancellation; infinity-minus-
+infinity sets OPERR. NOT yet implemented: denormals (underflow collapses
+to a correctly-signed zero instead), real exponent-overflow trap
+semantics (coarse saturate-to-infinity instead), and the accrued-
+exception/exception-status FPSR bytes (only the condition-code byte is
+updated) — all flagged explicitly, not silently wrong, and left for a
+later Phase 4 sub-phase alongside MUL/DIV/SQRT.
+
+**One real bug found via simulation, not inspection**: the same-sign
+mantissa-add overflow check used `sum[66]` (the ordinary, ALWAYS-1
+integer-bit position of any normalized "1.xxx" mantissa) as if it were a
+carry-out flag, silently double-counting the exponent bump on every
+single same-sign addition (1.0+2.0 computed as 7.5 instead of 3.0).
+Fixed by widening the adder by one genuine carry-out bit
+(`sum68[67]`), the standard/correct way to detect this — caught by a
+dedicated numeric test (`tb/m68882_apu_tb.sv`) using known-good,
+independently-computed extended-precision constants, not by staring at
+the RTL.
+
+**Verified**: `tb/m68882_apu_tb.sv` (new, 9/9 checks) — FADD/FSUB against
+known-good extended-precision bit patterns (1.0, 2.0, 3.0, 0.5, 1.5,
+-1.0, computed independently in Python), covering same-exponent and
+differing-exponent alignment, a carry-out renormalization case
+(0.5+0.5), exact cancellation to zero with the correct sign, and both N
+and Z condition-code flag results — driven through the REAL Command CIR
+dialog end to end (command word → APU → register file write → FPSR
+update), not the arithmetic core in isolation. Plus the full existing
+suite (`tb/m68882_biu_smoke_tb.sv` 11/11, `tb/m68882_proto_tb.sv` 17/17)
+confirmed unaffected.
+
+#### Phase 4b — MUL/DIV/SQRT and the remaining monadic/dyadic set (not started)
+Extension-field opcodes already confirmed from Table 4-13: FMUL=$23,
+FDIV=$20, FSQRT=$04, FABS=$18, FNEG=$1A, FCMP=$38, FTST=$3A, plus the
+full transcendental set ($00-$1F). Each needs its own real algorithm
+(multiply is a straightforward mantissa multiply + normalize/round using
+the same guard/round/sticky machinery Phase 4a already built; divide and
+sqrt are genuinely harder — a real iterative or table-based algorithm,
+not just "wire up the operator," if the result needs correct rounding).
+
+#### Phase 4c — External-operand format conversion (not started)
+Phase 3's own Operand CIR transfer path is still a raw-bytes stub (no
+real B/W/L/S/D/X/P-to-extended conversion). This needs to land before
+opclass 010/011 (external-operand-to-FPn / FPn-to-external) can compute
+anything for real — right now they can only move bytes, not numbers.
+
+#### Phase 4d — Exception flags and the accrued-exception byte (not started)
+Phase 4a only sets the FPSR condition-code byte and a coarse OPERR flag.
+Real exception-byte semantics (BSUN/SNAN/OPERR/OVFL/UNFL/DZ/INEX2/INEX1,
+the accrued-exception byte's own OR-accumulation rules, and actually
+taking a trap when FPCR's own ENABLE byte requests one) are deferred
+here.
 
 ### Phase 5 — State frame save/restore
 FSAVE/FRESTORE Null/Idle/Busy frame generation and parsing, both

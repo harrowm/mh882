@@ -2,8 +2,11 @@
 `default_nettype none
 
 import m68882_cir_pkg::*;
+import m68882_apu_pkg::*;
 
-// MC68882 instruction-dialog protocol -- Phase 3.
+// MC68882 instruction-dialog protocol -- Phase 3 (dialog shape) + Phase 4a
+// (register-to-register FADD/FSUB, wired into the opclass-000 branch
+// below).
 //
 // Owns the Response ($00), Command ($0A), Condition ($0E), Operand
 // ($10), and Register Select ($14) CIRs, and drives m68882_regfile.
@@ -112,6 +115,12 @@ module m68882_proto (
     logic        ctrl_wr_en;
     logic [31:0] ctrl_wr_data;
     logic [31:0] fpsr_o;
+    logic [31:0] fpcr_o;
+    logic [2:0]  apu_a_sel, apu_b_sel;
+    logic [95:0] apu_a_rd, apu_b_rd;
+    logic        apu_wr_en;
+    logic [2:0]  apu_wr_sel;
+    logic [95:0] apu_wr_data;
 
     m68882_regfile u_regfile (
         .clk_4x, .rst_n,
@@ -119,7 +128,9 @@ module m68882_proto (
         .fp_wr_sel(fp_wr_sel_r), .fp_wr_chunk(fp_wr_chunk_r), .fp_wr_en, .fp_wr_data,
         .ctrl_sel, .ctrl_rd_data,
         .ctrl_wr_sel(ctrl_wr_sel_r), .ctrl_wr_en, .ctrl_wr_data,
-        .fpsr_o
+        .fpsr_o, .fpcr_o,
+        .apu_a_sel, .apu_b_sel, .apu_a_rd, .apu_b_rd,
+        .apu_wr_en, .apu_wr_sel, .apu_wr_data
     );
 
     // fp_sel/fp_chunk_idx/ctrl_sel (READ side) are pure combinational
@@ -141,6 +152,25 @@ module m68882_proto (
     wire [2:0] c_ry      = cmd_ry(d_in[31:16]);
     wire [6:0] c_ext     = cmd_ext(d_in[31:16]);
     wire [7:0] c_multi_mask = {c_ry[0], c_ext};
+
+    // Phase 4a: register-to-register FADD/FSUB (opclass 000). Both
+    // source operands are read combinationally every cycle (harmless --
+    // the result is only ever LATCHED on the Command CIR's own ack_pulse,
+    // gated by c_opclass/c_ext below) and the ADD/SUB core itself is pure
+    // combinational logic (m68882_apu_pkg::fp_add_sub).
+    assign apu_a_sel = c_rx; // opclass 000: RX = source FPm
+    assign apu_b_sel = c_ry; // opclass 000: RY = destination FPn
+
+    wire is_fadd = (c_ext == 7'h22);
+    wire is_fsub = (c_ext == 7'h28);
+
+    logic [95:0] apu_result;
+    logic        apu_flag_z, apu_flag_n, apu_flag_i, apu_flag_nan, apu_flag_operr;
+
+    always_comb begin
+        fp_add_sub(apu_a_rd, apu_b_rd, is_fsub, round_mode_t'(fpcr_o[5:4]),
+                   apu_result, apu_flag_z, apu_flag_n, apu_flag_i, apu_flag_nan, apu_flag_operr);
+    end
 
     // Condition CIR predicate field + FPSR Z bit (combinational)
     wire [5:0] cond_pred = d_in[21:16];
@@ -207,9 +237,13 @@ module m68882_proto (
             fp_wr_chunk_r <= 2'h0;
             ctrl_wr_en    <= 1'b0;
             ctrl_wr_sel_r <= 2'h0;
+            apu_wr_en     <= 1'b0;
+            apu_wr_sel    <= 3'h0;
+            apu_wr_data   <= '0;
         end else begin
             fp_wr_en   <= 1'b0;
             ctrl_wr_en <= 1'b0;
+            apu_wr_en  <= 1'b0;
 
             if (abort) begin
                 state_r <= ST_IDLE;
@@ -229,10 +263,26 @@ module m68882_proto (
 
                     CIR_COMMAND: if (state_r == ST_IDLE) begin
                         unique case (c_opclass)
-                            3'b000: begin // FPm to FPn, register-to-register: no transfer needed
+                            3'b000: begin // FPm to FPn, register-to-register: no external
+                                           // transfer needed (Table 4-13 Note 1: the first
+                                           // primitive issued is Null even for a genuine
+                                           // arithmetic op, since both operands are already
+                                           // on-chip). Phase 4a: FADD ($22) and FSUB ($28)
+                                           // are computed for real here; every other
+                                           // extension-field opcode is still a no-op stub
+                                           // (documented in m68882_apu.sv/plan.md).
                                 ca_r    <= 1'b0;
                                 prim_r  <= PRIM_NULL;
                                 state_r <= ST_IDLE;
+                                if (is_fadd || is_fsub) begin
+                                    apu_wr_en     <= 1'b1;
+                                    apu_wr_sel    <= c_ry;
+                                    apu_wr_data   <= apu_result;
+                                    ctrl_wr_en    <= 1'b1;
+                                    ctrl_wr_sel_r <= 2'd1; // FPSR
+                                    ctrl_wr_data  <= {4'b0, apu_flag_n, apu_flag_z, apu_flag_i,
+                                                       apu_flag_nan, fpsr_o[23:0]};
+                                end
                             end
                             3'b010: if (c_rx == 3'b111) begin // move constant to FPn
                                 ca_r    <= 1'b0;

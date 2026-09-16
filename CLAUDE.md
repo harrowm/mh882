@@ -281,7 +281,10 @@ m68882_top            Pin-compatible top level. clk_4x is a plain port (Phase 1
 │                       6 opclasses; arithmetic/format-conversion stubbed, see Current State)
 ├── m68882_regfile      FP0-FP7 (96-bit each), FPCR, FPSR, FPIAR (IMPLEMENTED, Phase 3)
 ├── m68882_cu           Conversion unit (format conversion, 68882-only pipeline stage) (Phase 6)
-├── m68882_apu          Arithmetic processing unit (the actual math) (Phase 4)
+├── m68882_apu          Arithmetic processing unit. FADD/FSUB register-to-register
+│                       IMPLEMENTED (Phase 4a, real extended-precision add/subtract,
+│                       all 4 rounding modes); MUL/DIV/SQRT/transcendentals and format
+│                       conversion still Phase 4b/4c (see Current State/plan.md)
 └── m68882_frame        FSAVE/FRESTORE state-frame generation and parsing (Phase 5)
 ```
 
@@ -392,9 +395,42 @@ bit assignment) — see `rtl/m68882_proto.sv`'s own header comment and
 `plan.md`'s Phase 3 writeup for the full list of what still needs
 cross-checking before Phase 4+ builds on top of it.
 
-See `plan.md` for the full phased build plan. Phase 4 (real arithmetic
-core) is next.
+- **Phase 4a** (register-to-register FADD/FSUB): `rtl/m68882_apu.sv`
+  (new `m68882_apu_pkg`) — a real extended-precision adder/subtractor on
+  the confirmed internal format (Table 3-3: sign/15-bit exponent/16-bit
+  reserved/64-bit j.f mantissa with an EXPLICIT integer bit, not IEEE's
+  implicit-1). Wired into `rtl/m68882_proto.sv`'s opclass-000 decode via
+  the confirmed extension-field opcodes ($22=FADD, $28=FSUB, Table 4-13).
+  All 4 FPCR rounding modes implemented for real (guard/round/sticky,
+  round-to-nearest-even tie-break, the manual's own "+0.0 except -0.0 in
+  RM" exact-cancellation rule). `make test` adds `tb/m68882_apu_tb.sv`,
+  9/9, driven through the real Command CIR dialog end to end against
+  known-good extended-precision constants.
+
+**Decision, not silently assumed**: Phase 4's own original open question
+(match real 68881/68882 transcendental output bit-for-bit, vs. generic
+IEEE-correct) is resolved as **IEEE-correct** — reverse-engineering
+Motorola's own microcoded approximation algorithms isn't practical
+without the real ROM, and neither companion project needs exact
+transcendental bit-matching. See `plan.md` if this needs revisiting.
+
+**One real bug found via simulation** (see `plan.md` for full detail): a
+same-sign mantissa-add overflow check used the ordinary, ALWAYS-1
+integer-bit position as if it were a carry-out flag, silently double-
+counting the exponent bump on every addition (1.0+2.0 computed as 7.5).
+Fixed by adding one genuine carry-out bit to the adder.
+
+**NOT yet implemented** (explicitly, not silently): MUL/DIV/SQRT/
+transcendentals (Phase 4b — extension-field opcodes already confirmed);
+real B/W/L/S/D/X/P-to-extended format conversion for external operands
+(Phase 4c — opclass 010/011 can still only move raw bytes, not numbers);
+denormals (underflow collapses to signed zero); real exponent-overflow
+trap semantics (coarse saturate-to-infinity); the FPSR accrued-exception/
+exception-status bytes beyond a bare OPERR bit (Phase 4d).
+
+See `plan.md` for the full phased build plan. Phase 4b (MUL/DIV/SQRT) is
+next.
 
 ```bash
-make test   # builds and runs both testbenches via Icarus Verilog
+make test   # builds and runs all three testbenches via Icarus Verilog
 ```
