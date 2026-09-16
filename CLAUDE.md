@@ -665,9 +665,32 @@ says that work has always needed — but doing it means modifying a
 different repository this session was never asked to touch, so it stays
 undone here, documented rather than silently skipped.
 
+**Phase 9 (the transcendental instruction set) is now underway,
+opened after the original plan closed.** `docs/MC68881_MC68882_...pdf`
+Table 8-3 ("MC68882 Overall Execution Times," p.8-13) turned out to give
+real per-instruction cycle counts for literally every instruction,
+including every transcendental — this project's own equivalent of
+MH030's S-state delay table. Section 4.3 ("Computational Accuracy")
+separately confirms real transcendentals are NOT bit-exact (~64 ULP
+typical, 4096 ULP worst-case error bound — only the core arithmetic ops
+get IEEE's 0.5 ULP guarantee). **Phase 9a is complete**: `apu_latency()`
+now returns real Table 8-3 values (keyed directly by the raw Table 4-13
+extension code) instead of Phase 6's own placeholder guess, which
+turned out to have the relative spread badly wrong and wrongly modeled
+FABS/FNEG/FCMP/FTST as zero-cycle (real silicon: ~36-38 cycles each,
+fast but not instant — they now share the same real pipeline slot every
+other opclass-000 op uses). Auditing the full opcode space this way also
+found a real, previously-undiscovered bug: FMOVE (register-to-register,
+ext=$00) silently did nothing at all, never caught since no test had
+checked its actual result. Both fixed, with new regression tests. See
+plan.md's own Phase 9 section for the full derivation, the complete
+opcode table, and the Phase 9b/9c+ plan (exact auxiliary ops next, the
+real trig/log/exp set after that). **227/227 across all eight
+testbenches.**
+
 See `plan.md` for the full phased build plan and the complete list of
-what remains deliberately out of scope (transcendentals, W/B/P formats,
-BSUN/INEX1, denormals, and the rest).
+what remains deliberately out of scope (the rest of Phase 9, W/B/P
+formats, BSUN/INEX1, denormals, and the rest).
 
 ```bash
 make test   # builds and runs all eight testbenches via Icarus Verilog

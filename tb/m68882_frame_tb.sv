@@ -165,7 +165,7 @@ module m68882_frame_tb;
         check(u_top.u_proto.state_r == 0, "FRESTORE: after all 13 payload longwords, back to ST_IDLE");
 
         // Confirm the dialog machinery is genuinely usable again afterward.
-        run_cycle(CIR_COMMAND, 1'b1, cmd_word(3'b000, 3'd0, 3'd1, 7'd0), rd); // FPm to FPn, no-op ext
+        run_cycle(CIR_COMMAND, 1'b1, cmd_word(3'b000, 3'd0, 3'd1, 7'd0), rd); // FMOVE FP0,FP1 (ext=0)
         run_cycle(CIR_INSTRADDR, 1'b1, 32'h0000_3004, rd); // Phase 6: mandatory Instruction Address CIR
         run_cycle(CIR_RESPONSE, 1'b0, 32'h0, rd);
         check(rd[31:16] == 16'h0000, "FRESTORE: a real Command CIR dialog works normally right afterward");

@@ -133,7 +133,7 @@ module m68882_musashi_cosim_tb;
         run_cycle(CIR_COMMAND, 1'b1, cmdw, rd2);
         run_cycle(CIR_INSTRADDR, 1'b1, 32'h0000_9000, rd2);
         wait_ticks = 0;
-        while ((u_top.u_proto.slotA_valid_r || u_top.u_proto.slotB_valid_r) && wait_ticks < 400) begin
+        while ((u_top.u_proto.slotA_valid_r || u_top.u_proto.slotB_valid_r) && wait_ticks < 1000) begin
             @(posedge clk_4x);
             wait_ticks++;
         end

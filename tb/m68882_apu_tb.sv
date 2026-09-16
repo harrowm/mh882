@@ -134,21 +134,34 @@ module m68882_apu_tb;
 
     // Phase 6: Command CIR dispatch now REQUIRES the mandatory Instruction
     // Address CIR write next (otherwise proto_violation_r pulses and the
-    // dialog never leaves ST_WAIT_IADDR), and real arithmetic ops (FADD/
-    // FSUB/FMUL/FDIV/FSQRT/FCMP) commit only after a genuine multi-cycle
-    // APU pipeline latency (m68882_proto.sv's own apu_latency()), not
-    // instantly -- a fixed "repeat(2)" is no longer enough. Poll the real
-    // pipeline-occupancy registers instead of hardcoding a cycle count, so
-    // this test stays correct regardless of the exact placeholder latency
-    // values -- FABS/FNEG/FTST (which never occupy a slot) fall straight
-    // through with the wait loop never actually iterating.
+    // dialog never leaves ST_WAIT_IADDR), and every opclass-000 op
+    // (FADD/FSUB/FMUL/FDIV/FSQRT/FCMP/FABS/FNEG/FTST/FMOVE) commits only
+    // after a genuine multi-cycle APU pipeline latency
+    // (m68882_proto.sv's own apu_latency(), Phase 9: real Table 8-3
+    // cycle counts -- NONE of these ops are actually zero-cycle on real
+    // silicon) -- a fixed "repeat(2)" is no longer enough for any of
+    // them. Poll the real pipeline-occupancy registers instead of
+    // hardcoding a cycle count.
     task automatic dispatch(input logic [31:0] cmdw);
         logic [31:0] rd2;
         int wait_ticks;
         run_cycle(CIR_COMMAND, 1'b1, cmdw, rd2);
         run_cycle(CIR_INSTRADDR, 1'b1, 32'h0000_2000, rd2);
         wait_ticks = 0;
-        while ((u_top.u_proto.slotA_valid_r || u_top.u_proto.slotB_valid_r) && wait_ticks < 400) begin
+        while ((u_top.u_proto.slotA_valid_r || u_top.u_proto.slotB_valid_r) && wait_ticks < 1000) begin
+            @(posedge clk_4x);
+            wait_ticks++;
+        end
+        repeat (2) @(posedge clk_4x);
+    endtask
+
+    // Shares dispatch()'s own drain-wait logic, for a test that dispatched
+    // via raw run_cycle calls directly (to observe mid-flight state) and
+    // now just needs to wait for the already-in-flight op to commit.
+    task automatic wait_ticks_apu_drain();
+        int wait_ticks;
+        wait_ticks = 0;
+        while ((u_top.u_proto.slotA_valid_r || u_top.u_proto.slotB_valid_r) && wait_ticks < 1000) begin
             @(posedge clk_4x);
             wait_ticks++;
         end
@@ -267,6 +280,22 @@ module m68882_apu_tb;
         load_fp(0, EXT_N3_0);
         dispatch(cmd_word(3'b000, 3'd0, 3'd1, 7'h18)); // FABS
         check(u_top.u_proto.u_regfile.fp_r[1] == EXT_3_0, "FABS: |-3.0| == 3.0");
+
+        // ── Phase 9 regression: FABS genuinely occupies a real APU
+        // pipeline slot now (Table 8-3: 38 real cycles, NOT zero) --
+        // confirmed by observing it still IN FLIGHT (slotA_valid_r) right
+        // after dispatch, well before its own real latency could have
+        // already elapsed. Uses raw run_cycle (not dispatch(), which
+        // itself waits for the pipeline to drain) specifically to catch
+        // this mid-flight state.
+        load_fp(0, EXT_N3_0);
+        run_cycle(CIR_COMMAND, 1'b1, cmd_word(3'b000, 3'd0, 3'd1, 7'h18), rd); // FABS
+        run_cycle(CIR_INSTRADDR, 1'b1, 32'h0000_3000, rd);
+        run_cycle(CIR_RESPONSE, 1'b0, 32'h0, rd);
+        check(u_top.u_proto.slotA_valid_r && u_top.u_proto.slotA_op_r == 7'h18,
+              "Phase 9: FABS genuinely occupies slot A immediately after dispatch -- not instant on real silicon (Table 8-3)");
+        wait_ticks_apu_drain();
+        check(u_top.u_proto.u_regfile.fp_r[1] == EXT_3_0, "Phase 9: FABS eventually commits the same correct result: |-3.0| == 3.0");
 
         // ── FABS: |3.0| = 3.0 (already positive, no change in sign) ─────
         load_fp(0, EXT_3_0);
@@ -388,6 +417,21 @@ module m68882_apu_tb;
               "Phase 4d: AEXC DZ bit stays set (sticky) after a later, unrelated operation");
         check(u_top.u_proto.u_regfile.fpsr_r[10] == 1'b0,
               "Phase 4d: EXC DZ bit itself is NOT sticky -- cleared by the later, unrelated operation");
+
+        // ── Phase 9: FMOVE (register-to-register, ext=$00) -- a real bug
+        // fix. Previously this extension code fell into an unconditional
+        // "no-op stub" fallback and silently did nothing at all (never
+        // caught before since no existing test dispatched it and checked
+        // the result); it's a real, defined instruction (Table 4-13:
+        // "$00 FMOVE to FPn") that must copy the source register to the
+        // destination, same as any other opclass-000 op, and now goes
+        // through the real pipeline with its own genuine Table 8-3
+        // latency (21 cycles).
+        load_fp(0, EXT_N3_0);
+        load_fp(1, EXT_1_0); // dest sentinel, != -3.0
+        dispatch(cmd_word(3'b000, 3'd0, 3'd1, 7'h00)); // FMOVE FP0,FP1
+        check(u_top.u_proto.u_regfile.fp_r[1] == EXT_N3_0, "Phase 9: FMOVE FP0,FP1 copies the source value (-3.0) to the destination");
+        check(u_top.u_proto.u_regfile.fpsr_r[27] == 1'b1, "Phase 9: FMOVE sets the N condition code for a negative moved value");
 
         $display("---");
         $display("%0d passed, %0d failed", pass_count, fail_count);

@@ -127,7 +127,7 @@ module m68882_pipeline_tb;
     // one more edge, so checking fp_r[]/fpsr_r/etc immediately after the
     // wait loop exits (before that edge) would race a real, structural
     // one-cycle latency, not a testbench bug.
-    task automatic wait_slotA_op(input logic [2:0] want_op, input int bound);
+    task automatic wait_slotA_op(input logic [6:0] want_op, input int bound);
         int wait_ticks;
         wait_ticks = 0;
         while (!(u_top.u_proto.slotA_valid_r && u_top.u_proto.slotA_op_r == want_op) && wait_ticks < bound) begin
@@ -153,11 +153,13 @@ module m68882_pipeline_tb;
     localparam logic [95:0] EXT_3_0  = 96'h4000_0000_c000_0000_0000_0000;
     localparam logic [95:0] EXT_4_0  = 96'h4001_0000_8000_0000_0000_0000;
     localparam logic [95:0] EXT_6_0  = 96'h4001_0000_c000_0000_0000_0000;
-    localparam logic [95:0] EXT_N3_0 = 96'hc000_0000_c000_0000_0000_0000;
 
-    localparam logic [2:0] APU_OP_ADD  = 3'd0;
-    localparam logic [2:0] APU_OP_MUL  = 3'd2;
-    localparam logic [2:0] APU_OP_DIV  = 3'd3;
+    // Phase 9: slotA_op_r/slotB_op_r now hold the RAW Table 4-13
+    // extension-field code directly (rtl/m68882_proto.sv's own header
+    // comment) -- these mirror that directly rather than a separate enum.
+    localparam logic [6:0] APU_OP_ADD  = 7'h22;
+    localparam logic [6:0] APU_OP_MUL  = 7'h23;
+    localparam logic [6:0] APU_OP_DIV  = 7'h20;
 
     logic [31:0] rd;
 
@@ -176,11 +178,11 @@ module m68882_pipeline_tb;
 
         // ═══ Genuine 2-deep pipeline overlap ═══════════════════════════
         load_fp(0, EXT_2_0);  load_fp(1, EXT_4_0);  // FDIV: FP1 = 4.0/2.0
-        load_fp(6, EXT_N3_0); load_fp(7, 96'h0);    // FABS: FP7 = |FP6|
         load_fp(2, EXT_1_0);  load_fp(3, EXT_2_0);  // FADD: FP3 = FP2+FP3 (dest sentinel != 3.0)
         load_fp(4, EXT_2_0);  load_fp(5, EXT_3_0);  // FMUL: FP5 = FP4*FP5 (dest sentinel != 6.0)
 
-        // Dispatch a slow FDIV -- occupies slot A for apu_latency(DIV)=16 cycles.
+        // Dispatch a slow FDIV -- occupies slot A for apu_latency(DIV) real
+        // Table 8-3 cycles (108 external cycles x4 = 432 clk_4x ticks).
         dispatch_noblock(cmd_word(3'b000, 3'd0, 3'd1, 7'h20), 32'h0000_5000, rd);
         check(rd[31:16] == 16'h0000, "FDIV dispatch: Response is Null/CA=0 immediately (CU's own part is instant)");
         check(u_top.u_proto.slotA_valid_r && u_top.u_proto.slotA_op_r == APU_OP_DIV,
@@ -188,17 +190,28 @@ module m68882_pipeline_tb;
         check(u_top.u_proto.u_regfile.fpiar_r == 32'h0000_5000,
               "FDIV dispatch: FPIAR (the real APU-stage register) auto-loads immediately on slot-A entry");
 
-        // While slot A is still busy, dispatch FABS -- Table 5-1's own
-        // Minimum-Concurrency class, no pipeline slot needed at all, so
-        // it must complete THIS tick regardless of the DIV still running.
-        dispatch_noblock(cmd_word(3'b000, 3'd6, 3'd7, 7'h18), 32'h0000_5010, rd);
-        check(rd[31:16] == 16'h0000, "FABS dispatch (while DIV busy): Response is Null/CA=0 -- CU-only op, never blocked by the APU");
-        check(u_top.u_proto.u_regfile.fp_r[7] == EXT_3_0,
-              "FABS: |−3.0| == 3.0, computed and committed immediately despite the APU pipeline being busy");
+        // While slot A is still busy, dispatch a genuinely CU-only
+        // operation (move to FPCR, opclass 100). Phase 9's own Table 8-3
+        // investigation found NOTHING in opclass 000 (register-to-
+        // register arithmetic, including FABS/FNEG/FCMP/FTST) is
+        // actually zero-latency on real silicon -- Table 5-1's own
+        // "Minimum-Concurrency" framing means concurrent WITH other
+        // pipeline activity, not zero-latency in isolation. The real
+        // "never touches the APU pipeline at all" concurrency Section
+        // 5.1.1 describes belongs to opclass 100/101/110/111 instead.
+        run_cycle(CIR_COMMAND, 1'b1, cmd_word(3'b100, 3'b100, 3'b000, 7'd0), rd); // move to FPCR
+        run_cycle(CIR_INSTRADDR, 1'b1, 32'h0000_5010, rd);
+        run_cycle(CIR_RESPONSE, 1'b0, 32'h0, rd);
+        check(rd[31:16] == {1'b1, 1'b0, 1'b0, 13'(PRIM_XFER_SINGLE)},
+              "move-to-FPCR dispatch (while DIV busy): a genuinely CU-only dialog, never touches slot A/B at all");
+        run_cycle(CIR_OPERAND, 1'b1, 32'h0000_0010, rd); // rounding mode = toward-zero, FPCR bits[5:4]
+        run_cycle(CIR_RESPONSE, 1'b0, 32'h0, rd);
+        check(u_top.u_proto.u_regfile.fpcr_r == 32'h0000_0010,
+              "move-to-FPCR: completed immediately despite the APU pipeline being busy with the DIV");
         check(u_top.u_proto.slotA_valid_r && u_top.u_proto.slotA_op_r == APU_OP_DIV,
-              "FABS dispatch left slot A completely undisturbed -- still the same in-flight DIV");
-        check(u_top.u_proto.u_regfile.fpiar_r == 32'h0000_5010,
-              "FABS dispatch: FPIAR auto-loads FABS's own address too -- it genuinely executes via the APU's ALU (just combinationally), not the CU");
+              "move-to-FPCR dispatch left slot A completely undisturbed -- still the same in-flight DIV");
+        check(u_top.u_proto.u_regfile.fpiar_r == 32'h0000_5000,
+              "move-to-FPCR dispatch: FPIAR NOT touched -- a real CU-only dialog never touches the APU-stage register");
 
         // While slot A is STILL busy, dispatch a SECOND real arithmetic
         // op (FADD) -- the genuine 2-deep pipeline: it must be accepted
@@ -210,8 +223,8 @@ module m68882_pipeline_tb;
               "FADD dispatch: staged into slot B, waiting for slot A (the DIV) to free");
         check(u_top.u_proto.u_regfile.fp_r[3] != EXT_3_0,
               "FADD dispatch: destination register NOT yet written -- slot B hasn't executed");
-        check(u_top.u_proto.u_regfile.fpiar_r == 32'h0000_5010,
-              "FADD dispatch: FPIAR NOT yet updated (still FABS's address) -- only the genuinely-executing APU-stage instruction loads it, not a merely-staged one");
+        check(u_top.u_proto.u_regfile.fpiar_r == 32'h0000_5000,
+              "FADD dispatch: FPIAR NOT yet updated (still DIV's address) -- only the genuinely-executing APU-stage instruction loads it, not a merely-staged one");
 
         // A THIRD arithmetic dispatch while BOTH slots are full must be
         // rejected (Section 7.2.6) -- Response reports CA=1 (busy), and
@@ -225,7 +238,7 @@ module m68882_pipeline_tb;
 
         // Wait for the DIV to commit and the FADD to promote from slot B
         // into slot A.
-        wait_slotA_op(APU_OP_ADD, 400);
+        wait_slotA_op(APU_OP_ADD, 1000);
         check(u_top.u_proto.u_regfile.fp_r[1] == EXT_2_0, "FDIV eventually commits: FP1 = 4.0/2.0 == 2.0");
         check(!u_top.u_proto.slotB_valid_r, "Slot B promotion: now empty after handing off to slot A");
         check(u_top.u_proto.slotA_valid_r && u_top.u_proto.slotA_op_r == APU_OP_ADD,
@@ -241,12 +254,12 @@ module m68882_pipeline_tb;
         check(u_top.u_proto.slotB_valid_r && u_top.u_proto.slotB_op_r == APU_OP_MUL,
               "FMUL retry: staged into slot B");
 
-        wait_slotA_op(APU_OP_MUL, 400);
+        wait_slotA_op(APU_OP_MUL, 1000);
         check(u_top.u_proto.u_regfile.fp_r[3] == EXT_3_0, "Slot A (FADD) eventually commits: FP3 = 1.0+2.0 == 3.0");
         check(u_top.u_proto.u_regfile.fpiar_r == 32'h0000_5040,
               "Second promotion: FPIAR now reflects the FMUL's own address");
 
-        wait_pipeline_idle(400);
+        wait_pipeline_idle(1000);
         check(!u_top.u_proto.slotA_valid_r && !u_top.u_proto.slotB_valid_r,
               "Pipeline fully drains: both slots empty once the FMUL itself commits");
         check(u_top.u_proto.u_regfile.fp_r[5] == EXT_6_0, "Slot A (FMUL) eventually commits: FP5 = 2.0*3.0 == 6.0");
@@ -294,7 +307,7 @@ module m68882_pipeline_tb;
         load_fp(0, {1'b0, 15'd32766, 16'h0, 64'h8000_0000_0000_0000});
         load_fp(1, {1'b0, 15'd32766, 16'h0, 64'h8000_0000_0000_0000});
         dispatch_noblock(cmd_word(3'b000, 3'd0, 3'd1, 7'h22), 32'h0000_7010, rd); // FADD -> overflow
-        wait_pipeline_idle(400);
+        wait_pipeline_idle(1000);
 
         run_cycle(CIR_RESPONSE, 1'b0, 32'h0, rd);
         check(rd[31:16] == {1'b1, 1'b0, 1'b0, 13'(PRIM_TAKE_MID)},

@@ -205,64 +205,108 @@ module m68882_proto (
     logic [31:0] cu_instr_addr_r;   // CU-stage instruction address
     logic        proto_violation_r; // one-tick pulse: mandatory IA write was skipped
 
-    // ── Phase 6: 2-deep APU pipeline (slot A = executing, slot B =
+    // ── Phase 6/9: 2-deep APU pipeline (slot A = executing, slot B =
     // staged, waiting for slot A to free) ───────────────────────────────
-    // FCMP ($38) is folded in here too (APU_OP_CMP), NOT kept as a
-    // separate instant/CU-only op the way FABS/FNEG/FTST are -- two
-    // independent reasons: (1) it's the identical adder hardware FADD/
-    // FSUB already use (Section 4.5.5.1: FCMP computes "as if" FPn-source
-    // were subtracted), so real contention with an in-flight FADD/FSUB
-    // for that shared resource is correct modeling, not a simplification;
-    // (2) a confirmed Icarus tool limitation (not a logic bug): two
-    // SEPARATE always_comb processes each independently calling the SAME
-    // automatic task (fp_add_sub) produces a genuine zero-time delta-
-    // cycle livelock in this simulator specifically (bisected directly --
-    // removing either call site individually fixes it; the task's own
-    // logic is unaffected, confirmed by testing it in complete isolation
-    // too) -- rather than work around a tool bug with an awkward
-    // duplicate-logic-avoidance hack, routing FCMP through the exact same
-    // single slot-A call site both fixes the tool issue AND is the more
-    // realistic hardware choice.
-    localparam logic [2:0] APU_OP_ADD  = 3'd0;
-    localparam logic [2:0] APU_OP_SUB  = 3'd1;
-    localparam logic [2:0] APU_OP_MUL  = 3'd2;
-    localparam logic [2:0] APU_OP_DIV  = 3'd3;
-    localparam logic [2:0] APU_OP_SQRT = 3'd4;
-    localparam logic [2:0] APU_OP_CMP  = 3'd5;
-
-    function automatic logic [2:0] apu_op_from_ext(logic [6:0] ext);
+    // FCMP ($38) is folded in here too, NOT kept as a separate instant/
+    // CU-only op -- two independent reasons: (1) it's the identical adder
+    // hardware FADD/FSUB already use (Section 4.5.5.1: FCMP computes "as
+    // if" FPn-source were subtracted), so real contention with an
+    // in-flight FADD/FSUB for that shared resource is correct modeling,
+    // not a simplification; (2) a confirmed Icarus tool limitation (not a
+    // logic bug): two SEPARATE always_comb processes each independently
+    // calling the SAME automatic task (fp_add_sub) produces a genuine
+    // zero-time delta-cycle livelock in this simulator specifically
+    // (bisected directly -- removing either call site individually fixes
+    // it; the task's own logic is unaffected, confirmed by testing it in
+    // complete isolation too) -- rather than work around a tool bug with
+    // an awkward duplicate-logic-avoidance hack, routing FCMP through the
+    // exact same single slot-A call site both fixes the tool issue AND is
+    // the more realistic hardware choice.
+    //
+    // Phase 9: FABS/FNEG/FTST/FMOVE(reg-reg) also moved INTO this same
+    // real pipeline slot, no longer "instant" -- Table 8-3 (below) proved
+    // that assumption wrong. slotA_op_r/slotB_op_r hold the RAW 7-bit
+    // extension-field code directly (Table 4-13's own real opcode value,
+    // e.g. 7'h22 for FADD) rather than a separate translated enum -- one
+    // real number, traceable straight back to the manual, that scales to
+    // the full ~40-opcode extension-field space without a growing
+    // translation layer to keep in sync.
+    //
+    // apu_latency(): confirmed directly against Table 8-3, "MC68882
+    // Overall Execution Times" (MC68881/MC68882 User's Manual p.8-13,
+    // both text-extracted AND visually confirmed against the actual page
+    // image, not OCR-trusted blindly) -- the "FPn to FPm" (register-to-
+    // register) column's own Total figure, in REAL external clock
+    // cycles, x4 to convert to this chip's own clk_4x ticks (matching
+    // the same 4x-multiplied-clock convention MH030 uses for its own
+    // S-state timing). This REPLACES Phase 6's own placeholder
+    // convention, which badly understated the real relative spread
+    // (e.g. modeled FSQRT as barely 5x FADD; real silicon's FSQRT is
+    // ~2x FADD, while a real transcendental like FACOS is ~11x FADD) and
+    // wrongly modeled FABS/FNEG/FCMP/FTST as literally zero-cycle
+    // (Table 5-1's "Minimum-Concurrency" framing means CONCURRENT with
+    // other pipeline activity, not zero-latency in isolation -- a real,
+    // if fast, ~36-38-cycle op on real silicon). Entries for opcodes not
+    // yet implemented by this RTL (the still-open transcendental set)
+    // are included here anyway, since it's pure real data with no
+    // implementation cost -- only the dispatch gate (cmd_is_* below)
+    // decides which ones this RTL actually routes into the pipeline yet;
+    // everything else still falls through to the documented no-op stub.
+    function automatic logic [11:0] apu_latency(logic [6:0] ext);
         unique case (ext)
-            7'h22:   return APU_OP_ADD;
-            7'h28:   return APU_OP_SUB;
-            7'h23:   return APU_OP_MUL;
-            7'h20:   return APU_OP_DIV;
-            7'h04:   return APU_OP_SQRT;
-            7'h38:   return APU_OP_CMP;
-            default: return APU_OP_ADD; // unreached -- caller gates on the is_f* set first
-        endcase
-    endfunction
-
-    // THIS PROJECT'S OWN placeholder latency convention -- see header
-    // comment. Cycle counts, not confirmed against a real timing table.
-    function automatic logic [8:0] apu_latency(logic [2:0] op);
-        unique case (op)
-            APU_OP_ADD, APU_OP_SUB, APU_OP_CMP: return 9'd50;
-            APU_OP_MUL:             return 9'd100;
-            APU_OP_DIV:             return 9'd200;
-            APU_OP_SQRT:            return 9'd250;
-            default:                return 5'd1;
+            7'h00:   return 12'd84;   // FMOVE (reg-reg),  21 cyc
+            7'h01:   return 12'd232;  // FINT,             58 cyc
+            7'h02:   return 12'd2760; // FSINH,           690 cyc
+            7'h03:   return 12'd232;  // FINTRZ,           58 cyc
+            7'h04:   return 12'd440;  // FSQRT,           110 cyc
+            7'h06:   return 12'd2296; // FLOGNP1,         574 cyc
+            7'h08:   return 12'd2192; // FETOXM1,         548 cyc
+            7'h09:   return 12'd2656; // FTANH,           664 cyc
+            7'h0A:   return 12'd1624; // FATAN,           406 cyc
+            7'h0C:   return 12'd2336; // FASIN,           584 cyc
+            7'h0D:   return 12'd2784; // FATANH,          696 cyc
+            7'h0E:   return 12'd1576; // FSIN,            394 cyc
+            7'h0F:   return 12'd1904; // FTAN,            476 cyc
+            7'h10:   return 12'd2000; // FETOX,           500 cyc
+            7'h11:   return 12'd2280; // FTWOTOX,         570 cyc
+            7'h12:   return 12'd2280; // FTENTOX,         570 cyc
+            7'h14:   return 12'd2112; // FLOGN,           528 cyc
+            7'h15:   return 12'd2336; // FLOG10,          584 cyc
+            7'h16:   return 12'd2336; // FLOG2,           584 cyc
+            7'h18:   return 12'd152;  // FABS,             38 cyc
+            7'h19:   return 12'd2440; // FCOSH,           610 cyc
+            7'h1A:   return 12'd152;  // FNEG,             38 cyc
+            7'h1C:   return 12'd2512; // FACOS,           628 cyc
+            7'h1D:   return 12'd1576; // FCOS,            394 cyc
+            7'h1E:   return 12'd192;  // FGETEXP,          48 cyc
+            7'h1F:   return 12'd136;  // FGETMAN,          34 cyc
+            7'h20:   return 12'd432;  // FDIV,            108 cyc
+            7'h21:   return 12'd300;  // FMOD,             75 cyc
+            7'h22:   return 12'd224;  // FADD,             56 cyc
+            7'h23:   return 12'd304;  // FMUL,             76 cyc
+            7'h24:   return 12'd296;  // FSGLDIV,          74 cyc
+            7'h25:   return 12'd420;  // FREM,            105 cyc
+            7'h26:   return 12'd184;  // FSCALE,           46 cyc
+            7'h27:   return 12'd256;  // FSGLMUL,          64 cyc
+            7'h28:   return 12'd224;  // FSUB,             56 cyc
+            7'h38:   return 12'd152;  // FCMP,             38 cyc
+            7'h3A:   return 12'd144;  // FTST,             36 cyc
+            default: return 12'd4;    // FSINCOS ($30-$37) + anything else
+                                       // not yet dispatched into the real
+                                       // pipeline (see cmd_is_* gating --
+                                       // never actually reached today)
         endcase
     endfunction
 
     logic        slotA_valid_r;
-    logic [2:0]  slotA_op_r;
+    logic [6:0]  slotA_op_r;
     logic [95:0] slotA_a_r, slotA_b_r;
     logic [2:0]  slotA_dest_r;
     logic [1:0]  slotA_round_r;
-    logic [8:0]  apu_busy_cnt_r;
+    logic [11:0] apu_busy_cnt_r;
 
     logic        slotB_valid_r;
-    logic [2:0]  slotB_op_r;
+    logic [6:0]  slotB_op_r;
     logic [95:0] slotB_a_r, slotB_b_r;
     logic [2:0]  slotB_dest_r;
     logic [1:0]  slotB_round_r;
@@ -351,7 +395,7 @@ module m68882_proto (
     wire cmd_is_fabs  = (cmd_ext_r == 7'h18);
     wire cmd_is_fneg  = (cmd_ext_r == 7'h1A);
     wire cmd_is_fsqrt = (cmd_ext_r == 7'h04);
-    wire [2:0] cmd_apu_op = apu_op_from_ext(cmd_ext_r);
+    wire cmd_is_fmove = (cmd_ext_r == 7'h00);
 
     // State-frame format words (Section 6.4.2) -- see plan.md/CLAUDE.md
     // for the full derivation; unchanged from Phase 5.
@@ -361,47 +405,12 @@ module m68882_proto (
     localparam logic [5:0]  FRAME_IDLE_WORDS = 6'd13; // 52 bytes / 4
     localparam logic [5:0]  FRAME_BUSY_WORDS = 6'd52; // 208 bytes / 4
 
-    // ── Instant (CU-only, no APU pipeline slot) ops: FABS/FNEG/FTST --
-    // Table 5-1's own Minimum-Concurrency Instructions plus this
-    // project's own FABS/FNEG addition (trivial sign-bit ops, no real
-    // multi-cycle APU work). FCMP is NOT here -- see APU_OP_CMP's own
-    // header comment above (folded into the slot-A pipeline instead, both
-    // for realism -- it's the same physical adder FADD/FSUB use -- and to
-    // avoid a confirmed Icarus livelock from 2 independent always_comb
-    // call sites of the same task). Computed from LIVE apu_a_rd/apu_b_rd,
-    // valid at the IA-write dispatch tick since apu_a_sel/apu_b_sel
-    // already reflect this instruction's own registered cmd_rx_r/cmd_ry_r
-    // by then. ────────────────────────────────────────────────────────
-    fpx_t ftst_x;
-    logic ftst_z, ftst_n, ftst_i, ftst_nan;
-    assign ftst_x   = unpack_fpx(apu_a_rd);
-    assign ftst_z   = is_zero_fpx(ftst_x);
-    assign ftst_n   = ftst_x.sign && !ftst_z;
-    assign ftst_i   = is_inf_fpx(ftst_x);
-    assign ftst_nan = is_nan_fpx(ftst_x);
-
-    logic [95:0] absneg_result;
-    assign absneg_result = cmd_is_fabs ? {1'b0, apu_a_rd[94:0]}
-                                        : {!apu_a_rd[95], apu_a_rd[94:0]};
-
-    wire cmd_flag_snan = is_snan_fpx(unpack_fpx(apu_a_rd)) || is_snan_fpx(unpack_fpx(apu_b_rd));
-
-    logic instant_z, instant_n, instant_i, instant_nan, instant_operr;
-    always_comb begin
-        if (cmd_is_fabs || cmd_is_fneg) begin
-            instant_z     = is_zero_fpx(unpack_fpx(absneg_result));
-            instant_n     = absneg_result[95] && !instant_z;
-            instant_i     = is_inf_fpx(unpack_fpx(absneg_result));
-            instant_nan   = is_nan_fpx(unpack_fpx(absneg_result));
-            instant_operr = 1'b0;
-        end else begin // FTST
-            instant_z     = ftst_z;
-            instant_n     = ftst_n;
-            instant_i     = ftst_i;
-            instant_nan   = ftst_nan;
-            instant_operr = 1'b0;
-        end
-    end
+    // Phase 9: FABS/FNEG/FTST/FMOVE(reg-reg) all moved INTO the real
+    // slot-A pipeline (see its own header comment) -- their computation
+    // now lives alongside FADD/FSUB/FMUL/FDIV/FSQRT/FCMP's own, below,
+    // operating on the CAPTURED slotA_a_r/slotA_b_r rather than live
+    // apu_a_rd/apu_b_rd (which by commit time may belong to a completely
+    // different, later dispatch).
 
     // Shared FPSR-update formula (Phase 4d's own confirmed OR-accumulation
     // formulas, Section 2.3.4/Figure 2-7) -- factored into a function so
@@ -442,7 +451,7 @@ module m68882_proto (
                  slotA_sqrt_ovfl, slotA_sqrt_unfl, slotA_sqrt_inex2;
 
     always_comb begin
-        fp_add_sub(slotA_a_r, slotA_b_r, (slotA_op_r == APU_OP_SUB || slotA_op_r == APU_OP_CMP),
+        fp_add_sub(slotA_a_r, slotA_b_r, (slotA_op_r == 7'h28 || slotA_op_r == 7'h38),
                    round_mode_t'(slotA_round_r),
                    slotA_addsub_result, slotA_addsub_z, slotA_addsub_n, slotA_addsub_i, slotA_addsub_nan,
                    slotA_addsub_operr, slotA_addsub_ovfl, slotA_addsub_unfl, slotA_addsub_inex2);
@@ -457,30 +466,65 @@ module m68882_proto (
                 slotA_sqrt_operr, slotA_sqrt_ovfl, slotA_sqrt_unfl, slotA_sqrt_inex2);
     end
 
+    // FABS/FNEG (trivial sign-bit ops) and FTST/FMOVE (no real ALU work
+    // at all) need no genuine arithmetic core -- computed directly here,
+    // off the CAPTURED slotA_a_r, same as every other slot-A op.
+    wire [95:0] slotA_absneg_result = (slotA_op_r == 7'h18) ? {1'b0, slotA_a_r[94:0]}
+                                                              : {!slotA_a_r[95], slotA_a_r[94:0]};
+    fpx_t slotA_a_unpacked;
+    assign slotA_a_unpacked = unpack_fpx(slotA_a_r);
+    wire slotA_a_z   = is_zero_fpx(slotA_a_unpacked);
+    wire slotA_a_n   = slotA_a_unpacked.sign && !slotA_a_z;
+    wire slotA_a_i   = is_inf_fpx(slotA_a_unpacked);
+    wire slotA_a_nan = is_nan_fpx(slotA_a_unpacked);
+
     logic [95:0] slotA_result;
     logic        slotA_flag_z, slotA_flag_n, slotA_flag_i, slotA_flag_nan, slotA_flag_operr,
                  slotA_flag_dz, slotA_flag_ovfl, slotA_flag_unfl, slotA_flag_inex2;
     always_comb begin
         unique case (slotA_op_r)
-            APU_OP_MUL: begin
+            7'h23: begin // FMUL
                 slotA_result = slotA_mul_result; slotA_flag_z = slotA_mul_z; slotA_flag_n = slotA_mul_n;
                 slotA_flag_i = slotA_mul_i; slotA_flag_nan = slotA_mul_nan; slotA_flag_operr = slotA_mul_operr;
                 slotA_flag_dz = 1'b0; slotA_flag_ovfl = slotA_mul_ovfl; slotA_flag_unfl = slotA_mul_unfl;
                 slotA_flag_inex2 = slotA_mul_inex2;
             end
-            APU_OP_DIV: begin
+            7'h20: begin // FDIV
                 slotA_result = slotA_div_result; slotA_flag_z = slotA_div_z; slotA_flag_n = slotA_div_n;
                 slotA_flag_i = slotA_div_i; slotA_flag_nan = slotA_div_nan; slotA_flag_operr = slotA_div_operr;
                 slotA_flag_dz = slotA_div_dz; slotA_flag_ovfl = slotA_div_ovfl; slotA_flag_unfl = slotA_div_unfl;
                 slotA_flag_inex2 = slotA_div_inex2;
             end
-            APU_OP_SQRT: begin
+            7'h04: begin // FSQRT
                 slotA_result = slotA_sqrt_result; slotA_flag_z = slotA_sqrt_z; slotA_flag_n = slotA_sqrt_n;
                 slotA_flag_i = slotA_sqrt_i; slotA_flag_nan = slotA_sqrt_nan; slotA_flag_operr = slotA_sqrt_operr;
                 slotA_flag_dz = 1'b0; slotA_flag_ovfl = slotA_sqrt_ovfl; slotA_flag_unfl = slotA_sqrt_unfl;
                 slotA_flag_inex2 = slotA_sqrt_inex2;
             end
-            default: begin // APU_OP_ADD / APU_OP_SUB / APU_OP_CMP (identical adder)
+            7'h18, 7'h1A: begin // FABS / FNEG
+                slotA_result = slotA_absneg_result;
+                slotA_flag_z = is_zero_fpx(unpack_fpx(slotA_absneg_result));
+                slotA_flag_n = slotA_absneg_result[95] && !slotA_flag_z;
+                slotA_flag_i = is_inf_fpx(unpack_fpx(slotA_absneg_result));
+                slotA_flag_nan = is_nan_fpx(unpack_fpx(slotA_absneg_result));
+                slotA_flag_operr = 1'b0; slotA_flag_dz = 1'b0; slotA_flag_ovfl = 1'b0;
+                slotA_flag_unfl = 1'b0; slotA_flag_inex2 = 1'b0;
+            end
+            7'h3A: begin // FTST -- source-only, never writes a register (see commit gating below)
+                slotA_result = slotA_a_r; // unused
+                slotA_flag_z = slotA_a_z; slotA_flag_n = slotA_a_n;
+                slotA_flag_i = slotA_a_i; slotA_flag_nan = slotA_a_nan;
+                slotA_flag_operr = 1'b0; slotA_flag_dz = 1'b0; slotA_flag_ovfl = 1'b0;
+                slotA_flag_unfl = 1'b0; slotA_flag_inex2 = 1'b0;
+            end
+            7'h00: begin // FMOVE (register-to-register copy)
+                slotA_result = slotA_a_r;
+                slotA_flag_z = slotA_a_z; slotA_flag_n = slotA_a_n;
+                slotA_flag_i = slotA_a_i; slotA_flag_nan = slotA_a_nan;
+                slotA_flag_operr = 1'b0; slotA_flag_dz = 1'b0; slotA_flag_ovfl = 1'b0;
+                slotA_flag_unfl = 1'b0; slotA_flag_inex2 = 1'b0;
+            end
+            default: begin // FADD / FSUB / FCMP (identical adder)
                 slotA_result = slotA_addsub_result; slotA_flag_z = slotA_addsub_z; slotA_flag_n = slotA_addsub_n;
                 slotA_flag_i = slotA_addsub_i; slotA_flag_nan = slotA_addsub_nan; slotA_flag_operr = slotA_addsub_operr;
                 slotA_flag_dz = 1'b0; slotA_flag_ovfl = slotA_addsub_ovfl; slotA_flag_unfl = slotA_addsub_unfl;
@@ -642,7 +686,7 @@ module m68882_proto (
             slotA_b_r     <= 96'h0;
             slotA_dest_r  <= 3'h0;
             slotA_round_r <= 2'h0;
-            apu_busy_cnt_r <= 9'h0;
+            apu_busy_cnt_r <= 12'h0;
             slotB_valid_r <= 1'b0;
             slotB_op_r    <= 3'h0;
             slotB_a_r     <= 96'h0;
@@ -702,50 +746,31 @@ module m68882_proto (
 
                         unique case (cmd_opclass_r)
                             3'b000: begin // FPm to FPn, register-to-register: no external
-                                           // transfer needed (Table 4-13 Note 1). Split
-                                           // between the instant CU-only ops (FABS/FNEG/
-                                           // FTST) and the real APU-pipelined ones
-                                           // (FADD/FSUB/FMUL/FDIV/FSQRT/FCMP) -- see
-                                           // header comment and APU_OP_CMP's own comment
-                                           // above (FCMP shares the adder pipeline slot,
-                                           // it is NOT instant).
-                                if (cmd_is_fabs || cmd_is_fneg || cmd_is_ftst) begin
-                                    ca_r    <= 1'b0;
-                                    prim_r  <= PRIM_NULL;
-                                    state_r <= ST_IDLE;
-                                    if (!cmd_is_ftst) begin
-                                        apu_wr_en   <= 1'b1;
-                                        apu_wr_sel  <= cmd_ry_r;
-                                        apu_wr_data <= absneg_result;
-                                    end
-                                    ctrl_wr_en    <= 1'b1;
-                                    ctrl_wr_sel_r <= 2'd1; // FPSR
-                                    ctrl_wr_data  <= fpsr_next(fpsr_o, instant_n, instant_z, instant_i,
-                                                                instant_nan, cmd_flag_snan, instant_operr,
-                                                                1'b0, 1'b0, 1'b0, 1'b0);
-                                    fpiar_auto_wr_en   <= 1'b1;
-                                    fpiar_auto_wr_data <= d_in;
-                                end else if (cmd_is_fadd || cmd_is_fsub || cmd_is_fmul ||
-                                             cmd_is_fdiv || cmd_is_fsqrt || cmd_is_fcmp) begin
-                                    // Real arithmetic: the CU's own part
-                                    // (no external transfer, register-to-
-                                    // register) is instant either way --
-                                    // Null/CA=0 goes back immediately,
-                                    // letting the main processor proceed to
-                                    // a FOLLOWING dispatch, exactly like
-                                    // real silicon, regardless of whether
-                                    // the APU has even started on THIS op.
+                                           // transfer needed (Table 4-13 Note 1), so the
+                                           // CU's own part is ALWAYS instant (Null/CA=0
+                                           // immediately) regardless of whether the APU
+                                           // has even started the real computation --
+                                           // every recognized op here (including FABS/
+                                           // FNEG/FCMP/FTST/FMOVE -- Table 8-3 confirms
+                                           // NONE of them are actually zero-cycle on real
+                                           // silicon, just fast relative to the
+                                           // transcendentals) goes through the real
+                                           // 2-deep APU pipeline with its own genuine
+                                           // Table 8-3 latency.
+                                if (cmd_is_fadd || cmd_is_fsub || cmd_is_fmul ||
+                                    cmd_is_fdiv || cmd_is_fsqrt || cmd_is_fcmp ||
+                                    cmd_is_fabs || cmd_is_fneg || cmd_is_ftst || cmd_is_fmove) begin
                                     state_r <= ST_IDLE;
                                     if (!slotA_valid_r) begin
                                         ca_r    <= 1'b0;
                                         prim_r  <= PRIM_NULL;
                                         slotA_valid_r  <= 1'b1;
-                                        slotA_op_r     <= cmd_apu_op;
+                                        slotA_op_r     <= cmd_ext_r;
                                         slotA_a_r      <= apu_a_rd;
                                         slotA_b_r      <= apu_b_rd;
                                         slotA_dest_r   <= cmd_ry_r;
                                         slotA_round_r  <= cmd_round_r;
-                                        apu_busy_cnt_r <= apu_latency(cmd_apu_op);
+                                        apu_busy_cnt_r <= apu_latency(cmd_ext_r);
                                         fpiar_auto_wr_en   <= 1'b1;
                                         fpiar_auto_wr_data <= d_in;
                                     end else if (!slotB_valid_r) begin
@@ -758,7 +783,7 @@ module m68882_proto (
                                         ca_r    <= 1'b0;
                                         prim_r  <= PRIM_NULL;
                                         slotB_valid_r <= 1'b1;
-                                        slotB_op_r    <= cmd_apu_op;
+                                        slotB_op_r    <= cmd_ext_r;
                                         slotB_a_r     <= apu_a_rd;
                                         slotB_b_r     <= apu_b_rd;
                                         slotB_dest_r  <= cmd_ry_r;
@@ -935,7 +960,7 @@ module m68882_proto (
                                     null_reset_en <= 1'b1;
                                     slotA_valid_r <= 1'b0;
                                     slotB_valid_r <= 1'b0;
-                                    apu_busy_cnt_r <= 9'h0;
+                                    apu_busy_cnt_r <= 12'h0;
                                     prim_r  <= PRIM_NULL;
                                     ca_r    <= 1'b0;
                                     state_r <= ST_IDLE;
@@ -1050,12 +1075,12 @@ module m68882_proto (
             // reported) deterministically wins -- exception reporting
             // takes priority over an ordinary same-cycle dispatch ack. ──
             if (slotA_valid_r) begin
-                if (apu_busy_cnt_r <= 9'd1) begin
+                if (apu_busy_cnt_r <= 12'd1) begin
                     // Section 4.5.5.1: FCMP compares "as if" FPn-source
-                    // were computed, but FPn itself is never written --
-                    // matches FTST's own identical exclusion in the
-                    // instant-op path above.
-                    if (slotA_op_r != APU_OP_CMP) begin
+                    // were computed, but FPn itself is never written.
+                    // FTST likewise never writes (source-only, condition
+                    // codes only).
+                    if (slotA_op_r != 7'h38 && slotA_op_r != 7'h3A) begin
                         apu_wr_en   <= 1'b1;
                         apu_wr_sel  <= slotA_dest_r;
                         apu_wr_data <= slotA_result;
@@ -1094,7 +1119,7 @@ module m68882_proto (
                         slotA_valid_r <= 1'b0;
                     end
                 end else begin
-                    apu_busy_cnt_r <= apu_busy_cnt_r - 9'd1;
+                    apu_busy_cnt_r <= apu_busy_cnt_r - 12'd1;
                 end
             end else if (slotB_valid_r) begin
                 // Safety net for a same-cycle race: a dispatch's own

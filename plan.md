@@ -1,6 +1,6 @@
 # MC68882 FPU — Phased Scope Plan
 
-## Status: Phases 0-8 complete (4a/4b core arithmetic, transcendentals deferred; 4c L/S/D/X conversion, W/B/P remain; 4d exception/accrued-byte semantics; 5 state frame save/restore; 6 68882-specific pipelining; 7 Musashi golden-reference cosim; 8 companion integration example). Every phase in this plan's own original scope is now closed — see the Phase 8 writeup below for what remains deliberately out of scope, and why.
+## Status: Phases 0-8 complete (4a/4b core arithmetic, transcendentals deferred; 4c L/S/D/X conversion, W/B/P remain; 4d exception/accrued-byte semantics; 5 state frame save/restore; 6 68882-specific pipelining; 7 Musashi golden-reference cosim; 8 companion integration example). Every phase in this plan's own original scope is now closed. **Phase 9 (the transcendental instruction set, this plan's own long-flagged deferred item) is now underway** — see its own section below, added after the original 8-phase plan closed.
 
 ## Origin
 
@@ -1274,7 +1274,151 @@ MH882/
 └── timing_diagrams/    (Phase 2+) manual-vs-sim crops, same pipeline MH030 uses
 ```
 
-## Next step
+## Phase 9 — The transcendental instruction set (post-original-plan, IN PROGRESS)
 
-Write `CLAUDE.md` from the facts gathered above (closes Phase 0), then
-start Phase 1 (clock domain + pin-level BIU skeleton).
+Opened after the original 8-phase plan closed in full, per the user's own
+explicit direction to continue. Table 4-13's own extension-field opcode
+space (`docs/MC68881_MC68882_...pdf` p.4-9, transcribed below) has ~28
+more real instructions beyond the 9 register-to-register ops Phase 4
+already implemented — the full trig/log/exp transcendental set plus a
+handful of auxiliary ops (FINT/FINTRZ/FGETEXP/FGETMAN/FSCALE/FMOD/FREM/
+FSGLDIV/FSGLMUL).
+
+**Two real, cited standards this phase builds against, found directly in
+the manual rather than invented:**
+
+1. **Timing** (Section 8, Table 8-3 "MC68882 Overall Execution Times,"
+   p.8-13) — a genuine per-instruction cycle-count table in external
+   clock cycles, covering literally every instruction including every
+   transcendental. Exactly this project's own equivalent of the S-state
+   delay table MH030 built for its own timing work. Confirmed via BOTH
+   `pdftotext -layout` extraction AND direct visual inspection of the
+   actual page image (not OCR-trusted blindly) — the "FPn to FPm"
+   (register-to-register) column's own Total figure is what this
+   project's own pipeline currently models.
+2. **Numerical accuracy** (Section 4.3 "Computational Accuracy," p.3165)
+   — real silicon does NOT compute transcendentals bit-exact. Quoted
+   directly: "the worst-case accuracy is 4096 units in the last place...
+   the typical error bound for these instructions is approximately 64
+   units in the last place." Only the core arithmetic ops (already
+   IEEE-exact to 0.5 ULP in this RTL since Phase 4) get that stronger
+   guarantee. This means implementing the trig/log/exp set means a
+   reasonable polynomial/rational approximation verified against a
+   realistic ULP tolerance, not bit-exact agreement with a reference.
+
+**Table 4-13's own real extension-field opcode map** (p.4-9, OCR-
+corrected against direct visual/general knowledge cross-check — every
+value independently matches the well-known real 68881/2 opcode map):
+
+| Ext | Instr | Ext | Instr | Ext | Instr | Ext | Instr |
+|---|---|---|---|---|---|---|---|
+| $00 | FMOVE | $0F | FTAN | $1E | FGETEXP | $27 | FSGLMUL |
+| $01 | FINT | $10 | FETOX | $1F | FGETMAN | $28 | FSUB |
+| $02 | FSINH | $11 | FTWOTOX | $20 | FDIV | $30-$37 | FSINCOS |
+| $03 | FINTRZ | $12 | FTENTOX | $21 | FMOD | $38 | FCMP |
+| $04 | FSQRT | $14 | FLOGN | $22 | FADD | $3A | FTST |
+| $06 | FLOGNP1 | $15 | FLOG10 | $23 | FMUL | | |
+| $08 | FETOXM1 | $16 | FLOG2 | $24 | FSGLDIV | | |
+| $09 | FTANH | $18 | FABS | $25 | FREM | | |
+| $0A | FATAN | $19 | FCOSH | $26 | FSCALE | | |
+| $0C | FASIN | $1A | FNEG | | | | |
+| $0D | FATANH | $1C | FACOS | | | | |
+| $0E | FSIN | $1D | FCOS | | | | |
+
+**Musashi cross-check availability** (checked directly against
+`tools/musashi/m68kfpu.c`'s own `fpgen_rm_reg()` switch statement, not
+assumed): implements FMOVE, FINT, FINTRZ, FSQRT, FABS, FNEG, FSIN, FCOS,
+FSINCOS, FGETEXP, FDIV, FMOD, FSGLDIV, FADD, FMUL, FSGLMUL, FREM, FSUB,
+FCMP, FTST directly — usable as a live cosim reference for those (same
+Phase 7 methodology). Does NOT implement FACOS/FASIN/FATAN/FATANH/
+FCOSH/FETOX/FETOXM1/FLOGN/FLOGNP1/FLOG10/FLOG2/FSINH/FTAN/FTANH/
+FTENTOX/FTWOTOX/FGETMAN/FSCALE — for those, reference vectors will need
+generating independently (Python/mpmath, matching `tb/m68882_apu_tb.sv`'s
+own already-established "computed independently, cross-checked by hand"
+precedent for its known-good constants).
+
+### Phase 9a — Real Table 8-3 latencies replace the Phase 6 placeholder, COMPLETE
+
+Phase 6's own placeholder latency convention (ADD/SUB/CMP=50, MUL=100,
+DIV=200, SQRT=250 clk_4x ticks, explicitly flagged at the time as "not
+confirmed against a real timing table") is now replaced with real,
+manual-confirmed values: `apu_latency()` (`rtl/m68882_proto.sv`) is keyed
+directly by the RAW 7-bit Table 4-13 extension code (no separate
+translated enum to keep in sync — one real number straight from the
+manual per opcode), covering the full ~28-opcode remaining space too
+(pure data, zero cost to include even for opcodes this RTL doesn't
+dispatch into the pipeline yet).
+
+**Two real, non-obvious findings from doing this properly instead of
+just re-scaling the placeholder numbers:**
+- The real relative spread is much wider than the placeholder implied
+  (real FSQRT is ~2x real FADD; the placeholder had it at 5x). A
+  transcendental like FACOS is ~11x FADD — genuinely slow, not just
+  "slower."
+- **FABS/FNEG/FCMP/FTST are NOT zero-cycle on real silicon** — Phase 6
+  modeled them as "instant" based on Table 5-1's "Minimum-Concurrency
+  Instructions" framing, but that table describes CONCURRENCY (never
+  blocked by an in-flight APU op), not zero latency in isolation. Real
+  Table 8-3: 36-38 cycles each, fast relative to the transcendentals but
+  genuinely nonzero. All 4 now go through the real slot-A/B pipeline
+  like every other opclass-000 op, with their own real, distinct
+  latencies — a substantial, positive architectural simplification too
+  (the old separate "instant CU-only path" special-case is gone
+  entirely; every opclass-000 op now shares one uniform dispatch path).
+
+**A real, previously-undiscovered bug found while auditing the full
+Table 4-13 opcode space against this RTL's own dispatch logic**: FMOVE
+(register-to-register, ext=$00) fell through an unconditional "no-op
+stub" fallback and silently did nothing at all — never caught before
+because no existing test dispatched it and checked the actual result
+(`tb/m68882_frame_tb.sv`'s own pre-existing dispatch of ext=$00 only
+ever checked that the Response CIR dialog completed normally, never the
+register value). Fixed: FMOVE now goes through the same real pipeline
+slot as every other op, with its own genuine Table 8-3 latency (21
+cycles) and correct semantics (copy source to destination, set
+condition codes, no exceptions possible). New regression tests in
+`tb/m68882_apu_tb.sv` lock in both fixes: FABS is directly observed
+still `slotA_valid_r` (genuinely in flight) immediately after dispatch,
+well before its own real latency could have already elapsed; FMOVE is
+confirmed to actually copy -3.0 correctly (previously would have left
+the destination register completely unchanged).
+
+`tb/m68882_pipeline_tb.sv`'s own "CU-only op completes despite APU busy"
+demonstration needed a real rework too, for the same underlying reason:
+it used to dispatch FABS as the "instant, never blocked by the APU"
+example, which is no longer true. Replaced with a genuinely CU-only
+operation instead (move-to-FPCR, opclass 100) — this correctly
+demonstrates the real Section 5.1.1 concurrency guarantee, since
+opclass 100/101/110/111 dialogs never touch slot A/B at all, unlike
+literally everything in opclass 000 (confirmed by this same Table 8-3
+audit — there is no remaining "truly zero-slot" op left in the
+register-to-register arithmetic space).
+
+**227/227 across all eight testbenches** (11+27+52+28+32+63+12+2 — APU
+gained 4 new checks).
+
+### Phase 9b — Exact auxiliary ops (FINT/FINTRZ/FGETEXP/FGETMAN/FSCALE), NEXT
+
+These 5 have exact, well-defined IEEE bit-manipulation semantics, NOT
+subject to the ~64-ULP transcendental tolerance (they're not
+approximations — FINT/FINTRZ round to/toward an integer, FGETEXP/
+FGETMAN split a value into its unbiased exponent and normalized
+mantissa, FSCALE multiplies by a power of 2 via a pure exponent shift).
+Real Table 8-3 latencies already in place from Phase 9a. Plan:
+implement each as a new slot-A op (same pipeline pattern as FABS/FNEG),
+verify FINT/FINTRZ/FGETEXP against Musashi directly (all 3 implemented
+there); FGETMAN/FSCALE against independently-derived Python reference
+values (Musashi doesn't implement either).
+
+### Phase 9c+ — The real trig/log/exp set, NOT YET STARTED
+
+19 functions (FACOS/FASIN/FATAN/FATANH/FCOS/FCOSH/FETOX/FETOXM1/FLOGN/
+FLOGNP1/FLOG10/FLOG2/FSIN/FSINCOS/FSINH/FTAN/FTANH/FTENTOX/FTWOTOX) plus
+FMOD/FREM/FSGLDIV/FSGLMUL. Needs a genuine numerical algorithm per
+function (polynomial/rational minimax approximation, the standard
+technique for this class of problem) verified to the manual's own ~64
+ULP typical / 4096 ULP worst-case tolerance — Musashi-cross-checkable
+for FSIN/FCOS/FSINCOS/FMOD/FREM/FSGLDIV/FSGLMUL, Python/mpmath-
+generated reference vectors for the rest. Sequenced after Phase 9b
+deliberately — get the simpler, exact-semantics ops (and the pipeline
+infrastructure correction) landed and tested first.
