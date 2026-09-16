@@ -256,6 +256,60 @@ module m68882_apu_tb;
               "FDIV: 1.0 / 0.0 == +Infinity");
         check(u_top.u_proto.u_regfile.fpsr_r[10] == 1'b1, "FDIV: DZ exception-status bit set for divide-by-zero");
 
+        // ── FABS: |-3.0| = 3.0 (source in RX, result to RY) ──────────────
+        load_fp(0, EXT_N3_0);
+        run_cycle(CIR_COMMAND, 1'b1, cmd_word(3'b000, 3'd0, 3'd1, 7'h18), rd); // FABS
+        repeat (2) @(posedge clk_4x);
+        check(u_top.u_proto.u_regfile.fp_r[1] == EXT_3_0, "FABS: |-3.0| == 3.0");
+
+        // ── FABS: |3.0| = 3.0 (already positive, no change in sign) ─────
+        load_fp(0, EXT_3_0);
+        run_cycle(CIR_COMMAND, 1'b1, cmd_word(3'b000, 3'd0, 3'd1, 7'h18), rd); // FABS
+        repeat (2) @(posedge clk_4x);
+        check(u_top.u_proto.u_regfile.fp_r[1] == EXT_3_0, "FABS: |3.0| == 3.0");
+
+        // ── FNEG: -(2.0) = -2.0 ───────────────────────────────────────────
+        load_fp(0, EXT_2_0);
+        run_cycle(CIR_COMMAND, 1'b1, cmd_word(3'b000, 3'd0, 3'd1, 7'h1A), rd); // FNEG
+        repeat (2) @(posedge clk_4x);
+        check(u_top.u_proto.u_regfile.fp_r[1] == {1'b1, EXT_2_0[94:0]}, "FNEG: -(2.0) == -2.0");
+
+        // ── FNEG: -(-1.0) = 1.0 (double negation) ────────────────────────
+        load_fp(0, EXT_N1_0);
+        run_cycle(CIR_COMMAND, 1'b1, cmd_word(3'b000, 3'd0, 3'd1, 7'h1A), rd); // FNEG
+        repeat (2) @(posedge clk_4x);
+        check(u_top.u_proto.u_regfile.fp_r[1] == EXT_1_0, "FNEG: -(-1.0) == 1.0");
+
+        // ── FCMP: destination register (RY) is never written ────────────
+        load_fp(0, EXT_2_0);
+        load_fp(1, EXT_3_0); // dest pre-loaded with a sentinel value
+        run_cycle(CIR_COMMAND, 1'b1, cmd_word(3'b000, 3'd0, 3'd1, 7'h38), rd); // FCMP
+        repeat (2) @(posedge clk_4x);
+        check(u_top.u_proto.u_regfile.fp_r[1] == EXT_3_0, "FCMP: destination register FP1 is never written");
+
+        load_fp(0, EXT_2_0);
+        load_fp(1, EXT_2_0);
+        run_cycle(CIR_COMMAND, 1'b1, cmd_word(3'b000, 3'd0, 3'd1, 7'h38), rd); // FCMP: FP1(2.0) vs 2.0
+        repeat (2) @(posedge clk_4x);
+        check(u_top.u_proto.u_regfile.fpsr_r[26] == 1'b1, "FCMP: Z condition code set when both operands are equal");
+
+        load_fp(0, EXT_3_0);
+        load_fp(1, EXT_2_0);
+        run_cycle(CIR_COMMAND, 1'b1, cmd_word(3'b000, 3'd0, 3'd1, 7'h38), rd); // FCMP: FP1(2.0) vs 3.0 -> 2.0-3.0<0
+        repeat (2) @(posedge clk_4x);
+        check(u_top.u_proto.u_regfile.fpsr_r[27] == 1'b1, "FCMP: N condition code set when FPn < source");
+
+        // ── FTST: tests the SOURCE operand alone, sets condition codes ───
+        load_fp(0, 96'h0); // +0.0
+        run_cycle(CIR_COMMAND, 1'b1, cmd_word(3'b000, 3'd0, 3'd1, 7'h3A), rd); // FTST +0.0
+        repeat (2) @(posedge clk_4x);
+        check(u_top.u_proto.u_regfile.fpsr_r[26] == 1'b1, "FTST: Z condition code set for a zero source operand");
+
+        load_fp(0, EXT_N1_0);
+        run_cycle(CIR_COMMAND, 1'b1, cmd_word(3'b000, 3'd0, 3'd1, 7'h3A), rd); // FTST -1.0
+        repeat (2) @(posedge clk_4x);
+        check(u_top.u_proto.u_regfile.fpsr_r[27] == 1'b1, "FTST: N condition code set for a negative source operand");
+
         $display("---");
         $display("%0d passed, %0d failed", pass_count, fail_count);
         if (fail_count != 0) begin

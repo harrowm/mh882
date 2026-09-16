@@ -1,6 +1,6 @@
 # MC68882 FPU — Phased Scope Plan
 
-## Status: Phases 0-3 complete. Phase 4a (FADD/FSUB) complete. Phase 4b in progress (FMUL, FDIV done; SQRT/transcendentals/FABS/FNEG/FCMP/FTST next).
+## Status: Phases 0-3 complete. Phase 4a (FADD/FSUB) complete. Phase 4b in progress (FMUL/FDIV/FABS/FNEG/FCMP/FTST done; FSQRT/transcendentals next).
 
 ## Origin
 
@@ -531,6 +531,27 @@ narrow first step toward real accrued-exception-byte semantics (Phase
 mantissa divide, the trickier of the two normalization paths), 6.0/2.0=
 3.0, -6.0/2.0=-3.0 (sign combination), and 1.0/0.0 → +Infinity with the
 DZ bit set. All 6 passed on the first run.
+
+**FABS ($18), FNEG ($1A), FCMP ($38), FTST ($3A), COMPLETE**: no new
+`m68882_apu.sv` code needed — all four are simple enough to wire
+directly in `rtl/m68882_proto.sv`. FABS/FNEG are a plain sign-bit
+operation on the SOURCE (RX) operand (clear/flip bit95), written to the
+destination (RY) same as any other opclass-000 op, with condition codes
+computed from the result as usual. FCMP reuses `fp_add_sub`'s own
+subtraction path directly (Section 4.5.5.1: FCMP sets condition codes
+"as if" FPn-source were computed) by widening the task's own `is_sub`
+input to `is_fsub || is_fcmp` — the only new logic needed was skipping
+the register write for FCMP (and FTST) specifically, since neither
+instruction is supposed to modify any register, only FPSR's condition
+codes. FTST classifies the SOURCE operand alone (no arithmetic at all)
+via the existing `is_zero_fpx`/`is_inf_fpx`/`is_nan_fpx` functions.
+
+**Verified**: `tb/m68882_apu_tb.sv` gained 9 more checks (30/30 total) —
+FABS on a negative and an already-positive operand, FNEG including a
+double-negation round trip, FCMP confirming the destination register is
+genuinely never written plus both a Z-set (equal) and N-set (FPn<source)
+comparison, and FTST's Z/N condition codes from a zero and a negative
+source operand respectively.
 
 #### Phase 4c — External-operand format conversion (not started)
 Phase 3's own Operand CIR transfer path is still a raw-bytes stub (no

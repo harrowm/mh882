@@ -281,11 +281,11 @@ m68882_top            Pin-compatible top level. clk_4x is a plain port (Phase 1
 │                       6 opclasses; arithmetic/format-conversion stubbed, see Current State)
 ├── m68882_regfile      FP0-FP7 (96-bit each), FPCR, FPSR, FPIAR (IMPLEMENTED, Phase 3)
 ├── m68882_cu           Conversion unit (format conversion, 68882-only pipeline stage) (Phase 6)
-├── m68882_apu          Arithmetic processing unit. FADD/FSUB/FMUL/FDIV register-to-
-│                       register IMPLEMENTED (Phase 4a/4b, real extended-precision
-│                       add/subtract/multiply/divide, all 4 rounding modes); SQRT/
-│                       transcendentals/FABS/FNEG/FCMP/FTST and format conversion
-│                       still Phase 4b/4c (see Current State/plan.md)
+├── m68882_apu          Arithmetic processing unit. FADD/FSUB/FMUL/FDIV/FABS/FNEG/
+│                       FCMP/FTST register-to-register IMPLEMENTED (Phase 4a/4b, real
+│                       extended-precision arithmetic, all 4 rounding modes); FSQRT/
+│                       transcendentals and format conversion still Phase 4b/4c (see
+│                       Current State/plan.md)
 └── m68882_frame        FSAVE/FRESTORE state-frame generation and parsing (Phase 5)
 ```
 
@@ -435,17 +435,25 @@ toward Phase 4d's own real accrued-exception-byte semantics). All 12 new
 Phase 4a's own carry-out fix generalized cleanly to both, no repeat of
 that bug.
 
+**FABS ($18)/FNEG ($1A)/FCMP ($38)/FTST ($3A) are also implemented** —
+no new `m68882_apu.sv` code needed. FABS/FNEG are a plain sign-bit flip
+on the source operand; FCMP reuses `fp_add_sub`'s own subtraction path
+(widening its `is_sub` input to `is_fsub || is_fcmp`) but skips the
+register write; FTST classifies the source operand alone via the
+existing `is_zero_fpx`/`is_inf_fpx`/`is_nan_fpx` functions, also with no
+register write. 9 more `tb/m68882_apu_tb.sv` checks (30/30 total).
+
 **NOT yet implemented** (explicitly, not silently): FSQRT/
-transcendentals/FABS/FNEG/FCMP/FTST (Phase 4b, remaining — extension-
-field opcodes already confirmed); real B/W/L/S/D/X/P-to-extended format
-conversion for external operands (Phase 4c — opclass 010/011 can still
-only move raw bytes, not numbers); denormals (underflow collapses to
-signed zero); real exponent-overflow trap semantics (coarse saturate-to-
+transcendentals (Phase 4b, remaining — extension-field opcodes already
+confirmed); real B/W/L/S/D/X/P-to-extended format conversion for
+external operands (Phase 4c — opclass 010/011 can still only move raw
+bytes, not numbers); denormals (underflow collapses to signed zero);
+real exponent-overflow trap semantics (coarse saturate-to-
 infinity); the rest of the FPSR accrued-exception/exception-status bytes
 beyond OPERR/DZ (Phase 4d).
 
-See `plan.md` for the full phased build plan. Phase 4b (FSQRT next, then
-transcendentals/FABS/FNEG/FCMP/FTST) continues.
+See `plan.md` for the full phased build plan. Phase 4b (FSQRT, then the
+transcendental set) continues.
 
 ```bash
 make test   # builds and runs all three testbenches via Icarus Verilog
