@@ -1,6 +1,6 @@
 # MC68882 FPU — Phased Scope Plan
 
-## Status: Phases 0-3 complete. Phase 4a (FADD/FSUB) complete. Phase 4b in progress (FMUL/FDIV/FABS/FNEG/FCMP/FTST/FSQRT done; only the transcendental set remains).
+## Status: Phases 0-3 complete. Phase 4a complete. Phase 4b: FADD/FSUB/FMUL/FDIV/FABS/FNEG/FCMP/FTST/FSQRT done; the transcendental set (~18 functions) is explicitly deferred. Phase 4c (L/S/D/X format conversion) complete; W/B/P remain. Phase 4d (full exception/accrued-byte semantics) next.
 
 ## Origin
 
@@ -614,11 +614,94 @@ with both the NAN condition code AND (once the OPERR-wiring fix above
 landed) the OPERR exception-status bit confirmed set, and
 sqrt(+0.0)=+0.0.
 
-#### Phase 4c — External-operand format conversion (not started)
-Phase 3's own Operand CIR transfer path is still a raw-bytes stub (no
-real B/W/L/S/D/X/P-to-extended conversion). This needs to land before
-opclass 010/011 (external-operand-to-FPn / FPn-to-external) can compute
-anything for real — right now they can only move bytes, not numbers.
+**Transcendental set ($00-$1F minus the already-implemented $04/$18/
+$1A) — explicitly deferred, not silently dropped.** FSIN/FCOS/FTAN/
+FASIN/FACOS/FATAN/FSINH/FCOSH/FTANH/FATANH/FETOX/FETOXM1/FTWOTOX/
+FTENTOX/FLOGN/FLOGNP1/FLOG10/FLOG2/FGETEXP/FGETMAN/FMOD/FREM/FSCALE/
+FSGLMUL/FSGLDIV/FSINCOS all have confirmed extension-field opcodes
+(Table 4-13) but need genuinely different techniques from anything built
+so far — numerical approximation (polynomial/rational minimax, CORDIC,
+or table-driven) plus real range reduction, each with its own accuracy
+and edge-case analysis, rather than the closed-form bit-manipulation
+algorithms FADD/FMUL/FDIV/FSQRT all shared. This is a materially
+different, larger, and more open-ended body of work than the rest of
+Phase 4b, and less architecturally significant to the project's own
+core goal (a working, protocol-correct, cycle-accurate companion chip)
+than Phase 4c's own remaining gap — real external-operand format
+conversion is needed before opclass 010/011 can do anything but move
+raw bytes, which is a more fundamental correctness gap than any single
+missing transcendental function. Revisit this set later, one function
+at a time, using the same rigor (manual-confirmed opcodes, numeric
+cross-checks, dedicated tests) already established.
+
+#### Phase 4c — External-operand format conversion (L/S/D/X COMPLETE, W/B/P remain)
+Phase 3's own Operand CIR transfer path was a raw-bytes stub (no real
+B/W/L/S/D/X/P-to-extended conversion) — opclass 010/011 could move
+bytes but never compute anything for real. Fixed for 4 of the 7 formats.
+
+`m68882_apu_pkg` gained 6 new tasks in `rtl/m68882_apu.sv`:
+`int32_to_ext`/`ext_to_int32` (Long-Word Integer), `single_to_ext`/
+`ext_to_single` (IEEE-754 binary32), `double_to_ext`/`ext_to_double`
+(IEEE-754 binary64). Extended-Precision (X) needs no conversion task at
+all — it already IS the internal 96-bit format (Table 3-3), so it's a
+pure passthrough. Every EXTERNAL-TO-EXTENDED direction is exact/lossless
+by construction (extended's own 64-bit mantissa has strictly more
+significant bits than any of L/S/D), so only the reverse direction
+(EXTENDED-TO-EXTERNAL, used by opclass 011) needs real rounding —
+implemented via the same guard/round/sticky shape as fp_add_sub/fp_mul/
+fp_div/fp_sqrt, just against each format's own narrower target width
+(24-bit single significand, 53-bit double significand, or truncation to
+a 32-bit integer).
+
+**Wiring into `rtl/m68882_proto.sv`**: since RECEIVE (opclass 010)
+can't convert until ALL chunks have arrived (a raw byte-assembly buffer,
+`xfer_stage_r`, accumulates chunks combinationally — `receive_assembled`
+— as they land, with the actual conversion only computed and LATCHED
+into the register file on the FINAL chunk), while SUPPLY (opclass 011)
+can convert immediately at Command-CIR-dispatch time (the source
+register is already fully available) and simply stage the pre-converted
+bytes (`supply_staged`) to be read out chunk by chunk — a genuine
+asymmetry between the two directions, not an arbitrary implementation
+choice. The existing opclass-110/111 (move-multiple) and opclass-100/101
+(system-control-register) paths are untouched — they never needed
+conversion (always native 32-bit/96-bit values) and still use the
+original raw chunked `fp_wr_en`/`fp_rd_data` ports directly.
+
+**Two real bugs found via direct numeric testing, not inspection**:
+1. Icarus rejected `x.mant[drop-1]`-style variable-index bit-selects in
+   `ext_to_int32` (`drop` is data-dependent, not a compile-time
+   constant) — fixed by rewriting the guard/round/sticky extraction
+   using dynamic SHIFTS and a MASK instead (`x.mant >> k` and
+   `(1<<k)-1`, both fine with a variable `k`), never a variable
+   part-select — the same category of Icarus limitation already worked
+   around elsewhere in this project (see the earlier `first_set_from`
+   function-call-part-select fix, Phase 3).
+2. A plain off-by-one in `int32_to_ext`'s own exponent formula (used the
+   constant 31 instead of 32) — converting the integer 5 produced an
+   exponent one too LOW (4.0's own exponent instead of the correct
+   value for 5.0), while the MANTISSA came out completely correct (the
+   shift-amount formula that produces the mantissa was derived
+   independently and happened to be right) — a good illustration of why
+   checking the FULL result against a known-good value matters even
+   when a quick glance at part of the output (the mantissa bits) looks
+   plausible.
+
+**Verified**: `tb/m68882_proto_tb.sv` gained 12 more checks (27/27
+total) — Long-Word-Integer round trip for +5 and -5 (sign handling),
+Single-Precision round trip for 3.5 (0x40600000, a well-known IEEE
+bit pattern), Double-Precision round trip for 3.5 across its own 2
+chunks (0x400C000000000000), and Extended-Precision's own pure
+3-chunk passthrough in both directions.
+
+**NOT yet implemented** (explicitly, not silently, matching this
+project's own established practice for scope boundaries): Word Integer
+(W) and Byte Integer (B) — the same conversion CLASS as Long-Word (a
+signed integer, just narrower), genuinely lower effort to add later than
+any of the classes already done; Packed Decimal (P) — a wholly
+different, harder class (BCD-encoded digit string, sign, exponent in
+BCD, a static-or-dynamic k-factor controlling output rounding) requiring
+meaningfully more work than any format implemented so far. Both are
+left as a documented remainder of this phase, not a silent gap.
 
 #### Phase 4d — Exception flags and the accrued-exception byte (not started)
 Phase 4a only sets the FPSR condition-code byte and a coarse OPERR flag.

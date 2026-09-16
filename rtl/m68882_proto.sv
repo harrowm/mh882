@@ -101,6 +101,15 @@ module m68882_proto (
     logic        is_ctrl_reg_r;       // 1 = transferring an FPCR/FPSR/FPIAR register, 0 = an FPn
     logic        multi_ctrl_r;        // 1 = this WAIT_XFER dialog is a multi-control-register move
 
+    // Phase 4c: opclass 010/011 (external operand <-> FPn) own state.
+    // is_ctrl_reg_r==0 && state_r==ST_WAIT_XFER already uniquely
+    // identifies this dialog (no other WAIT_XFER user has is_ctrl_reg_r
+    // clear), so no separate "is this an EA transfer" flag is needed.
+    logic [2:0] xfer_fmt_r;    // captured c_rx (data-format code) at command dispatch
+    logic [95:0] xfer_stage_r; // RECEIVE: raw bytes staged as they arrive, converted on
+                                // the last chunk. SUPPLY: pre-converted bytes, staged once
+                                // at command dispatch, read out chunk by chunk.
+
     // ── Register file ──────────────────────────────────────────────
     logic [2:0]  fp_sel;
     logic [1:0]  fp_chunk_idx;
@@ -259,6 +268,69 @@ module m68882_proto (
         end
     end
 
+    // ── Phase 4c: external-operand format conversion ────────────────────
+    //
+    // SUPPLY (opclass 011, FPn -> external): the source register
+    // (apu_b_rd, since apu_b_sel==c_ry, and reg_idx_r is ALSO set to
+    // c_ry for this opclass -- the same register) is converted to the
+    // target format the moment the Command CIR is written, staged into
+    // xfer_stage_r, and then just read out chunk by chunk -- exactly
+    // like the pre-Phase-4c raw-passthrough path did, except the value
+    // staged is now a real conversion instead of the raw register bits.
+    logic [31:0] supply_int32;
+    logic [31:0] supply_single;
+    logic [63:0] supply_double;
+    logic        supply_int32_operr, supply_single_operr, supply_double_operr;
+    logic [95:0] supply_staged;
+
+    always_comb begin
+        ext_to_int32(apu_b_rd, round_mode_t'(fpcr_o[5:4]), supply_int32, supply_int32_operr);
+        ext_to_single(apu_b_rd, round_mode_t'(fpcr_o[5:4]), supply_single, supply_single_operr);
+        ext_to_double(apu_b_rd, round_mode_t'(fpcr_o[5:4]), supply_double, supply_double_operr);
+
+        unique case (c_rx)
+            FMT_L:   supply_staged = {supply_int32, 64'h0};
+            FMT_S:   supply_staged = {supply_single, 64'h0};
+            FMT_D:   supply_staged = {supply_double, 32'h0};
+            FMT_X:   supply_staged = apu_b_rd; // native format, pure passthrough
+            default: supply_staged = 96'h0; // W/B/P: not yet implemented (Phase 4c scope)
+        endcase
+    end
+
+    // RECEIVE (opclass 010, external -> FPn): raw chunks are staged as
+    // they arrive; receive_assembled is what xfer_stage_r WOULD hold
+    // once the CURRENT chunk (d_in) is folded in, computed combinationally
+    // so the conversion on the FINAL chunk doesn't have to wait a tick
+    // for xfer_stage_r's own registered update to catch up.
+    logic [95:0] receive_assembled;
+    always_comb begin
+        receive_assembled = xfer_stage_r;
+        unique case (chunk_idx_r)
+            2'd0: receive_assembled[95:64] = d_in;
+            2'd1: receive_assembled[63:32] = d_in;
+            2'd2: receive_assembled[31:0]  = d_in;
+            default: ;
+        endcase
+    end
+
+    logic [95:0] receive_int32_ext, receive_single_ext, receive_double_ext;
+    always_comb begin
+        int32_to_ext(receive_assembled[95:64], receive_int32_ext);
+        single_to_ext(receive_assembled[95:64], receive_single_ext);
+        double_to_ext(receive_assembled[95:32], receive_double_ext);
+    end
+
+    logic [95:0] receive_converted;
+    always_comb begin
+        unique case (xfer_fmt_r)
+            FMT_L:   receive_converted = receive_int32_ext;
+            FMT_S:   receive_converted = receive_single_ext;
+            FMT_D:   receive_converted = receive_double_ext;
+            FMT_X:   receive_converted = receive_assembled; // native format, pure passthrough
+            default: receive_converted = 96'h0; // W/B/P: not yet implemented
+        endcase
+    end
+
     // Condition CIR predicate field + FPSR Z bit (combinational)
     wire [5:0] cond_pred = d_in[21:16];
     wire       fpsr_z    = fpsr_o[26];
@@ -319,6 +391,8 @@ module m68882_proto (
             chunks_left_r <= 2'h0;
             is_ctrl_reg_r <= 1'b0;
             multi_ctrl_r  <= 1'b0;
+            xfer_fmt_r    <= 3'h0;
+            xfer_stage_r  <= 96'h0;
             fp_wr_en      <= 1'b0;
             fp_wr_sel_r   <= 3'h0;
             fp_wr_chunk_r <= 2'h0;
@@ -404,6 +478,8 @@ module m68882_proto (
                                 reg_idx_r     <= c_ry;
                                 chunk_idx_r   <= 2'h0;
                                 chunks_left_r <= chunks_for_bytes(fmt_bytes(c_rx));
+                                xfer_fmt_r    <= c_rx;
+                                xfer_stage_r  <= 96'h0; // Phase 4c: format-conversion staging buffer
                                 state_r       <= ST_WAIT_XFER;
                             end
                             3'b011: begin // FPm to external destination
@@ -415,6 +491,8 @@ module m68882_proto (
                                 reg_idx_r     <= c_ry; // source FPm
                                 chunk_idx_r   <= 2'h0;
                                 chunks_left_r <= chunks_for_bytes(fmt_bytes(c_rx));
+                                xfer_fmt_r    <= c_rx;
+                                xfer_stage_r  <= supply_staged; // Phase 4c: pre-converted at dispatch
                                 state_r       <= ST_WAIT_XFER;
                             end
                             3'b100: begin // move to system control register(s)
@@ -490,7 +568,23 @@ module m68882_proto (
                                 ctrl_wr_en    <= 1'b1;
                                 ctrl_wr_sel_r <= reg_idx_r[1:0]; // pre-advance value
                                 ctrl_wr_data  <= d_in;
+                            end else if (state_r == ST_WAIT_XFER) begin
+                                // Phase 4c: opclass 010 external-operand-to-FPn --
+                                // stage the raw chunk every access; on the LAST
+                                // chunk, also issue the real converted value (a
+                                // whole-register write, reusing the APU's own
+                                // write port rather than the chunked fp_wr_en
+                                // path FMOVEM/ctrl-register moves use below).
+                                xfer_stage_r <= receive_assembled;
+                                if (chunks_left_r <= 2'd1) begin
+                                    apu_wr_en   <= 1'b1;
+                                    apu_wr_sel  <= reg_idx_r; // pre-advance value
+                                    apu_wr_data <= receive_converted;
+                                end
                             end else begin
+                                // opclass 110 move-multiple-to-FPn: each chunk
+                                // is already a genuine native 32-bit slice of
+                                // the internal 96-bit format -- no conversion.
                                 fp_wr_en      <= 1'b1;
                                 fp_wr_sel_r   <= reg_idx_r;      // pre-advance value
                                 fp_wr_chunk_r <= chunk_idx_r;    // pre-advance value
@@ -568,7 +662,24 @@ module m68882_proto (
             end
             CIR_OPERAND: if (dr_r && (state_r == ST_WAIT_XFER || state_r == ST_WAIT_MULTI_XFER)) begin
                 d_oe  = 1'b1;
-                d_out = is_ctrl_reg_r ? ctrl_rd_data : fp_rd_data;
+                if (is_ctrl_reg_r) begin
+                    d_out = ctrl_rd_data;
+                end else if (state_r == ST_WAIT_XFER) begin
+                    // Phase 4c: opclass 011 FPn-to-external -- read out the
+                    // pre-converted staging buffer (supply_staged, latched
+                    // at command dispatch) chunk by chunk, not the raw
+                    // register value fp_rd_data would present.
+                    unique case (chunk_idx_r)
+                        2'd0: d_out = xfer_stage_r[95:64];
+                        2'd1: d_out = xfer_stage_r[63:32];
+                        2'd2: d_out = xfer_stage_r[31:0];
+                        default: d_out = 32'h0;
+                    endcase
+                end else begin
+                    // opclass 111 move-multiple-from-FPn: native format,
+                    // no conversion.
+                    d_out = fp_rd_data;
+                end
             end
             default: ;
         endcase

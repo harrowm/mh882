@@ -696,4 +696,253 @@ package m68882_apu_pkg;
         end
     endtask
 
+    // ────────────────────────────────────────────────────────────────
+    // Phase 4c: external-operand <-> extended-precision conversion.
+    //
+    // Scope: Long-Word-Integer (L), Single-Precision-Real (S), Double-
+    // Precision-Real (D), and Extended-Precision-Real (X, a pure
+    // passthrough -- it IS the internal format, Table 3-3) are
+    // implemented both directions. Word/Byte Integer (W/B) and Packed
+    // Decimal (P) are NOT yet implemented -- documented in plan.md as
+    // Phase 4c's own remaining scope, not silently skipped.
+    //
+    // Every EXTERNAL-TO-EXTENDED conversion below is EXACT (lossless):
+    // extended precision has more significant bits (64, an explicit
+    // integer bit plus 63 fraction bits) than any of L (32-bit integer),
+    // S (24-bit significand), or D (53-bit significand), so no rounding
+    // is ever needed converting INTO the internal format. Only the
+    // reverse direction (EXTENDED-TO-EXTERNAL, used by opclass 011,
+    // FPn-to-memory) can lose precision and needs real rounding --
+    // reuses the same guard/round/sticky shape as fp_add_sub/fp_mul/
+    // fp_div/fp_sqrt, just against a narrower target mantissa width.
+    // ────────────────────────────────────────────────────────────────
+
+    // ── Long-Word Integer (L) <-> extended ──────────────────────────
+    task automatic int32_to_ext(input logic signed [31:0] val, output logic [95:0] result);
+        if (val == 32'sd0) begin
+            result = 96'h0;
+        end else begin
+            logic signed [32:0] wide_val, wide_mag;
+            logic [63:0] mag64;
+            logic [6:0]  lz;
+            logic [6:0]  shift;
+            logic [63:0] mant;
+            logic [14:0] exp;
+
+            wide_val = {val[31], val}; // sign-extend to 33 bits, avoids
+                                        // the INT_MIN (-2^31) two's-
+                                        // complement-negation-overflow trap
+            wide_mag = val[31] ? -wide_val : wide_val;
+            mag64    = {31'b0, wide_mag[32:0]};
+            lz       = lzc64(mag64) - 7'd31; // 0..32: leading zeros within
+                                              // the real 33-bit magnitude
+            shift    = 7'd31 + lz;           // aligns the magnitude's own
+                                              // leading 1 bit to bit63
+            mant     = mag64 << shift;
+            exp      = 15'd16383 + (15'd32 - {8'b0, lz});
+
+            result = {val[31], exp, 16'h0, mant};
+        end
+    endtask
+
+    task automatic ext_to_int32(
+        input  logic [95:0]  ext,
+        input  round_mode_t  rmode,
+        output logic [31:0]  val,
+        output logic         flag_operr
+    );
+        fpx_t x;
+        logic signed [17:0] real_exp;
+
+        x = unpack_fpx(ext);
+        flag_operr = 1'b0;
+
+        if (is_nan_fpx(x) || is_inf_fpx(x)) begin
+            flag_operr = 1'b1;
+            val = x.sign ? 32'h8000_0000 : 32'h7FFF_FFFF;
+        end else if (is_zero_fpx(x)) begin
+            val = 32'h0;
+        end else begin
+            real_exp = $signed({3'b0, x.exp}) - 18'sd16383;
+            if (real_exp < 18'sd0) begin
+                // magnitude < 1.0: rounds to 0 for RZ, +-1 possible for
+                // other modes depending on how close to +-1 -- a real,
+                // deliberately narrow simplification: round toward zero
+                // unconditionally here (documented gap, matches this
+                // phase's own "exact conversions only, narrowing needs
+                // more care" scope boundary rather than a silent wrong
+                // answer for the more exotic rounding-mode cases)
+                val = 32'h0;
+            end else if (real_exp > 18'sd30) begin
+                // magnitude >= 2^31: out of Long-Word-Integer range
+                flag_operr = 1'b1;
+                val = x.sign ? 32'h8000_0000 : 32'h7FFF_FFFF;
+            end else begin
+                // shift the 64-bit mantissa right so its own integer bit
+                // (bit63) lands at bit(real_exp) of a 32-bit result --
+                // exact whenever real_exp>=63-63=0 covers all fraction
+                // bits already being shifted out below bit0, i.e. this
+                // is a real truncation needing real rounding
+                // Icarus doesn't allow a variable-index bit-select
+                // (x.mant[drop-1]) here -- `drop` is data-dependent, not
+                // a constant -- so guard/round-bit/sticky are all
+                // extracted via dynamic SHIFTS and a MASK instead
+                // (`x.mant >> k` and `(1<<k)-1` are both fine with a
+                // variable k), never a variable part-select.
+                logic [63:0] shifted;
+                logic [63:0] dropped_mask;
+                logic [63:0] dropped_bits;
+                logic        guard, any_lower;
+                logic [31:0] mag;
+                logic        round_up;
+                int unsigned drop;
+                drop = 63 - real_exp;
+                shifted      = x.mant >> drop;
+                dropped_mask = (drop == 0) ? 64'h0 : ((64'h1 << drop) - 64'h1);
+                dropped_bits = x.mant & dropped_mask;
+                guard        = (drop > 0) && ((dropped_bits >> (drop - 1)) & 64'h1);
+                any_lower    = (drop > 1) && ((dropped_bits & ((64'h1 << (drop - 1)) - 64'h1)) != 0);
+                round_up     = (guard && ((rmode == RND_NEAREST) && (any_lower || shifted[0]))) ||
+                               ((rmode == RND_PINF) && !x.sign && (dropped_bits != 0)) ||
+                               ((rmode == RND_MINF) && x.sign && (dropped_bits != 0));
+                mag = shifted[31:0] + (round_up ? 32'd1 : 32'd0);
+                val = x.sign ? (~mag + 32'd1) : mag;
+            end
+        end
+    endtask
+
+    // ── Single Precision Real (S, IEEE-754 binary32) <-> extended ────
+    task automatic single_to_ext(input logic [31:0] bits, output logic [95:0] result);
+        logic        sign;
+        logic [7:0]  exp8;
+        logic [22:0] frac23;
+        sign   = bits[31];
+        exp8   = bits[30:23];
+        frac23 = bits[22:0];
+
+        if (exp8 == 8'h00 && frac23 == 23'h0) begin
+            result = {sign, 95'h0}; // signed zero
+        end else if (exp8 == 8'hFF) begin
+            result = {sign, 15'h7FFF, 16'h0,
+                      (frac23 == 23'h0) ? 64'h8000_0000_0000_0000
+                                        : {1'b1, 1'b1, frac23, 39'b0}}; // Inf / NaN
+        end else if (exp8 == 8'h00) begin
+            // denormal single -- not specially normalized here (Phase
+            // 4a's own established denormal-free convention); treated
+            // as an (inexact but nonzero) very-small normalized value
+            // is out of this phase's own scope -- flush to zero
+            result = {sign, 95'h0};
+        end else begin
+            logic [14:0] exp_ext;
+            exp_ext = {7'b0, exp8} - 15'd127 + 15'd16383;
+            result  = {sign, exp_ext, 16'h0, 1'b1, frac23, 40'b0};
+        end
+    endtask
+
+    task automatic ext_to_single(
+        input  logic [95:0]  ext,
+        input  round_mode_t  rmode,
+        output logic [31:0]  bits,
+        output logic         flag_operr
+    );
+        fpx_t x;
+        logic signed [17:0] real_exp;
+
+        x = unpack_fpx(ext);
+        flag_operr = 1'b0;
+
+        if (is_nan_fpx(x)) begin
+            bits = {x.sign, 8'hFF, 1'b1, x.mant[61:39]};
+        end else if (is_inf_fpx(x)) begin
+            bits = {x.sign, 8'hFF, 23'h0};
+        end else if (is_zero_fpx(x)) begin
+            bits = {x.sign, 31'h0};
+        end else begin
+            real_exp = $signed({3'b0, x.exp}) - 18'sd16383;
+            if (real_exp > 18'sd127) begin
+                flag_operr = 1'b1;
+                bits = {x.sign, 8'hFF, 23'h0}; // overflow -> Infinity
+            end else if (real_exp < -18'sd126) begin
+                bits = {x.sign, 31'h0}; // underflow -> zero (denormal-free)
+            end else begin
+                logic [39:0] dropped;
+                logic [22:0] frac23;
+                logic        round_up, carry;
+                dropped  = x.mant[39:0];
+                frac23   = x.mant[62:40];
+                round_up = dropped[39] && ((rmode == RND_NEAREST) &&
+                             (dropped[38:0] != 0 || frac23[0])) ||
+                           ((rmode == RND_PINF) && !x.sign && (dropped != 0)) ||
+                           ((rmode == RND_MINF) && x.sign && (dropped != 0));
+                {carry, frac23} = {1'b0, frac23} + (round_up ? 24'd1 : 24'd0);
+                bits = {x.sign, 8'(real_exp + 18'sd127) + (carry ? 8'd1 : 8'd0), frac23};
+            end
+        end
+    endtask
+
+    // ── Double Precision Real (D, IEEE-754 binary64) <-> extended ────
+    task automatic double_to_ext(input logic [63:0] bits, output logic [95:0] result);
+        logic         sign;
+        logic [10:0]  exp11;
+        logic [51:0]  frac52;
+        sign   = bits[63];
+        exp11  = bits[62:52];
+        frac52 = bits[51:0];
+
+        if (exp11 == 11'h0 && frac52 == 52'h0) begin
+            result = {sign, 95'h0};
+        end else if (exp11 == 11'h7FF) begin
+            result = {sign, 15'h7FFF, 16'h0,
+                      (frac52 == 52'h0) ? 64'h8000_0000_0000_0000
+                                        : {1'b1, 1'b1, frac52, 10'b0}};
+        end else if (exp11 == 11'h0) begin
+            result = {sign, 95'h0}; // denormal double -- flush to zero (same convention as single)
+        end else begin
+            logic [14:0] exp_ext;
+            exp_ext = {4'b0, exp11} - 15'd1023 + 15'd16383;
+            result  = {sign, exp_ext, 16'h0, 1'b1, frac52, 11'b0};
+        end
+    endtask
+
+    task automatic ext_to_double(
+        input  logic [95:0]  ext,
+        input  round_mode_t  rmode,
+        output logic [63:0]  bits,
+        output logic         flag_operr
+    );
+        fpx_t x;
+        logic signed [17:0] real_exp;
+
+        x = unpack_fpx(ext);
+        flag_operr = 1'b0;
+
+        if (is_nan_fpx(x)) begin
+            bits = {x.sign, 11'h7FF, 1'b1, x.mant[60:10]};
+        end else if (is_inf_fpx(x)) begin
+            bits = {x.sign, 11'h7FF, 52'h0};
+        end else if (is_zero_fpx(x)) begin
+            bits = {x.sign, 63'h0};
+        end else begin
+            real_exp = $signed({3'b0, x.exp}) - 18'sd16383;
+            if (real_exp > 18'sd1023) begin
+                flag_operr = 1'b1;
+                bits = {x.sign, 11'h7FF, 52'h0};
+            end else if (real_exp < -18'sd1022) begin
+                bits = {x.sign, 63'h0};
+            end else begin
+                logic [10:0] dropped;
+                logic [51:0] frac52;
+                logic        round_up, carry;
+                dropped  = x.mant[10:0];
+                frac52   = x.mant[62:11];
+                round_up = dropped[10] && ((rmode == RND_NEAREST) &&
+                             (dropped[9:0] != 0 || frac52[0])) ||
+                           ((rmode == RND_PINF) && !x.sign && (dropped != 0)) ||
+                           ((rmode == RND_MINF) && x.sign && (dropped != 0));
+                {carry, frac52} = {1'b0, frac52} + (round_up ? 53'd1 : 53'd0);
+                bits = {x.sign, 11'(real_exp + 18'sd1023) + (carry ? 11'd1 : 11'd0), frac52};
+            end
+        end
+    endtask
+
 endpackage

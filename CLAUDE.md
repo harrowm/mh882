@@ -467,17 +467,39 @@ bit10). 6 more `tb/m68882_apu_tb.sv` checks (36/36 total) — sqrt(4.0),
 sqrt(2.25), sqrt(9.0) (odd-exponent path), sqrt(-4.0)→NaN+OPERR,
 sqrt(+0.0)=+0.0.
 
+**Phase 4c (external-operand format conversion) is also implemented for
+Long-Word-Integer (L), Single-Precision (S), Double-Precision (D), and
+Extended-Precision (X, a pure passthrough — it already IS the internal
+format)**: `m68882_apu_pkg` gained `int32_to_ext`/`ext_to_int32`,
+`single_to_ext`/`ext_to_single`, `double_to_ext`/`ext_to_double`. Every
+EXTERNAL-TO-EXTENDED direction is exact/lossless (extended has strictly
+more mantissa bits than L/S/D); only EXTENDED-TO-EXTERNAL needs real
+rounding, reusing the same guard/round/sticky shape as the arithmetic
+tasks. Wired into `rtl/m68882_proto.sv` with a genuine RECEIVE/SUPPLY
+asymmetry: RECEIVE (opclass 010) assembles raw chunks combinationally
+and converts only once the LAST chunk arrives; SUPPLY (opclass 011)
+converts immediately at command dispatch (the source register is
+already available) and stages the result for chunk-by-chunk readout.
+Two real bugs found via direct numeric testing: Icarus rejected a
+variable-index bit-select in `ext_to_int32` (fixed via dynamic
+shift+mask instead, the same category of fix as an earlier Phase 3
+issue); and a plain off-by-one in `int32_to_ext`'s own exponent formula
+(31 instead of 32) that produced a subtly wrong exponent while the
+mantissa came out completely correct — a reminder to check the FULL
+result, not just the part that looks right at a glance. 12 more
+`tb/m68882_proto_tb.sv` checks (27/27 total).
+
 **NOT yet implemented** (explicitly, not silently): the transcendental
 set (Phase 4b's own remaining scope — extension-field opcodes already
-confirmed); real B/W/L/S/D/X/P-to-extended format conversion for
-external operands (Phase 4c — opclass 010/011 can still only move raw
-bytes, not numbers); denormals (underflow collapses to signed zero);
-real exponent-overflow trap semantics (coarse saturate-to-infinity); the
-rest of the FPSR accrued-exception/exception-status bytes beyond
-OPERR/DZ (Phase 4d).
+confirmed); Word/Byte Integer and Packed Decimal formats (Phase 4c's own
+remaining scope — W/B are the same class as the already-done L, just
+narrower; P is a genuinely harder BCD-based format); denormals
+(underflow collapses to signed zero); real exponent-overflow trap
+semantics (coarse saturate-to-infinity); the rest of the FPSR accrued-
+exception/exception-status bytes beyond OPERR/DZ (Phase 4d).
 
-See `plan.md` for the full phased build plan. Phase 4b's own remaining
-scope (the transcendental set) continues.
+See `plan.md` for the full phased build plan. Phase 4d (exception/
+accrued-byte semantics) is next.
 
 ```bash
 make test   # builds and runs all three testbenches via Icarus Verilog

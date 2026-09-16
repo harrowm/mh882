@@ -113,31 +113,41 @@ module m68882_proto_tb;
         return {opclass, rx, ry, ext, 16'h0};
     endfunction
 
+    // 5.0 in extended precision: 1.01(binary)*2^2, exp=16385=0x4001,
+    // mantissa=0xA000000000000000.
+    localparam logic [95:0] EXT_5_0 = 96'h4001_0000_a000_0000_0000_0000;
+    // 3.5 in extended precision: 1.11(binary)*2^1, exp=16384=0x4000,
+    // mantissa=0xE000000000000000.
+    localparam logic [95:0] EXT_3_5 = 96'h4000_0000_e000_0000_0000_0000;
+
     initial begin
         repeat (4) @(posedge clk_4x);
         rst_n = 1'b1;
         repeat (4) @(posedge clk_4x);
 
-        // ── opclass 010: external operand (Long, 1 chunk) -> FP3 ────────
+        // ── opclass 010: external Long-Word-Integer operand (5) -> FP3 ──
+        // Phase 4c real conversion: 5 (0x00000005) as a signed 32-bit
+        // integer converts to extended precision 5.0 = 1.01(binary)*2^2,
+        // exp=16385=0x4001, mantissa=0xA000000000000000 (EXT_5_0 below).
         run_cycle(CIR_COMMAND, 1'b1, cmd_word(3'b010, FMT_L, 3'd3, 7'd0), rd);
         run_cycle(CIR_RESPONSE, 1'b0, 32'h0, rd);
         check(rd[31:16] == {1'b1, 1'b0, 1'b0, 13'(PRIM_EVAL_EA)},
               "opclass 010: Response = CA=1,DR=0,PRIM_EVAL_EA");
-        run_cycle(CIR_OPERAND, 1'b1, 32'hCAFE_BABE, rd);
+        run_cycle(CIR_OPERAND, 1'b1, 32'h0000_0005, rd);
         run_cycle(CIR_RESPONSE, 1'b0, 32'h0, rd);
         check(rd[31:16] == 16'h0000, "opclass 010: Response reverts to Null after the transfer");
-        check(u_top.u_proto.u_regfile.fp_r[3][95:64] == 32'hCAFE_BABE,
-              "opclass 010: the transferred value landed in FP3's own storage");
+        check(u_top.u_proto.u_regfile.fp_r[3] == EXT_5_0,
+              "opclass 010: Long-Word-Integer 5 converts to extended-precision 5.0 in FP3");
 
         repeat (4) @(posedge clk_4x);
 
-        // ── opclass 011: FP3 -> external operand (Long) ─────────────────
+        // ── opclass 011: FP3 (5.0) -> external Long-Word-Integer operand ─
         run_cycle(CIR_COMMAND, 1'b1, cmd_word(3'b011, FMT_L, 3'd3, 7'd0), rd);
         run_cycle(CIR_RESPONSE, 1'b0, 32'h0, rd);
         check(rd[31:16] == {1'b1, 1'b0, 1'b1, 13'(PRIM_EVAL_EA)},
               "opclass 011: Response = CA=1,DR=1,PRIM_EVAL_EA");
         run_cycle(CIR_OPERAND, 1'b0, 32'h0, rd);
-        check(rd == 32'hCAFE_BABE, "opclass 011: FP3's own stored value is supplied back out");
+        check(rd == 32'h0000_0005, "opclass 011: FP3's own extended 5.0 converts back to the integer 5");
         run_cycle(CIR_RESPONSE, 1'b0, 32'h0, rd);
         check(rd[31:16] == 16'h0000, "opclass 011: Response reverts to Null after the transfer");
 
@@ -196,6 +206,85 @@ module m68882_proto_tb;
               "opclass 110: FP0 received its own 3 chunks in order");
         check(u_top.u_proto.u_regfile.fp_r[1] == {32'hA000_0003, 32'hA000_0004, 32'hA000_0005},
               "opclass 110: FP1 received its own 3 chunks in order");
+
+        repeat (4) @(posedge clk_4x);
+
+        // ── opclass 010: Long-Word-Integer -5 -> FP4 (negative, sign
+        // handling) -- -5.0 = -1.01(binary)*2^2, same exp/mantissa as
+        // +5.0 with the sign bit set.
+        run_cycle(CIR_COMMAND, 1'b1, cmd_word(3'b010, FMT_L, 3'd4, 7'd0), rd);
+        run_cycle(CIR_RESPONSE, 1'b0, 32'h0, rd);
+        run_cycle(CIR_OPERAND, 1'b1, 32'hFFFF_FFFB, rd); // -5 two's complement
+        run_cycle(CIR_RESPONSE, 1'b0, 32'h0, rd);
+        check(u_top.u_proto.u_regfile.fp_r[4] == {1'b1, EXT_5_0[94:0]},
+              "opclass 010: Long-Word-Integer -5 converts to extended-precision -5.0");
+
+        repeat (4) @(posedge clk_4x);
+
+        // ── opclass 010: Single-Precision-Real 3.5 -> FP4 ────────────────
+        // 3.5f = 0x40600000 (well-known IEEE-754 single bit pattern);
+        // extended 3.5 = 1.11(binary)*2^1, exp=16384=0x4000,
+        // mantissa=0xE000000000000000 (EXT_3_5 above).
+        run_cycle(CIR_COMMAND, 1'b1, cmd_word(3'b010, FMT_S, 3'd4, 7'd0), rd);
+        run_cycle(CIR_RESPONSE, 1'b0, 32'h0, rd);
+        run_cycle(CIR_OPERAND, 1'b1, 32'h4060_0000, rd);
+        run_cycle(CIR_RESPONSE, 1'b0, 32'h0, rd);
+        check(u_top.u_proto.u_regfile.fp_r[4] == EXT_3_5,
+              "opclass 010: Single-Precision 3.5 converts to extended-precision 3.5");
+
+        repeat (4) @(posedge clk_4x);
+
+        // ── opclass 011: FP4 (3.5) -> Single-Precision-Real ──────────────
+        run_cycle(CIR_COMMAND, 1'b1, cmd_word(3'b011, FMT_S, 3'd4, 7'd0), rd);
+        run_cycle(CIR_RESPONSE, 1'b0, 32'h0, rd);
+        run_cycle(CIR_OPERAND, 1'b0, 32'h0, rd);
+        check(rd == 32'h4060_0000, "opclass 011: extended-precision 3.5 converts back to Single-Precision 3.5");
+
+        repeat (4) @(posedge clk_4x);
+
+        // ── opclass 010: Double-Precision-Real 3.5 -> FP4 (2 chunks) ─────
+        // 3.5 in IEEE double = 0x400C000000000000 (well-known bit pattern).
+        run_cycle(CIR_COMMAND, 1'b1, cmd_word(3'b010, FMT_D, 3'd4, 7'd0), rd);
+        run_cycle(CIR_RESPONSE, 1'b0, 32'h0, rd);
+        run_cycle(CIR_OPERAND, 1'b1, 32'h400C_0000, rd);
+        run_cycle(CIR_OPERAND, 1'b1, 32'h0000_0000, rd);
+        run_cycle(CIR_RESPONSE, 1'b0, 32'h0, rd);
+        check(u_top.u_proto.u_regfile.fp_r[4] == EXT_3_5,
+              "opclass 010: Double-Precision 3.5 (2 chunks) converts to extended-precision 3.5");
+
+        repeat (4) @(posedge clk_4x);
+
+        // ── opclass 011: FP4 (3.5) -> Double-Precision-Real (2 chunks) ───
+        run_cycle(CIR_COMMAND, 1'b1, cmd_word(3'b011, FMT_D, 3'd4, 7'd0), rd);
+        run_cycle(CIR_RESPONSE, 1'b0, 32'h0, rd);
+        run_cycle(CIR_OPERAND, 1'b0, 32'h0, rd);
+        check(rd == 32'h400C_0000, "opclass 011: extended 3.5 converts back to Double-Precision 3.5, chunk 0");
+        run_cycle(CIR_OPERAND, 1'b0, 32'h0, rd);
+        check(rd == 32'h0000_0000, "opclass 011: extended 3.5 converts back to Double-Precision 3.5, chunk 1");
+
+        repeat (4) @(posedge clk_4x);
+
+        // ── opclass 010/011: Extended-Precision-Real (X) is a pure
+        // passthrough -- 3 chunks, no conversion at all.
+        run_cycle(CIR_COMMAND, 1'b1, cmd_word(3'b010, FMT_X, 3'd5, 7'd0), rd);
+        run_cycle(CIR_RESPONSE, 1'b0, 32'h0, rd);
+        run_cycle(CIR_OPERAND, 1'b1, 32'h1111_2222, rd);
+        run_cycle(CIR_OPERAND, 1'b1, 32'h3333_4444, rd);
+        run_cycle(CIR_OPERAND, 1'b1, 32'h5555_6666, rd);
+        run_cycle(CIR_RESPONSE, 1'b0, 32'h0, rd);
+        check(u_top.u_proto.u_regfile.fp_r[5] == 96'h1111_2222_3333_4444_5555_6666,
+              "opclass 010: Extended-Precision (X) is a pure passthrough into FP5");
+
+        repeat (4) @(posedge clk_4x);
+
+        run_cycle(CIR_COMMAND, 1'b1, cmd_word(3'b011, FMT_X, 3'd5, 7'd0), rd);
+        run_cycle(CIR_RESPONSE, 1'b0, 32'h0, rd);
+        run_cycle(CIR_OPERAND, 1'b0, 32'h0, rd);
+        check(rd == 32'h1111_2222, "opclass 011: Extended-Precision (X) passthrough out of FP5, chunk 0");
+        run_cycle(CIR_OPERAND, 1'b0, 32'h0, rd);
+        check(rd == 32'h3333_4444, "opclass 011: Extended-Precision (X) passthrough out of FP5, chunk 1");
+        run_cycle(CIR_OPERAND, 1'b0, 32'h0, rd);
+        check(rd == 32'h5555_6666, "opclass 011: Extended-Precision (X) passthrough out of FP5, chunk 2");
 
         $display("---");
         $display("%0d passed, %0d failed", pass_count, fail_count);
