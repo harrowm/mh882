@@ -820,10 +820,32 @@ infinity, and a literal division would hit IEEE's indeterminate
 `make test` 8/8 suites clean, 340/340 total**, measured accuracy 0-10
 ULP.
 
+**Phase 9h (FLOGN/FLOGNP1/FLOG10/FLOG2) is also complete — the
+logarithm family.** One shared `fp_logn_core` task computes `ln(x)` via
+the standard atanh-based reduction (`x=m*2^e`, `t=(m-1)/(m+1)`,
+`ln(m)=2*t*P(t^2)` via an 18-term Horner series, `+e*ln2` via
+`int32_to_ext`) — same shared-core shape as `fp_sincos`/`fp_exp_core`.
+FLOG10/FLOG2 scale the result by `ln(a)/ln(10)`/`ln(a)/ln(2)` via
+`fp_div` against the already-established `LN2`/`LN10` constants.
+FLOGNP1 computes `ln(1+a)` via the identity `2*atanh(a/(a+2))` applied
+DIRECTLY to `a` for small `|a|` (avoiding the same absorption-precision
+loss `fp_etoxm1` guards against for `e^a-1`), falling back to
+`fp_logn_core(1+a)` outside that range. **A real bug was found and
+fixed in this session's own Python test-reference generator, not the
+RTL**: the independent `dln(x)` helper was missing the required factor
+of 2 in its own atanh-to-ln conversion, caught by a sanity check
+against the well-known `ln(2)≈0.693`, not by inspection — a reminder
+that an independent reference script still needs its own output
+sanity-checked before being trusted (the same lesson `fp_sincos`'s own
+PI_OVER_2-derivation bug taught at Phase 9d). **APU test grew 119→142
+checks, `make test` 8/8 suites clean, 363/363 total**, measured
+accuracy 0-47 ULP (the one 47-ULP case deliberately probes near
+FLOGNP1's own genuine `x=-1` mathematical singularity).
+
 See `plan.md` for the full phased build plan and the complete list of
-what remains deliberately out of scope (Phase 9h+ — the remaining 10
-log/inverse-trig functions — W/B/P formats, BSUN/INEX1, denormals, and
-the rest).
+what remains deliberately out of scope (Phase 9i+ — the last 4
+functions of the original transcendental set, FACOS/FASIN/FATAN/
+FATANH — W/B/P formats, BSUN/INEX1, denormals, and the rest).
 
 ```bash
 make test   # builds and runs all eight testbenches via Icarus Verilog

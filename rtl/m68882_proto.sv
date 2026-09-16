@@ -450,6 +450,11 @@ module m68882_proto (
     wire cmd_is_fcosh = (cmd_ext_r == 7'h19);
     wire cmd_is_ftanh = (cmd_ext_r == 7'h09);
     wire cmd_is_ftan  = (cmd_ext_r == 7'h0F);
+    // Phase 9h: the logarithm family.
+    wire cmd_is_flogn   = (cmd_ext_r == 7'h14);
+    wire cmd_is_flognp1 = (cmd_ext_r == 7'h06);
+    wire cmd_is_flog10  = (cmd_ext_r == 7'h15);
+    wire cmd_is_flog2   = (cmd_ext_r == 7'h16);
 
     // State-frame format words (Section 6.4.2) -- see plan.md/CLAUDE.md
     // for the full derivation; unchanged from Phase 5.
@@ -584,6 +589,13 @@ module m68882_proto (
     logic        slotA_tanh_z, slotA_tanh_n, slotA_tanh_i, slotA_tanh_nan;
     logic        slotA_tan_z, slotA_tan_n, slotA_tan_i, slotA_tan_nan, slotA_tan_operr;
 
+    // Phase 9h: the logarithm family -- one call site each.
+    logic [95:0] slotA_logn_result, slotA_lognp1_result, slotA_log10_result, slotA_log2_result;
+    logic        slotA_logn_z, slotA_logn_n, slotA_logn_i, slotA_logn_nan, slotA_logn_operr, slotA_logn_dz;
+    logic        slotA_lognp1_z, slotA_lognp1_n, slotA_lognp1_i, slotA_lognp1_nan, slotA_lognp1_operr, slotA_lognp1_dz;
+    logic        slotA_log10_z, slotA_log10_n, slotA_log10_i, slotA_log10_nan, slotA_log10_operr, slotA_log10_dz;
+    logic        slotA_log2_z, slotA_log2_n, slotA_log2_i, slotA_log2_nan, slotA_log2_operr, slotA_log2_dz;
+
     always_comb begin
         fp_int(slotA_a_r, round_mode_t'(slotA_int_round_bits),
                slotA_int_result, slotA_int_z, slotA_int_n, slotA_int_i, slotA_int_nan, slotA_int_inex2);
@@ -615,6 +627,14 @@ module m68882_proto (
         fp_cosh(slotA_a_r, slotA_cosh_result, slotA_cosh_z, slotA_cosh_n, slotA_cosh_i, slotA_cosh_nan);
         fp_tanh(slotA_a_r, slotA_tanh_result, slotA_tanh_z, slotA_tanh_n, slotA_tanh_i, slotA_tanh_nan);
         fp_tan(slotA_a_r, slotA_tan_result, slotA_tan_z, slotA_tan_n, slotA_tan_i, slotA_tan_nan, slotA_tan_operr);
+        fp_logn(slotA_a_r, slotA_logn_result, slotA_logn_z, slotA_logn_n, slotA_logn_i, slotA_logn_nan,
+                slotA_logn_operr, slotA_logn_dz);
+        fp_lognp1(slotA_a_r, slotA_lognp1_result, slotA_lognp1_z, slotA_lognp1_n, slotA_lognp1_i, slotA_lognp1_nan,
+                  slotA_lognp1_operr, slotA_lognp1_dz);
+        fp_log10(slotA_a_r, slotA_log10_result, slotA_log10_z, slotA_log10_n, slotA_log10_i, slotA_log10_nan,
+                 slotA_log10_operr, slotA_log10_dz);
+        fp_log2(slotA_a_r, slotA_log2_result, slotA_log2_z, slotA_log2_n, slotA_log2_i, slotA_log2_nan,
+                slotA_log2_operr, slotA_log2_dz);
     end
 
     // FABS/FNEG (trivial sign-bit ops) and FTST/FMOVE (no real ALU work
@@ -804,6 +824,34 @@ module m68882_proto (
                 slotA_flag_z = slotA_tan_z; slotA_flag_n = slotA_tan_n;
                 slotA_flag_i = slotA_tan_i; slotA_flag_nan = slotA_tan_nan;
                 slotA_flag_operr = slotA_tan_operr; slotA_flag_dz = 1'b0;
+                slotA_flag_ovfl = 1'b0; slotA_flag_unfl = 1'b0; slotA_flag_inex2 = 1'b0;
+            end
+            7'h14: begin // FLOGN
+                slotA_result = slotA_logn_result;
+                slotA_flag_z = slotA_logn_z; slotA_flag_n = slotA_logn_n;
+                slotA_flag_i = slotA_logn_i; slotA_flag_nan = slotA_logn_nan;
+                slotA_flag_operr = slotA_logn_operr; slotA_flag_dz = slotA_logn_dz;
+                slotA_flag_ovfl = 1'b0; slotA_flag_unfl = 1'b0; slotA_flag_inex2 = 1'b0;
+            end
+            7'h06: begin // FLOGNP1
+                slotA_result = slotA_lognp1_result;
+                slotA_flag_z = slotA_lognp1_z; slotA_flag_n = slotA_lognp1_n;
+                slotA_flag_i = slotA_lognp1_i; slotA_flag_nan = slotA_lognp1_nan;
+                slotA_flag_operr = slotA_lognp1_operr; slotA_flag_dz = slotA_lognp1_dz;
+                slotA_flag_ovfl = 1'b0; slotA_flag_unfl = 1'b0; slotA_flag_inex2 = 1'b0;
+            end
+            7'h15: begin // FLOG10
+                slotA_result = slotA_log10_result;
+                slotA_flag_z = slotA_log10_z; slotA_flag_n = slotA_log10_n;
+                slotA_flag_i = slotA_log10_i; slotA_flag_nan = slotA_log10_nan;
+                slotA_flag_operr = slotA_log10_operr; slotA_flag_dz = slotA_log10_dz;
+                slotA_flag_ovfl = 1'b0; slotA_flag_unfl = 1'b0; slotA_flag_inex2 = 1'b0;
+            end
+            7'h16: begin // FLOG2
+                slotA_result = slotA_log2_result;
+                slotA_flag_z = slotA_log2_z; slotA_flag_n = slotA_log2_n;
+                slotA_flag_i = slotA_log2_i; slotA_flag_nan = slotA_log2_nan;
+                slotA_flag_operr = slotA_log2_operr; slotA_flag_dz = slotA_log2_dz;
                 slotA_flag_ovfl = 1'b0; slotA_flag_unfl = 1'b0; slotA_flag_inex2 = 1'b0;
             end
             default: begin // FADD / FSUB / FCMP (identical adder)
@@ -1057,7 +1105,8 @@ module m68882_proto (
                                     cmd_is_fsgldiv || cmd_is_fsglmul || cmd_is_fmod || cmd_is_frem ||
                                     cmd_is_fsin || cmd_is_fcos || cmd_is_fsincos ||
                                     cmd_is_fetox || cmd_is_fetoxm1 || cmd_is_ftwotox || cmd_is_ftentox ||
-                                    cmd_is_fsinh || cmd_is_fcosh || cmd_is_ftanh || cmd_is_ftan) begin
+                                    cmd_is_fsinh || cmd_is_fcosh || cmd_is_ftanh || cmd_is_ftan ||
+                                    cmd_is_flogn || cmd_is_flognp1 || cmd_is_flog10 || cmd_is_flog2) begin
                                     state_r <= ST_IDLE;
                                     if (!slotA_valid_r) begin
                                         ca_r    <= 1'b0;

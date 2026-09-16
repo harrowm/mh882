@@ -1807,20 +1807,99 @@ NaN+OPERR check). Measured accuracy 0-10 ULP, comfortably inside
 `ulp_tol=4096`. **APU test grew 104→119 checks, `make test` 8/8 suites
 clean, 340/340 total.**
 
-### Phase 9h+ — The remaining log/inverse-trig set, NOT YET STARTED
+### Phase 9h — FLOGN/FLOGNP1/FLOG10/FLOG2, COMPLETE (the logarithm family)
 
-10 functions (FACOS/FASIN/FATAN/FATANH/FLOGN/FLOGNP1/FLOG10/FLOG2).
-Needs a genuine numerical algorithm per function — the log family
-(FLOGN/FLOGNP1/FLOG10/FLOG2) via its own argument-reduction-plus-series
-(e.g. reduce to `y` near 1 via the SAME `k=round(log2(a))`-style
-exponent extraction `fp_getexp`/`fp_scale` already do, then a series
-for `ln(mantissa)`, with `FLOG10`/`FLOG2` scaling the result by
-`1/ln(10)`/`1/ln(2)` the way `fp_twotox`/`fp_tentox` scaled their INPUT
-by `ln2`/`ln10`); FACOS/FASIN/FATAN/FATANH need their own
-argument-reduction-plus-series or identity-based approach (e.g. `atan`
-via its own series with range reduction, `asin(x)=atan(x/sqrt(1-x^2))`,
-`acos(x)=pi/2-asin(x)`, `atanh(x)=0.5*ln((1+x)/(1-x))` once a log core
-exists). All verified to the manual's own ~64 ULP typical / 4096 ULP
-worst-case tolerance via the same Python/Decimal reference-vector +
-`check_close` methodology Phase 9d/9f/9g established (none of these 10
-are Musashi-verifiable either).
+One shared `fp_logn_core` task (`ln(x)` for `x>0`), the same "one
+shared numerical core, thin per-instruction wrappers" shape `fp_sincos`/
+`fp_exp_core` already established.
+
+**Algorithm**: NOT a plain Taylor series in `(x-1)` (converges too
+slowly near `x=2`) — the standard atanh-based reduction instead. Write
+`x = m*2^e` with `m` in `[1,2)` (exactly this project's own internal
+mantissa/exponent split already gives this, no extra work), then
+`ln(x)=ln(m)+e*ln(2)`. `ln(m)` via `t=(m-1)/(m+1)` (`|t|<=1/3` for `m`
+in `[1,2)`), `ln(m)=2*(t+t^3/3+t^5/5+...)=2*t*P(t^2)`, `P` an 18-term
+Horner series in `w=t^2` — independently verified (Python, `Decimal`,
+80 digits) to truncation-error ~6.7e-20 at the worst case `|t|=1/3`,
+comfortably inside the ~6.9e-18 target (needing more terms than
+`fp_exp_core`'s own 16 or `fp_sincos`'s own 9, since this series lacks
+factorial-accelerated convergence). The `e*ln2` correction term reuses
+`int32_to_ext` (already established by `fp_getexp`).
+
+**A real bug was found and fixed in this session's OWN test-reference
+generator, not the RTL**, while deriving expected values: the
+independent Python `dln(x)` helper computed `atanh((x-1)/(x+1))`
+without its own required factor of 2, silently returning exactly
+`ln(x)/2`. Caught via a sanity check (`dln(2)` printed `0.34657...`,
+which is instantly recognizable as wrong against the well-known
+`ln(2)≈0.693147...`) — 8 of the 12 numeric test vectors had to be
+corrected before the RTL's own actual (correct) output could be
+verified against them. A reminder, same lesson `fp_sincos`'s own
+PI_OVER_2-derivation bug from Phase 9d taught: an independently-written
+reference script is not automatically correct just because it's
+independent of the RTL — sanity-check ITS OWN output against a known
+constant before trusting it as ground truth.
+
+**FLOGN** ($14): `fp_logn_core(a)` directly. Table 6-2/6-3 (confirmed
+directly): `source<0` or `source=-infinity` → OPERR, NaN; `source=0` →
+DZ, `-infinity`; `source=+infinity` → `+infinity`, well-defined, no
+exception.
+
+**FLOG10** ($15) / **FLOG2** ($16): `ln(a)/ln(10)` / `ln(a)/ln(2)` — one
+scaling division each (reusing the already-established `LN2`/`LN10`
+constants from Phase 9f, via `fp_div`, rather than needing new
+reciprocal constants). NaN/inf/zero results from `fp_logn_core` already
+come out correct after dividing by a normal positive constant
+(`-inf/LN10=-inf`, `NaN/LN10=NaN`) — only OPERR/DZ are explicitly
+forwarded from `fp_logn_core`'s own output, since `fp_div` itself has
+no way to know those exceptions belong to the LOG operation, not the
+later division.
+
+**FLOGNP1** ($06): `ln(1+a)`, computed via the algebraic identity
+`ln(1+x)=2*atanh(x/(x+2))` applied DIRECTLY to `x` — deliberately never
+forms the literal sum `1+x` when `|x|` is small, avoiding the same
+class of absorption-precision-loss `fp_etoxm1`'s own header comment
+describes for `e^x-1` (forming `1+x` explicitly would silently discard
+`x`'s own low-order bits into the dominant `1`). This identity's own
+`t=x/(x+2)` conveniently stays inside `ln_series`'s safe `|t|<=1/3`
+convergence radius for `x` in roughly `[-0.5,1.0]` — covering the whole
+"small x" regime this concern actually matters for — with NO `e*ln2`
+correction needed at all in that regime (the identity never decomposed
+a real exponent). Outside that range, `|x|` is not small, so forming
+`1+x` explicitly loses only a few low bits of `x` relative to its own
+much larger magnitude — safe within this project's own ~64-ULP-typical
+target — and the general `fp_logn_core(1+x)` is used instead. New
+DZ/OPERR special cases specific to this instruction (`x=-1` exactly →
+DZ, `-inf`; `x<-1` or `x=-infinity` → OPERR, NaN), confirmed directly
+against Table 6-2/6-3's own FLOGNP1-specific entries (different
+thresholds than FLOGN's own `x<0`/`x=0`, since this instruction's
+domain is shifted by 1).
+
+**Testing**: 30 new checks (numeric `check_close` against independent
+Python/`Decimal` references for all 4 functions across a representative
+operand set, including FLOGNP1's own two-path split mirroring
+`fp_etoxm1`'s own test structure, plus DZ/OPERR/well-defined-infinity
+exact checks for each function's own Table 6-2/6-3 entries). Measured
+accuracy 0-47 ULP (the one 47-ULP case is `FLOGNP1(-0.999)`,
+deliberately chosen close to the genuine `x=-1` mathematical
+singularity, where reduced precision is expected and still comfortably
+inside `ulp_tol=4096`). **APU test grew 119→142 checks, `make test`
+8/8 suites clean, 363/363 total.**
+
+### Phase 9i+ — FACOS/FASIN/FATAN/FATANH, NOT YET STARTED
+
+The last 4 functions of the original ~28-function transcendental set.
+Needs its own argument-reduction-plus-series or identity-based
+approach now that both `fp_sincos` (Phase 9d) and `fp_logn_core` (Phase
+9h) exist as building blocks: `atan(x)` via its own series with range
+reduction (e.g. `atan(x) = atan(1) - atan((1-x)/(1+x))` for `|x|` far
+from 0, mirroring the same "reduce to a small argument, then a
+converging series" shape every other transcendental here uses);
+`asin(x)=atan(x/sqrt(1-x^2))`; `acos(x)=pi/2-asin(x)`;
+`atanh(x)=0.5*ln((1+x)/(1-x))` (direct reuse of `fp_logn_core`, same
+shape as `fp_tanh` reusing `fp_exp_core`). All verified to the manual's
+own ~64 ULP typical / 4096 ULP worst-case tolerance via the same
+Python/Decimal reference-vector + `check_close` methodology every
+earlier Phase 9 sub-phase established (not Musashi-verifiable either).
+Closes the ENTIRE original ~28-function MC68881/2 transcendental
+instruction set once landed.

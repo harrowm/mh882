@@ -2236,4 +2236,279 @@ package m68882_apu_pkg;
         end
     endtask
 
+    // ── Phase 9h: FLOGN ($14) / FLOGNP1 ($06) / FLOG10 ($15) / FLOG2
+    // ($16) -- the logarithm family, all built on one shared
+    // `fp_logn_core` task (ln(x) for x>0), the same "one shared
+    // numerical core, thin per-instruction wrappers" shape as
+    // `fp_sincos`/`fp_exp_core`.
+    //
+    // Algorithm: standard atanh-based reduction, NOT a plain Taylor
+    // series in (x-1) (which only converges usefully near x=1 and far
+    // too slowly near x=2 to be practical). Write x = m * 2^e with m in
+    // [1,2) -- exactly this project's own internal mantissa/exponent
+    // split, no extra work to derive -- then ln(x) = ln(m) + e*ln(2).
+    // ln(m) is computed via t=(m-1)/(m+1) (|t|<=1/3 for m in [1,2)),
+    // ln(m) = 2*(t + t^3/3 + t^5/5 + ...) = 2*t*P(t^2), P evaluated as
+    // an 18-term (w^0..w^17) Horner series in w=t^2 -- independently
+    // verified in Python (Decimal, 80 digits) to have truncation error
+    // ~6.7e-20 at the worst case |t|=1/3, comfortably inside the
+    // ~6.9e-18 target implied by the manual's own "~64 ULP typical"
+    // bound (needing more terms than fp_exp_core's own 16 or
+    // fp_sincos's own 9, since this series lacks factorial-accelerated
+    // convergence -- purely geometric decay by t^2 per term instead).
+    // The e*ln2 correction term reuses `int32_to_ext` (already
+    // established by `fp_getexp`) to convert the signed unbiased
+    // exponent directly to a floatx80 value.
+    //
+    // Operation Table / Table 6-2 (Operand Error) / Table 6-3 (Divide-
+    // by-Zero) entries, confirmed directly: FLOGx(source<0 or -inf) =
+    // OPERR, NaN; FLOGN/FLOG10/FLOG2(source=0) = DZ, -infinity;
+    // FLOGx(+inf) = +inf, well-defined, no exception.
+    localparam logic [95:0] LN_C0  = 96'h3ff9_0000_ea0ea0ea0ea0ea0f; // w^17
+    localparam logic [95:0] LN_C1  = 96'h3ff9_0000_f83e0f83e0f83e10; // w^16
+    localparam logic [95:0] LN_C2  = 96'h3ffa_0000_8421084210842108; // w^15
+    localparam logic [95:0] LN_C3  = 96'h3ffa_0000_8d3dcb08d3dcb08d; // w^14
+    localparam logic [95:0] LN_C4  = 96'h3ffa_0000_97b425ed097b425f; // w^13
+    localparam logic [95:0] LN_C5  = 96'h3ffa_0000_a3d70a3d70a3d70a; // w^12
+    localparam logic [95:0] LN_C6  = 96'h3ffa_0000_b21642c8590b2164; // w^11
+    localparam logic [95:0] LN_C7  = 96'h3ffa_0000_c30c30c30c30c30c; // w^10
+    localparam logic [95:0] LN_C8  = 96'h3ffa_0000_d79435e50d79435e; // w^9
+    localparam logic [95:0] LN_C9  = 96'h3ffa_0000_f0f0f0f0f0f0f0f1; // w^8
+    localparam logic [95:0] LN_C10 = 96'h3ffb_0000_8888888888888889; // w^7
+    localparam logic [95:0] LN_C11 = 96'h3ffb_0000_9d89d89d89d89d8a; // w^6
+    localparam logic [95:0] LN_C12 = 96'h3ffb_0000_ba2e8ba2e8ba2e8c; // w^5
+    localparam logic [95:0] LN_C13 = 96'h3ffb_0000_e38e38e38e38e38e; // w^4
+    localparam logic [95:0] LN_C14 = 96'h3ffc_0000_9249249249249249; // w^3
+    localparam logic [95:0] LN_C15 = 96'h3ffc_0000_cccccccccccccccd; // w^2
+    localparam logic [95:0] LN_C16 = 96'h3ffd_0000_aaaaaaaaaaaaaaab; // w^1
+    localparam logic [95:0] LN_C17 = 96'h3fff_0000_8000000000000000; // w^0
+
+    localparam logic [95:0] ONE_EXT = 96'h3fff_0000_8000000000000000;
+    localparam logic [95:0] TWO_EXT = 96'h4000_0000_8000000000000000;
+    localparam logic [95:0] NEG_INF_EXT = 96'hffff_0000_8000000000000000;
+
+    // ln(m) for m ALREADY in [1,2) -- the shared atanh-series core, used
+    // both by fp_logn_core's own general case (on the mantissa it
+    // extracts) and directly by fp_lognp1's own small-x path (which
+    // constructs its own effective "m" algebraically, without ever
+    // decomposing a real floatx80 exponent -- see that task's own
+    // header comment).
+    task automatic ln_series(
+        input  logic [95:0]  t_in,
+        output logic [95:0]  ln_m
+    );
+        logic [95:0] w, tmp, acc;
+        logic [95:0] ln_coeff [0:17];
+        logic pz, pn, pi_, pnan, poperr, povfl, punfl, pinex2;
+        logic rz, rn, ri, rnan, roperr, rovfl, runfl, rinex2;
+        int i;
+        ln_coeff = '{LN_C0, LN_C1, LN_C2, LN_C3, LN_C4, LN_C5, LN_C6, LN_C7, LN_C8, LN_C9,
+                     LN_C10, LN_C11, LN_C12, LN_C13, LN_C14, LN_C15, LN_C16, LN_C17};
+        fp_mul(t_in, t_in, RND_NEAREST, w, pz, pn, pi_, pnan, poperr, povfl, punfl, pinex2);
+        acc = ln_coeff[0];
+        for (i = 1; i < 18; i++) begin
+            fp_mul(acc, w, RND_NEAREST, tmp, pz, pn, pi_, pnan, poperr, povfl, punfl, pinex2);
+            fp_add_sub(ln_coeff[i], tmp, 1'b0, RND_NEAREST, acc, rz, rn, ri, rnan, roperr, rovfl, runfl, rinex2);
+        end
+        fp_mul(acc, t_in, RND_NEAREST, tmp, pz, pn, pi_, pnan, poperr, povfl, punfl, pinex2);
+        fp_mul(tmp, TWO_EXT, RND_NEAREST, ln_m, pz, pn, pi_, pnan, poperr, povfl, punfl, pinex2);
+    endtask
+
+    task automatic fp_logn_core(
+        input  logic [95:0]  a_raw,
+        output logic [95:0]  result,
+        output logic         flag_z, flag_n, flag_i, flag_nan, flag_operr, flag_dz
+    );
+        fpx_t a;
+        logic a_nan, a_zero, a_inf;
+        a = unpack_fpx(a_raw);
+        a_nan  = is_nan_fpx(a);
+        a_zero = is_zero_fpx(a);
+        a_inf  = is_inf_fpx(a);
+        flag_operr = 1'b0;
+        flag_dz    = 1'b0;
+
+        if (a_nan) begin
+            result = a_raw;
+        end else if (a_zero) begin
+            flag_dz = 1'b1;
+            result = NEG_INF_EXT;
+        end else if (a.sign) begin
+            // Negative source (finite or -infinity, both sign=1) --
+            // Table 6-2's own "Source is <0, Source=-infinity" entry
+            // covers both in one check.
+            flag_operr = 1'b1;
+            result = {1'b0, 15'h7FFF, 16'h0, 64'hC000_0000_0000_0000};
+        end else if (a_inf) begin
+            result = a_raw; // +inf -> +inf, well-defined, no exception
+        end else begin
+            logic [95:0] m_ext, num, den, t, e_ext, scaled, ln_m;
+            logic        nz, nn, ni, nnan, noperr, novfl, nunfl, ninex2;
+            logic        dz2, dn2, di2, dnan2, doperr2, ddz2, dovfl2, dunfl2, dinex2b;
+            logic        qz, qn, qi, qnan, qoperr, qdz, qovfl, qunfl, qinex2;
+            logic        mz, mn, mi, mnan, moperr, movfl, munfl, minex2;
+            logic        az, an, ai, anan, aoperr, aovfl, aunfl, ainex2;
+            logic signed [31:0] e_val;
+
+            m_ext = {1'b0, 15'd16383, 16'h0, a.mant}; // reinterpret mantissa as its own [1,2) value
+            e_val = $signed({17'b0, a.exp}) - 32'sd16383;
+
+            fp_add_sub(ONE_EXT, m_ext, 1'b1, RND_NEAREST, num, nz, nn, ni, nnan, noperr, novfl, nunfl, ninex2); // m - 1
+            fp_add_sub(ONE_EXT, m_ext, 1'b0, RND_NEAREST, den, dz2, dn2, di2, dnan2, doperr2, dovfl2, dunfl2, dinex2b); // m + 1
+            fp_div(den, num, RND_NEAREST, t, qz, qn, qi, qnan, qoperr, qdz, qovfl, qunfl, qinex2); // t = (m-1)/(m+1)
+
+            ln_series(t, ln_m);
+
+            int32_to_ext(e_val, e_ext);
+            fp_mul(e_ext, LN2, RND_NEAREST, scaled, mz, mn, mi, mnan, moperr, movfl, munfl, minex2);
+            fp_add_sub(scaled, ln_m, 1'b0, RND_NEAREST, result, az, an, ai, anan, aoperr, aovfl, aunfl, ainex2);
+        end
+
+        begin
+            fpx_t r_out;
+            r_out = unpack_fpx(result);
+            flag_z   = is_zero_fpx(r_out);
+            flag_n   = r_out.sign && !flag_z;
+            flag_i   = is_inf_fpx(r_out);
+            flag_nan = is_nan_fpx(r_out);
+        end
+    endtask
+
+    // FLOGN ($14): ln(a), direct.
+    task automatic fp_logn(
+        input  logic [95:0]  a_raw,
+        output logic [95:0]  result,
+        output logic         flag_z, flag_n, flag_i, flag_nan, flag_operr, flag_dz
+    );
+        fp_logn_core(a_raw, result, flag_z, flag_n, flag_i, flag_nan, flag_operr, flag_dz);
+    endtask
+
+    // FLOG10 ($15) / FLOG2 ($16): ln(a)/ln(10), ln(a)/ln(2). NaN/inf/
+    // zero/negative results from fp_logn_core already come out correct
+    // after being divided by a normal positive constant (-inf/LN10=
+    // -inf, NaN/LN10=NaN, etc.) -- only OPERR/DZ need to be forwarded
+    // explicitly, since fp_div itself has no way to know THOSE
+    // exceptions belong to the LOG operation, not the division.
+    task automatic fp_log10(
+        input  logic [95:0]  a_raw,
+        output logic [95:0]  result,
+        output logic         flag_z, flag_n, flag_i, flag_nan, flag_operr, flag_dz
+    );
+        logic [95:0] ln_a;
+        logic        lz, ln, li, lnan, loperr, ldz;
+        logic        dn_, dd, di_, dnan_, doperr_, ddz_, dovfl_, dunfl_, dinex2_;
+        fp_logn_core(a_raw, ln_a, lz, ln, li, lnan, loperr, ldz);
+        fp_div(LN10, ln_a, RND_NEAREST, result, flag_z, flag_n, flag_i, flag_nan,
+               doperr_, ddz_, dovfl_, dunfl_, dinex2_);
+        flag_operr = loperr;
+        flag_dz    = ldz;
+    endtask
+
+    task automatic fp_log2(
+        input  logic [95:0]  a_raw,
+        output logic [95:0]  result,
+        output logic         flag_z, flag_n, flag_i, flag_nan, flag_operr, flag_dz
+    );
+        logic [95:0] ln_a;
+        logic        lz, ln, li, lnan, loperr, ldz;
+        logic        dn_, dd, di_, dnan_, doperr_, ddz_, dovfl_, dunfl_, dinex2_;
+        fp_logn_core(a_raw, ln_a, lz, ln, li, lnan, loperr, ldz);
+        fp_div(LN2, ln_a, RND_NEAREST, result, flag_z, flag_n, flag_i, flag_nan,
+               doperr_, ddz_, dovfl_, dunfl_, dinex2_);
+        flag_operr = loperr;
+        flag_dz    = ldz;
+    endtask
+
+    // FLOGNP1 ($06): ln(1+a), computed via the algebraic identity
+    // ln(1+x) = 2*atanh(x/(x+2)) DIRECTLY on x -- deliberately never
+    // forms the literal sum "1+x" when |x| is small, since doing so
+    // would silently absorb x's own low-order bits into the dominant
+    // "1" (the same class of precision loss FETOXM1's own header
+    // comment describes for e^x-1, just for logarithms instead of
+    // exponentials). This identity's own t=x/(x+2) also happens to stay
+    // inside ln_series's own safe convergence radius (|t|<=1/3) for
+    // x in roughly [-0.5, 1.0], comfortably covering the whole "small
+    // x" regime this precision concern actually matters for. Outside
+    // that range, |x| is not small, so forming "1+x" explicitly loses
+    // no more than a few low bits of x relative to its own much larger
+    // magnitude -- safe within this project's own ~64-ULP-typical
+    // target -- and the general fp_logn_core (with its own real
+    // exponent-extraction reduction, valid for any x>-1) is used
+    // instead.
+    task automatic fp_lognp1(
+        input  logic [95:0]  a_raw,
+        output logic [95:0]  result,
+        output logic         flag_z, flag_n, flag_i, flag_nan, flag_operr, flag_dz
+    );
+        fpx_t a;
+        logic a_nan, a_zero, a_inf;
+        a = unpack_fpx(a_raw);
+        a_nan  = is_nan_fpx(a);
+        a_zero = is_zero_fpx(a);
+        a_inf  = is_inf_fpx(a);
+        flag_operr = 1'b0;
+        flag_dz    = 1'b0;
+
+        if (a_nan) begin
+            result = a_raw;
+        end else if (a_zero) begin
+            result = a_raw; // ln(1+0) = 0, sign of zero preserved
+        end else if (a.sign && a.exp == 15'd16383 && a.mant == 64'h8000_0000_0000_0000) begin
+            // a == -1.0 exactly (Table 6-3: "Source Operand = -1")
+            flag_dz = 1'b1;
+            result = NEG_INF_EXT;
+        end else if (a.sign && a_inf) begin
+            // a == -infinity (Table 6-2: "Source= - infinity")
+            flag_operr = 1'b1;
+            result = {1'b0, 15'h7FFF, 16'h0, 64'hC000_0000_0000_0000};
+        end else if (a.sign && ((a.exp > 15'd16383) ||
+                                 (a.exp == 15'd16383 && a.mant > 64'h8000_0000_0000_0000))) begin
+            // a < -1.0 (Table 6-2: "Source is < -1")
+            flag_operr = 1'b1;
+            result = {1'b0, 15'h7FFF, 16'h0, 64'hC000_0000_0000_0000};
+        end else if (a_inf) begin
+            result = a_raw; // +inf -> +inf, well-defined
+        end else begin
+            logic [95:0] den, t;
+            logic        dz2, dn2, di2, dnan2, doperr2, dovfl2, dunfl2, dinex2b;
+            logic        qz, qn, qi, qnan, qoperr, qdz, qovfl, qunfl, qinex2;
+            fp_add_sub(TWO_EXT, a_raw, 1'b0, RND_NEAREST, den, dz2, dn2, di2, dnan2, doperr2, dovfl2, dunfl2, dinex2b); // x+2, always safe (x>-1 here, so x+2>1, no absorption concern)
+            fp_div(den, a_raw, RND_NEAREST, t, qz, qn, qi, qnan, qoperr, qdz, qovfl, qunfl, qinex2); // t = x/(x+2)
+
+            begin
+                fpx_t tx;
+                logic signed [17:0] t_real_exp;
+                logic small_x;
+                tx = unpack_fpx(t);
+                t_real_exp = $signed({3'b0, tx.exp}) - 18'sd16383;
+                small_x = qz || (t_real_exp <= -18'sd2) ||
+                          ((t_real_exp == -18'sd1) && (tx.mant == 64'h8000_0000_0000_0000));
+                if (small_x) begin
+                    // |t|<=1/3: ln_series directly on t IS the whole
+                    // answer -- no e*ln2 correction needed, this
+                    // identity never decomposed a real exponent at all.
+                    ln_series(t, result);
+                end else begin
+                    logic [95:0] one_plus_a;
+                    logic        oz, on, oi, onan, ooperr, oovfl, ounfl, oinex2;
+                    logic        lz, ln, li, lnan, loperr, ldz;
+                    // |x| not small here -- forming 1+x explicitly loses
+                    // no more than a few low bits of x, safe within this
+                    // project's own ~64-ULP-typical target.
+                    fp_add_sub(ONE_EXT, a_raw, 1'b0, RND_NEAREST, one_plus_a, oz, on, oi, onan, ooperr, oovfl, ounfl, oinex2);
+                    fp_logn_core(one_plus_a, result, lz, ln, li, lnan, loperr, ldz);
+                end
+            end
+        end
+
+        begin
+            fpx_t r_out;
+            r_out = unpack_fpx(result);
+            flag_z   = is_zero_fpx(r_out);
+            flag_n   = r_out.sign && !flag_z;
+            flag_i   = is_inf_fpx(r_out);
+            flag_nan = is_nan_fpx(r_out);
+        end
+    endtask
+
 endpackage

@@ -157,6 +157,8 @@ module m68882_apu_tb;
     localparam logic [95:0] EXT_7_0   = 96'h4001_0000_e000_0000_0000_0000;
     localparam logic [95:0] EXT_10_0  = 96'h4002_0000_a000_0000_0000_0000;
     localparam logic [95:0] EXT_0_001 = 96'h3ff5_0000_8312_6e97_8d4f_df3b;
+    localparam logic [95:0] EXT_100_0 = 96'h4005_0000_c800_0000_0000_0000;
+    localparam logic [95:0] EXT_N0_999 = 96'hbffe_0000_ffbe_76c8_b439_5810;
 
     logic [31:0] rd;
 
@@ -869,6 +871,100 @@ module m68882_apu_tb;
         dispatch(cmd_word(3'b000, 3'd0, 3'd1, 7'h0F)); // FTAN(+inf)
         check(u_top.u_proto.u_regfile.fpsr_r[24] == 1'b1, "Phase 9g: FTAN(+inf) NAN condition code set");
         check(u_top.u_proto.u_regfile.fpsr_r[13] == 1'b1, "Phase 9g: FTAN(+inf) OPERR exception-status bit set");
+
+        // ── Phase 9h: FLOGN/FLOGNP1/FLOG10/FLOG2 (the logarithm
+        // family, shared fp_logn_core) ──────────────────────────────
+        // References independently computed in Python (80-digit
+        // Decimal atanh-series, same methodology as Phase 9d/9f/9g).
+        load_fp(0, EXT_1_0);
+        dispatch(cmd_word(3'b000, 3'd0, 3'd1, 7'h14)); // FLOGN(1.0) = 0, exact
+        check(u_top.u_proto.u_regfile.fp_r[1] == 96'h0, "Phase 9h: FLOGN(1.0) == +0.0 exactly");
+
+        load_fp(0, EXT_2_0);
+        dispatch(cmd_word(3'b000, 3'd0, 3'd1, 7'h14)); // FLOGN(2.0) = ln2, m already in [1,2), e=1 (worst-case |t|=1/3)
+        check_close(u_top.u_proto.u_regfile.fp_r[1], 96'h3ffe_0000_b17217f7d1cf79ac,
+                    4096, "Phase 9h: FLOGN(2.0) ~= ln(2) = 0.6931471806... (worst-case |t|=1/3)");
+
+        load_fp(0, EXT_0_5);
+        dispatch(cmd_word(3'b000, 3'd0, 3'd1, 7'h14)); // FLOGN(0.5) = -ln2
+        check_close(u_top.u_proto.u_regfile.fp_r[1], 96'hbffe_0000_b17217f7d1cf79ac,
+                    4096, "Phase 9h: FLOGN(0.5) ~= -ln(2) = -0.6931471806...");
+
+        load_fp(0, EXT_10_0);
+        dispatch(cmd_word(3'b000, 3'd0, 3'd1, 7'h14)); // FLOGN(10.0), exercises e!=0,1 reduction
+        check_close(u_top.u_proto.u_regfile.fp_r[1], 96'h4000_0000_935d8dddaaa8ac17,
+                    4096, "Phase 9h: FLOGN(10.0) ~= ln(10) = 2.3025850930...");
+
+        load_fp(0, EXT_0_001);
+        dispatch(cmd_word(3'b000, 3'd0, 3'd1, 7'h14)); // FLOGN(0.001), negative-exponent reduction
+        check_close(u_top.u_proto.u_regfile.fp_r[1], 96'hc001_0000_dd0c54cc7ffd0222,
+                    4096, "Phase 9h: FLOGN(0.001) ~= -6.9077552790...");
+
+        load_fp(0, 96'h0); // +0.0
+        dispatch(cmd_word(3'b000, 3'd0, 3'd1, 7'h14)); // FLOGN(+0.0)
+        check(u_top.u_proto.u_regfile.fp_r[1] == 96'hffff_0000_8000_0000_0000_0000, "Phase 9h: FLOGN(+0.0) == -infinity");
+        check(u_top.u_proto.u_regfile.fpsr_r[10] == 1'b1, "Phase 9h: FLOGN(+0.0) DZ exception-status bit set");
+
+        load_fp(0, EXT_N1_0);
+        dispatch(cmd_word(3'b000, 3'd0, 3'd1, 7'h14)); // FLOGN(-1.0)
+        check(u_top.u_proto.u_regfile.fpsr_r[24] == 1'b1, "Phase 9h: FLOGN(-1.0) NAN condition code set");
+        check(u_top.u_proto.u_regfile.fpsr_r[13] == 1'b1, "Phase 9h: FLOGN(-1.0) OPERR exception-status bit set");
+
+        load_fp(0, 96'h7fff_0000_8000_0000_0000_0000); // +inf
+        dispatch(cmd_word(3'b000, 3'd0, 3'd1, 7'h14)); // FLOGN(+inf)
+        check(u_top.u_proto.u_regfile.fp_r[1] == 96'h7fff_0000_8000_0000_0000_0000, "Phase 9h: FLOGN(+inf) == +inf");
+
+        load_fp(0, EXT_10_0);
+        dispatch(cmd_word(3'b000, 3'd0, 3'd1, 7'h15)); // FLOG10(10.0) = 1.0
+        check_close(u_top.u_proto.u_regfile.fp_r[1], EXT_1_0, 4096, "Phase 9h: FLOG10(10.0) ~= 1.0");
+
+        load_fp(0, EXT_100_0);
+        dispatch(cmd_word(3'b000, 3'd0, 3'd1, 7'h15)); // FLOG10(100.0) = 2.0
+        check_close(u_top.u_proto.u_regfile.fp_r[1], EXT_2_0, 4096, "Phase 9h: FLOG10(100.0) ~= 2.0");
+
+        load_fp(0, 96'h0); // +0.0
+        dispatch(cmd_word(3'b000, 3'd0, 3'd1, 7'h15)); // FLOG10(+0.0), DZ must forward through fp_logn_core correctly
+        check(u_top.u_proto.u_regfile.fp_r[1] == 96'hffff_0000_8000_0000_0000_0000, "Phase 9h: FLOG10(+0.0) == -infinity");
+        check(u_top.u_proto.u_regfile.fpsr_r[10] == 1'b1, "Phase 9h: FLOG10(+0.0) DZ exception-status bit set (forwarded from fp_logn_core)");
+
+        load_fp(0, EXT_2_0);
+        dispatch(cmd_word(3'b000, 3'd0, 3'd1, 7'h16)); // FLOG2(2.0) = 1.0
+        check_close(u_top.u_proto.u_regfile.fp_r[1], EXT_1_0, 4096, "Phase 9h: FLOG2(2.0) ~= 1.0");
+
+        load_fp(0, EXT_100_0);
+        dispatch(cmd_word(3'b000, 3'd0, 3'd1, 7'h16)); // FLOG2(100.0)
+        check_close(u_top.u_proto.u_regfile.fp_r[1], 96'h4001_0000_d49a784bcd1b8afe,
+                    4096, "Phase 9h: FLOG2(100.0) ~= 6.6438561898...");
+
+        // FLOGNP1: small-x direct-t-substitution path vs. the ordinary
+        // fp_logn_core(1+x) fallback, both against independent
+        // references -- confirms the small-x absorption-avoidance
+        // branch (fp_lognp1's own header comment) produces the right
+        // answer, mirroring FETOXM1's own two-path test structure.
+        load_fp(0, EXT_0_001);
+        dispatch(cmd_word(3'b000, 3'd0, 3'd1, 7'h06)); // FLOGNP1(0.001), small-x direct-t path
+        check_close(u_top.u_proto.u_regfile.fp_r[1], 96'h3ff5_0000_8301aa7c61f5f8ac,
+                    4096, "Phase 9h: FLOGNP1(0.001) ~= 0.0009995003... (small-x direct-t path, avoiding absorption)");
+
+        load_fp(0, 96'h4002_0000_9000_0000_0000_0000); // 9.0 built inline (no EXT_9_0 localparam exists)
+        dispatch(cmd_word(3'b000, 3'd0, 3'd1, 7'h06)); // FLOGNP1(9.0) = ln(10), ordinary fp_logn_core(1+x) fallback path
+        check_close(u_top.u_proto.u_regfile.fp_r[1], 96'h4000_0000_935d8dddaaa8ac17,
+                    4096, "Phase 9h: FLOGNP1(9.0) ~= ln(10) = 2.3025850930... (ordinary fp_logn_core(1+x) path)");
+
+        load_fp(0, EXT_N0_999);
+        dispatch(cmd_word(3'b000, 3'd0, 3'd1, 7'h06)); // FLOGNP1(-0.999), close to the x=-1 singularity
+        check_close(u_top.u_proto.u_regfile.fp_r[1], 96'hc001_0000_dd0c54cc7ffd0222,
+                    4096, "Phase 9h: FLOGNP1(-0.999) ~= -6.9077552790... (close to the x=-1 singularity)");
+
+        load_fp(0, EXT_N1_0);
+        dispatch(cmd_word(3'b000, 3'd0, 3'd1, 7'h06)); // FLOGNP1(-1.0) exactly
+        check(u_top.u_proto.u_regfile.fp_r[1] == 96'hffff_0000_8000_0000_0000_0000, "Phase 9h: FLOGNP1(-1.0) == -infinity");
+        check(u_top.u_proto.u_regfile.fpsr_r[10] == 1'b1, "Phase 9h: FLOGNP1(-1.0) DZ exception-status bit set");
+
+        load_fp(0, EXT_N8_0);
+        dispatch(cmd_word(3'b000, 3'd0, 3'd1, 7'h06)); // FLOGNP1(-8.0), x < -1
+        check(u_top.u_proto.u_regfile.fpsr_r[24] == 1'b1, "Phase 9h: FLOGNP1(-8.0) NAN condition code set (x < -1)");
+        check(u_top.u_proto.u_regfile.fpsr_r[13] == 1'b1, "Phase 9h: FLOGNP1(-8.0) OPERR exception-status bit set (x < -1)");
 
         $display("---");
         $display("%0d passed, %0d failed", pass_count, fail_count);
