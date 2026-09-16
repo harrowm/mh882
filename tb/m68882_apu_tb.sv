@@ -120,6 +120,11 @@ module m68882_apu_tb;
     localparam logic [95:0] EXT_0_5  = 96'h3ffe_0000_8000_0000_0000_0000;
     localparam logic [95:0] EXT_1_5  = 96'h3fff_0000_c000_0000_0000_0000;
     localparam logic [95:0] EXT_N1_0 = 96'hbfff_0000_8000_0000_0000_0000;
+    localparam logic [95:0] EXT_4_0  = 96'h4001_0000_8000_0000_0000_0000;
+    localparam logic [95:0] EXT_6_0  = 96'h4001_0000_c000_0000_0000_0000;
+    localparam logic [95:0] EXT_2_25 = 96'h4000_0000_9000_0000_0000_0000;
+    localparam logic [95:0] EXT_N3_0 = 96'hc000_0000_c000_0000_0000_0000;
+    localparam logic [95:0] EXT_0_25 = 96'h3ffd_0000_8000_0000_0000_0000;
 
     logic [31:0] rd;
 
@@ -177,6 +182,42 @@ module m68882_apu_tb;
         repeat (2) @(posedge clk_4x);
         check(u_top.u_proto.u_regfile.fp_r[1] == EXT_N1_0, "FSUB: 1.0 - 2.0 == -1.0");
         check(u_top.u_proto.u_regfile.fpsr_r[27] == 1'b1, "FSUB: N condition code set for a negative result");
+
+        // ── FMUL: 2.0 * 2.0 = 4.0 (product exactly at a power of 2) ─────
+        load_fp(0, EXT_2_0);
+        load_fp(1, EXT_2_0);
+        run_cycle(CIR_COMMAND, 1'b1, cmd_word(3'b000, 3'd0, 3'd1, 7'h23), rd); // FMUL
+        repeat (2) @(posedge clk_4x);
+        check(u_top.u_proto.u_regfile.fp_r[1] == EXT_4_0, "FMUL: 2.0 * 2.0 == 4.0");
+
+        // ── FMUL: 2.0 * 3.0 = 6.0 (product needs the [2,4) renormalization) ──
+        load_fp(0, EXT_2_0);
+        load_fp(1, EXT_3_0);
+        run_cycle(CIR_COMMAND, 1'b1, cmd_word(3'b000, 3'd0, 3'd1, 7'h23), rd); // FMUL
+        repeat (2) @(posedge clk_4x);
+        check(u_top.u_proto.u_regfile.fp_r[1] == EXT_6_0, "FMUL: 2.0 * 3.0 == 6.0");
+
+        // ── FMUL: 1.5 * 1.5 = 2.25 (no renormalization needed) ───────────
+        load_fp(0, EXT_1_5);
+        load_fp(1, EXT_1_5);
+        run_cycle(CIR_COMMAND, 1'b1, cmd_word(3'b000, 3'd0, 3'd1, 7'h23), rd); // FMUL
+        repeat (2) @(posedge clk_4x);
+        check(u_top.u_proto.u_regfile.fp_r[1] == EXT_2_25, "FMUL: 1.5 * 1.5 == 2.25");
+
+        // ── FMUL: sign combination, -1.0 * 3.0 = -3.0 ────────────────────
+        load_fp(0, EXT_N1_0);
+        load_fp(1, EXT_3_0);
+        run_cycle(CIR_COMMAND, 1'b1, cmd_word(3'b000, 3'd0, 3'd1, 7'h23), rd); // FMUL
+        repeat (2) @(posedge clk_4x);
+        check(u_top.u_proto.u_regfile.fp_r[1] == EXT_N3_0, "FMUL: -1.0 * 3.0 == -3.0");
+        check(u_top.u_proto.u_regfile.fpsr_r[27] == 1'b1, "FMUL: N condition code set for a negative product");
+
+        // ── FMUL: 0.5 * 0.5 = 0.25 (both exponents below bias) ───────────
+        load_fp(0, EXT_0_5);
+        load_fp(1, EXT_0_5);
+        run_cycle(CIR_COMMAND, 1'b1, cmd_word(3'b000, 3'd0, 3'd1, 7'h23), rd); // FMUL
+        repeat (2) @(posedge clk_4x);
+        check(u_top.u_proto.u_regfile.fp_r[1] == EXT_0_25, "FMUL: 0.5 * 0.5 == 0.25");
 
         $display("---");
         $display("%0d passed, %0d failed", pass_count, fail_count);

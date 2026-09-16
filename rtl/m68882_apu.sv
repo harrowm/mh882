@@ -312,4 +312,109 @@ package m68882_apu_pkg;
         end
     endtask
 
+    // FMUL (extension-field opcode $23, Table 4-13) -- Phase 4b.
+    //
+    // Mantissa multiply: a.mant/b.mant are each a 64-bit unsigned integer
+    // representing a fixed-point value in [2^63, 2^64), i.e. j.f with the
+    // binary point after bit 63 (bit63 is always the explicit integer
+    // bit for a normalized operand). Their 128-bit product therefore
+    // represents a value in [2^126, 2^128) -- equivalently, the true
+    // product_value = product128 / 2^126 lands in [1,4). If bit127 is
+    // set the product is in [2,4) and needs one more right-shift
+    // (exponent+1) to renormalize back to the same [1,2)-equivalent
+    // 64-bit window convention every other result in this file uses;
+    // otherwise bit126 already IS the new integer bit and no extra shift
+    // is needed.
+    task automatic fp_mul(
+        input  logic [95:0]  a_raw,
+        input  logic [95:0]  b_raw,
+        input  round_mode_t  rmode,
+        output logic [95:0]  result,
+        output logic         flag_z,
+        output logic         flag_n,
+        output logic         flag_i,
+        output logic         flag_nan,
+        output logic         flag_operr
+    );
+        fpx_t a, b;
+        logic sign_r;
+        logic a_nan, b_nan, a_inf, b_inf, a_zero, b_zero;
+
+        a = unpack_fpx(a_raw);
+        b = unpack_fpx(b_raw);
+        sign_r = a.sign ^ b.sign;
+
+        a_nan  = is_nan_fpx(a);
+        b_nan  = is_nan_fpx(b);
+        a_inf  = is_inf_fpx(a);
+        b_inf  = is_inf_fpx(b);
+        a_zero = is_zero_fpx(a);
+        b_zero = is_zero_fpx(b);
+
+        flag_operr = 1'b0;
+
+        if (a_nan) begin
+            result = a_raw;
+        end else if (b_nan) begin
+            result = b_raw;
+        end else if ((a_inf && b_zero) || (a_zero && b_inf)) begin
+            flag_operr = 1'b1; // 0 * Infinity is undefined
+            result = {1'b0, 15'h7FFF, 16'h0, 64'hC000_0000_0000_0000};
+        end else if (a_inf || b_inf) begin
+            result = {sign_r, 15'h7FFF, 16'h0, 64'h8000_0000_0000_0000};
+        end else if (a_zero || b_zero) begin
+            result = {sign_r, 15'h0, 16'h0, 64'h0};
+        end else begin
+            logic [127:0] product128;
+            logic signed [17:0] exp_sum;
+            logic [63:0] mant64;
+            logic        guard, round_bit, sticky;
+            logic [63:0] rounded_mant;
+            logic        carry;
+
+            product128 = a.mant * b.mant;
+
+            if (product128[127]) begin
+                mant64    = product128[127:64];
+                guard     = product128[63];
+                round_bit = product128[62];
+                sticky    = |product128[61:0];
+                exp_sum   = $signed({3'b0, a.exp}) + $signed({3'b0, b.exp}) - 18'sd16383 + 18'sd1;
+            end else begin
+                mant64    = product128[126:63];
+                guard     = product128[62];
+                round_bit = product128[61];
+                sticky    = |product128[60:0];
+                exp_sum   = $signed({3'b0, a.exp}) + $signed({3'b0, b.exp}) - 18'sd16383;
+            end
+
+            round_mantissa(mant64, guard, round_bit, sticky, sign_r, rmode, rounded_mant, carry);
+            if (carry) begin
+                rounded_mant = {1'b1, rounded_mant[63:1]};
+                exp_sum      = exp_sum + 18'sd1;
+            end
+
+            if (exp_sum >= 18'sd32767) begin
+                // exponent overflow -- saturate to infinity (Phase 4a's
+                // own coarse OVFL substitute, same convention here)
+                result = {sign_r, 15'h7FFF, 16'h0, 64'h8000_0000_0000_0000};
+            end else if (exp_sum <= 18'sd0 || rounded_mant == 64'h0) begin
+                // exponent underflow -- Phase 4a's own denormal-free
+                // simplification: collapse to a correctly signed zero
+                result = {sign_r, 15'h0, 16'h0, 64'h0};
+            end else begin
+                result = {sign_r, exp_sum[14:0], 16'h0, rounded_mant};
+            end
+        end
+
+        begin
+            fpx_t r;
+            r = unpack_fpx(result);
+            flag_z   = is_zero_fpx(r);
+            flag_n   = r.sign && !flag_z;
+            flag_i   = is_inf_fpx(r);
+            flag_nan = is_nan_fpx(r);
+        end
+    endtask
+
 endpackage

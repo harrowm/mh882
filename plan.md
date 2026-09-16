@@ -1,6 +1,6 @@
 # MC68882 FPU — Phased Scope Plan
 
-## Status: Phases 0-3 complete. Phase 4a (register-to-register FADD/FSUB) complete. Phase 4b (MUL/DIV/SQRT/transcendentals) is next.
+## Status: Phases 0-3 complete. Phase 4a (FADD/FSUB) complete. Phase 4b in progress (FMUL done; DIV/SQRT/transcendentals next).
 
 ## Origin
 
@@ -468,7 +468,7 @@ update), not the arithmetic core in isolation. Plus the full existing
 suite (`tb/m68882_biu_smoke_tb.sv` 11/11, `tb/m68882_proto_tb.sv` 17/17)
 confirmed unaffected.
 
-#### Phase 4b — MUL/DIV/SQRT and the remaining monadic/dyadic set (not started)
+#### Phase 4b — MUL/DIV/SQRT and the remaining monadic/dyadic set (FMUL complete, rest not started)
 Extension-field opcodes already confirmed from Table 4-13: FMUL=$23,
 FDIV=$20, FSQRT=$04, FABS=$18, FNEG=$1A, FCMP=$38, FTST=$3A, plus the
 full transcendental set ($00-$1F). Each needs its own real algorithm
@@ -476,6 +476,31 @@ full transcendental set ($00-$1F). Each needs its own real algorithm
 the same guard/round/sticky machinery Phase 4a already built; divide and
 sqrt are genuinely harder — a real iterative or table-based algorithm,
 not just "wire up the operator," if the result needs correct rounding).
+
+**FMUL ($23), COMPLETE**: `m68882_apu_pkg::fp_mul` (in `rtl/m68882_apu.sv`,
+alongside `fp_add_sub`) — a real 64×64→128-bit mantissa multiply,
+renormalizing the [1,4) product range back to the same 64-bit "1.xxx"
+window convention `fp_add_sub` already uses (shift right 1 + exponent+1
+when the product lands in [2,4), i.e. `product128[127]` set), rounded
+through the same `round_mantissa` task (all 4 FPCR rounding modes,
+correctly reused unchanged). Special cases: NaN propagation, 0×Infinity
+sets OPERR (undefined), Infinity×(nonzero finite)=signed Infinity,
+zero×finite=signed zero. Same denormal-free/coarse-overflow
+simplifications as Phase 4a, documented in the same place. Wired into
+`rtl/m68882_proto.sv`'s opclass-000 decode alongside FADD/FSUB (a 3-way
+mux on `is_fadd`/`is_fsub`/`is_fmul`, all three cores computed
+combinationally every cycle and selected at the point of latching).
+
+**Verified**: `tb/m68882_apu_tb.sv` gained 6 more checks (15/15 total) —
+2.0×2.0=4.0 (product exactly at a power of 2, no renormalization),
+2.0×3.0=6.0 (needs the [2,4)-range renormalization), 1.5×1.5=2.25 (no
+renormalization, exercises real fractional-bit rounding),
+-1.0×3.0=-3.0 (sign combination + N condition code), 0.5×0.5=0.25 (both
+operand exponents below bias, confirming the signed exponent-sum
+arithmetic doesn't wrap). All 6 passed on the FIRST run — the carry-out
+fix Phase 4a's own FADD/FSUB bug required (widening the adder by one
+true carry-out bit) turned out to generalize correctly to FMUL's own
+renormalization logic without needing a second, independent fix.
 
 #### Phase 4c — External-operand format conversion (not started)
 Phase 3's own Operand CIR transfer path is still a raw-bytes stub (no

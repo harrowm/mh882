@@ -163,13 +163,35 @@ module m68882_proto (
 
     wire is_fadd = (c_ext == 7'h22);
     wire is_fsub = (c_ext == 7'h28);
+    wire is_fmul = (c_ext == 7'h23);
 
+    logic [95:0] addsub_result, mul_result;
+    logic        addsub_z, addsub_n, addsub_i, addsub_nan, addsub_operr;
+    logic        mul_z, mul_n, mul_i, mul_nan, mul_operr;
     logic [95:0] apu_result;
     logic        apu_flag_z, apu_flag_n, apu_flag_i, apu_flag_nan, apu_flag_operr;
 
     always_comb begin
         fp_add_sub(apu_a_rd, apu_b_rd, is_fsub, round_mode_t'(fpcr_o[5:4]),
-                   apu_result, apu_flag_z, apu_flag_n, apu_flag_i, apu_flag_nan, apu_flag_operr);
+                   addsub_result, addsub_z, addsub_n, addsub_i, addsub_nan, addsub_operr);
+        fp_mul(apu_a_rd, apu_b_rd, round_mode_t'(fpcr_o[5:4]),
+               mul_result, mul_z, mul_n, mul_i, mul_nan, mul_operr);
+
+        if (is_fmul) begin
+            apu_result     = mul_result;
+            apu_flag_z     = mul_z;
+            apu_flag_n     = mul_n;
+            apu_flag_i     = mul_i;
+            apu_flag_nan   = mul_nan;
+            apu_flag_operr = mul_operr;
+        end else begin
+            apu_result     = addsub_result;
+            apu_flag_z     = addsub_z;
+            apu_flag_n     = addsub_n;
+            apu_flag_i     = addsub_i;
+            apu_flag_nan   = addsub_nan;
+            apu_flag_operr = addsub_operr;
+        end
     end
 
     // Condition CIR predicate field + FPSR Z bit (combinational)
@@ -274,7 +296,7 @@ module m68882_proto (
                                 ca_r    <= 1'b0;
                                 prim_r  <= PRIM_NULL;
                                 state_r <= ST_IDLE;
-                                if (is_fadd || is_fsub) begin
+                                if (is_fadd || is_fsub || is_fmul) begin
                                     apu_wr_en     <= 1'b1;
                                     apu_wr_sel    <= c_ry;
                                     apu_wr_data   <= apu_result;
