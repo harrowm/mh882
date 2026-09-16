@@ -189,6 +189,11 @@ state-size byte):
 
 ## MC68882-Specific Architecture (why this chip, not a 68881, was asked for)
 
+**Every mechanism this section describes is now IMPLEMENTED (Phase 6)** --
+see plan.md's own Phase 6 writeup for the full derivation, bugs found,
+and the 32-check `tb/m68882_pipeline_tb.sv` test that exercises all of
+it end to end.
+
 **Three-stage internal pipeline** (Section 1.2/1.2.1): **BIU** (bus
 interface unit) → **CU** (conversion unit — converts operands to/from
 the internal extended-precision format) → **APU** (arithmetic processing
@@ -228,13 +233,27 @@ and simply never causes a violation if skipped. This chip maintains 3
 SEPARATE per-pipeline-stage instruction-address registers (BIU/CU/APU);
 the PC value written to the Instruction Address CIR "rides along" with
 its own instruction through each pipeline stage, and FPIAR (the
-host-visible one) is specifically the APU-stage register.
+host-visible one) is specifically the APU-stage register. **Phase 6
+implements 2 of the 3 concretely** — the CU-stage register
+(`m68882_proto.sv`'s own internal `cu_instr_addr_r`) and the APU-stage
+one (FPIAR itself, auto-loading the instant an instruction genuinely
+enters the APU — immediate dispatch or slot-B promotion, never mere
+slot-B staging). The 3rd, main-processor-side "BIU stage" address is
+outside this coprocessor's own boundary — there is no real instruction
+prefetch/stream on this chip's own side for a BIU-stage register to
+track; the main processor's own PC is never visible here beyond whatever
+address it once chooses to write to Instruction Address CIR.
 
 **CA-bit flexibility**: the 68881 always sets CA=1 for every non-null
 primitive. This chip may issue an Evaluate-EA-and-Transfer-Data primitive
 with CA=0 in cases where skipping the automatic Response-CIR recheck
 doesn't affect correctness — a pipelining optimization the 68881 never
-has the internal structure to make.
+has the internal structure to make. **Investigated and deliberately NOT
+implemented in Phase 6**: with no real main-processor instruction stream
+driving this FPU yet (Phase 7/8 territory), there is no independently
+testable behavioral difference to build against — the register-to-
+register CA=0 case this project already implements (Table 4-13 Note 1,
+since Phase 4a) already demonstrates the underlying mechanism.
 
 **APU/CU concurrent-exception attribution** (Section 7.5.4.2 — a real
 protocol trap this RTL must model faithfully, not simplify away): when an
@@ -257,7 +276,15 @@ the pending primitive and corrupts the suspended protocol. The only
 valid way to inspect this chip's state mid-dialog is FSAVE (examine the
 frame) then FRESTORE (reinstate) — a real constraint on how this
 project's own future verification harness (Phase 7) may probe internal
-state without disturbing it.
+state without disturbing it. **Phase 6 implements the exact case this
+project can currently exercise**: a trapped arithmetic exception
+detected at slot-A commit sets Take-Mid-Instruction-Exception and it
+persists across Response CIR reads (XA alone does nothing to it) until a
+COMPLETING FSAVE clears it back to null. The more elaborate "exception in
+the APU while a genuinely DIFFERENT instruction is independently visible
+via the CU's own external-transfer dialog" sub-case remains theoretical
+without a real concurrent EA-transfer-plus-arithmetic scenario to test it
+against — a real, still-open sub-case, not silently dropped.
 
 ## Module Hierarchy
 
@@ -282,13 +309,19 @@ m68882_top            Pin-compatible top level. clk_4x is a plain port (Phase 1
 │                       6 opclasses) + Save/Restore CIR FSAVE/FRESTORE state-frame dialog
 │                       (IMPLEMENTED, Phase 5 — real protocol shape, placeholder payload
 │                       content, see Current State)
-├── m68882_regfile      FP0-FP7 (96-bit each), FPCR, FPSR, FPIAR (IMPLEMENTED, Phase 3)
-├── m68882_cu           Conversion unit (format conversion, 68882-only pipeline stage) (Phase 6)
+├── m68882_regfile      FP0-FP7 (96-bit each), FPCR (2 write ports: shared ctrl_wr_en path +
+│                       a dedicated fpiar_auto_wr_en port for the pipeline's own auto-load,
+│                       Phase 6), FPSR, FPIAR (IMPLEMENTED, Phase 3, widened Phase 6)
 └── m68882_apu          Arithmetic processing unit. FADD/FSUB/FMUL/FDIV/FABS/FNEG/FCMP/
                         FTST/FSQRT register-to-register + L/S/D/X external-operand format
                         conversion all IMPLEMENTED (Phase 4a/4b/4c, real extended-precision
                         arithmetic, all 4 rounding modes); the transcendental set and W/B/P
-                        formats remain (see Current State/plan.md)
+                        formats remain (see Current State/plan.md). The CU's own conversion-
+                        unit role (Section 1.2.1) is implemented directly inside
+                        m68882_proto.sv, not as a separate module -- it was never more than
+                        the existing opclass 010/011 format-conversion dialog plus (Phase 6)
+                        the real 2-deep APU pipeline staging logic, both genuinely CU-side
+                        responsibilities that never needed their own module boundary.
 ```
 
 Keep each module under ~3000 lines, matching MH030's own guideline.
@@ -320,7 +353,9 @@ doesn't need to (and can't) account for.
 
 ## Current State
 
-**Phases 0-3 are complete.**
+**Phases 0-6 are complete** (see the Phase 6 closing paragraph a few
+sections above and plan.md for the full writeup; Phases 0-3 below cover
+the earliest history in more detail).
 
 - **Phase 0** (spec foundation): this file.
 - **Phase 1** (clock domain + pin-level BIU skeleton): `rtl/m68882_sync.sv`
@@ -534,11 +569,36 @@ cycle (genuine bus contention, caught via the write data reading back
 as X); and a control pulse (`null_reset_en`) that was set but never
 cleared, which would have permanently held the whole register file in
 reset after the first Null-frame restore. `tb/m68882_frame_tb.sv` (new,
-28/28 checks). **114/114 across all four testbenches.**
+28/28 checks). 114/114 across all four testbenches at the time.
 
-See `plan.md` for the full phased build plan. Phase 6 (68882-specific
-pipelining) is next.
+**Phase 6 (68882-specific pipelining) is also complete.** The real
+BIU→CU→APU differentiator over the 68881: a genuine 2-deep APU pipeline
+(slot A executing, slot B staged and waiting, a 3rd dispatch rejected
+while both are full — Section 7.2.6), which needed real multi-cycle APU
+execution latency to exist at all (own placeholder cycle counts, not a
+real timing table — see plan.md) since every op through Phase 5 finished
+combinationally in the same tick it dispatched. Also: the mandatory
+Instruction Address CIR requirement (a new `ST_WAIT_IADDR` dialog state,
+with a `proto_violation_r` pulse standing in for Coprocessor Protocol
+Violation), real per-pipeline-stage instruction-address tracking (FPIAR
+now genuinely auto-loads on APU entry via a new dedicated regfile port),
+real AB-vs-XA Control CIR semantics (replacing the old 68881-style
+unconditional-abort model), and the exception-primitive-persists-until-
+FSAVE rule (Section 7.5.4.2) actually wired up. FCMP moved from an
+instant CU-only op into the real APU pipeline slot — both a genuine
+hardware-realism improvement (it shares the identical adder FADD/FSUB
+already use) and the fix for a confirmed Icarus Verilog tool bug found
+while building this (two independent `always_comb` call sites of the
+same `automatic` task caused a genuine zero-simulation-time livelock —
+see plan.md for the full bisection). All 4 existing testbenches updated
+for the new mandatory-dispatch sequencing; a new `tb/m68882_pipeline_tb.sv`
+(32 checks) exercises the full 2-deep overlap, busy-reject, protocol-
+violation, AB, and XA/FSAVE sequences end to end. **146/146 across all
+five testbenches.**
+
+See `plan.md` for the full phased build plan. Phase 7 (verification
+harness) is next.
 
 ```bash
-make test   # builds and runs all three testbenches via Icarus Verilog
+make test   # builds and runs all five testbenches via Icarus Verilog
 ```

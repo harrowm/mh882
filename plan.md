@@ -1,6 +1,6 @@
 # MC68882 FPU — Phased Scope Plan
 
-## Status: Phases 0-4 complete (4a/4b core arithmetic, transcendentals deferred; 4c L/S/D/X conversion, W/B/P remain; 4d exception/accrued-byte semantics). Phase 5 (state frame save/restore) complete. Phase 6 (68882-specific pipelining) is next.
+## Status: Phases 0-5 complete (4a/4b core arithmetic, transcendentals deferred; 4c L/S/D/X conversion, W/B/P remain; 4d exception/accrued-byte semantics; 5 state frame save/restore). Phase 6 (68882-specific pipelining) complete. Phase 7 (verification harness) is next.
 
 ## Origin
 
@@ -863,18 +863,221 @@ Restore CIR's own old raw-storage behavior (now a real dialog, repurposed
 into a genuine Phase 5 protocol check instead of a generic bus-timing
 one). **114/114 across all four testbenches.**
 
-### Phase 6 — 68882-specific pipelining (BIU → CU → APU overlap)
-The genuine 68882 differentiator (Section 5.1.1, confirmed above): the
-CU accepts and stages a second arithmetic instruction (converting B/W/L/P
-operands, prefetching via the BIU) while the APU is still busy with the
-first, then hands off once the APU frees. Also: per-pipeline-stage
-Instruction Address tracking (mandatory PC transfer), AB abort-window
-semantics vs. XA exception-ack, CA=0 optimization opportunities, and the
-still-unread APU/CU-concurrent-exception-attribution nuance flagged
-above. Deliberately sequenced last — a concurrency/overlap layer on top
-of a protocol and arithmetic core that must be correct and functionally
-complete first; Phases 1-5 alone already give a fully correct, just less
-concurrent, 68882.
+### Phase 6 — 68882-specific pipelining (BIU → CU → APU overlap), COMPLETE
+
+**Scope decision, made explicitly rather than silently narrowed**: the
+user directed that this phase implement the real overlap mechanism, not
+a documented deferral. Doing that honestly required a genuine
+architectural change — every arithmetic op through Phase 5 completed
+within the same tick its Command CIR word was written (pure combinational
+math, zero real execution latency), so there was structurally nothing
+for a second instruction to overlap WITH. Phase 6 introduces the missing
+ingredient (real, multi-cycle APU execution latency) specifically so the
+overlap mechanism has something genuine to demonstrate, rather than
+inventing pipelining machinery with no observable effect.
+
+**1. Genuine 2-deep APU pipeline (`m68882_proto.sv`)**: two real
+hardware slots, not a queue —
+  - **Slot A** (`slotA_*_r`/`apu_busy_cnt_r`): the instruction currently
+    EXECUTING in the APU. Only FADD/FSUB/FMUL/FDIV/FSQRT and (see item 4
+    below) FCMP ever occupy it — real multi-cycle work.
+  - **Slot B** (`slotB_*_r`): a SECOND arithmetic instruction the CU
+    stages (captures operands/opcode/destination/rounding mode from the
+    live register file) while slot A is still busy, waiting for slot A to
+    free. This is literally "genuine 2-deep pipelining, not just faster
+    single-instruction dispatch" — plan.md's own Phase 0 research
+    citation for Section 5.1.1.
+  - A **3rd** arithmetic dispatch arriving while BOTH slots are full is
+    rejected per Section 7.2.6 ("busy APU, defer command word"): Response
+    reports CA=1 (busy, Null payload) instead of accepting the command
+    word; nothing about either slot changes; a real host is expected to
+    retry the identical Command+Instruction-Address sequence later.
+  - CU-only ops (FMOVE-class opclass 010/011/100/101/110/111, plus
+    FABS/FNEG/FTST — Table 5-1's own Minimum-Concurrency Instructions,
+    trivial sign-bit ops needing no pipeline stage) complete INSTANTLY
+    regardless of slot A/B occupancy — this is the other half of the real
+    concurrency guarantee: a genuinely register-move-only instruction is
+    never blocked by an in-flight arithmetic op.
+  - Per-opcode latency (`apu_latency()`, own placeholder convention, NOT
+    confirmed against a real 68882 timing table — none was located in
+    this project's own manual extraction, unlike MH030's own extensively
+    cross-checked S-state tables): ADD/SUB/CMP=50, MUL=100, DIV=200,
+    SQRT=250 cycles. Deliberately spread wide and non-trivial —
+    generous enough that the 2-deep overlap window is comfortably
+    observable in simulation against this project's OWN real CIR
+    bus-dialog overhead (a single Command+Instruction-Address+Response
+    dispatch sequence costs ~25-30 `clk_4x` ticks on its own bus timing
+    alone), not just nominally present. The exact values were tuned
+    empirically (see the debugging note below) rather than guessed once.
+
+**2. Mandatory Instruction Address CIR (Section 5.1.1)**: unlike the
+68881 (PC transfer optional), the 68882 REQUIRES the main processor to
+write Instruction Address CIR as the very next access after every
+Command CIR write, before doing anything else — including reading
+Response CIR. Modeled via a new `ST_WAIT_IADDR` dialog state: Command CIR
+write now only captures the raw command-word fields into registers
+(`cmd_opclass_r`/`cmd_rx_r`/`cmd_ry_r`/`cmd_ext_r`/`cmd_multi_mask_r`/
+`cmd_round_r`) and transitions here; the REAL opclass dispatch decode
+(everything Phases 3-5 did directly on the Command CIR write) now fires
+on the FOLLOWING Instruction Address CIR write instead. Any OTHER CIR
+access while `state_r==ST_WAIT_IADDR` pulses `proto_violation_r` — a
+real, testable stand-in for Coprocessor Protocol Violation (vector 13),
+which is architecturally raised by the MAIN PROCESSOR, not this chip
+(MH030's own CLAUDE.md documents that side as out of scope there for
+the same "needs a real attached coprocessor" reason this project exists
+to eventually close). This requirement applies to Command CIR dispatch
+only, not Condition CIR (a materially different, main-processor-side
+cpBcc/cpScc dialog this project only models minimally).
+
+**3. Per-pipeline-stage instruction address + real FPIAR auto-load**:
+`cu_instr_addr_r` (new, internal) is the real "CU-stage" register,
+captured from every Instruction Address CIR write. FPIAR
+(`m68882_regfile.sv`) is confirmed by the Phase 0 research to be
+specifically the "APU-stage" one of the 68882's 3 real per-pipeline-stage
+instruction-address registers — the only one that's actually
+programmer-visible. It now auto-loads (a NEW dedicated
+`fpiar_auto_wr_en`/`fpiar_auto_wr_data` regfile port, deliberately
+separate from the shared `ctrl_wr_en` path every other control register
+uses) the moment an instruction genuinely ENTERS the APU — immediate
+dispatch into a free slot A, or slot B's own later promotion into slot
+A — NOT at mere slot-B staging time. The dedicated port exists because a
+slot-A commit (an FPSR write via the shared `ctrl_wr_en` port) and a
+slot-B promotion (an FPIAR auto-load) can both need to happen on the
+SAME cycle — one shared port could never express that. FMOVE-class
+dispatches never touch FPIAR at all (correct — they never touch the
+APU); the 3rd, main-processor-side "BIU stage" address is outside this
+coprocessor's own boundary (no BIU-stage register exists here — the main
+processor's own PC is never visible beyond whatever address it once
+writes to Instruction Address CIR).
+
+**4. FCMP folded into the APU pipeline, not left instant** — both a real
+design refinement AND the fix for a confirmed Icarus tool bug (see
+below): FCMP shares the IDENTICAL adder hardware FADD/FSUB already use
+(Section 4.5.5.1: FCMP computes "as if" FPn-source were subtracted), so
+real contention with an in-flight FADD/FSUB for that shared resource is
+correct modeling, not a simplification. `APU_OP_CMP` reuses the ADD/SUB
+default case in the slot-A result mux; at commit, FPn is never written
+(Section 4.5.5.1's own "FPn itself is unaffected" rule, mirroring FTST's
+identical exclusion in the instant-op path).
+
+**5. Real AB vs. XA Control CIR semantics (`m68882_cir.sv`)**, replacing
+Phase 3's 68881-style "any write is an unconditional total abort":
+  - **AB** (bit0 of the 16-bit Control CIR field — this project's own
+    unconfirmed internal bit-position convention, matching the Response
+    Primitive payload precedent; only the AB-vs-XA semantic distinction
+    itself, Section 7.5.4, is confirmed, not the bit position): terminates
+    whatever dialog is genuinely in an abort window (`state_r != ST_IDLE`,
+    including a stuck `ST_WAIT_IADDR`) — a no-op if the FPCP is already
+    idle.
+  - **XA** (bit1): the main processor's exception handler acknowledging a
+    reported FP exception. Deliberately a pure pass-through pulse with NO
+    RTL effect of its own — Section 7.5.4.2, confirmed directly: "the
+    write-exception-acknowledge operation does NOT itself cause a null
+    primitive — only the exception handler's own FSAVE changes the
+    primitive back to null." Verified directly (see item 6): writing XA
+    alone leaves a pending exception primitive completely unchanged.
+
+**6. Exception-primitive persistence until FSAVE (Section 7.5.4.2)**: on
+slot-A commit, if FPCR's ENABLE byte (bits[15:8], same positions as the
+EXC byte) requests a trap for a flag that fired, the Response primitive
+becomes `PRIM_TAKE_MID` (CA=1) instead of reverting to Null, and this
+persists across every subsequent Response CIR read (already structurally
+true — `prim_r` was never touched by an ordinary Response CIR read to
+begin with). Only a COMPLETING FSAVE (the state-frame payload transfer's
+own last Operand CIR access) clears it back to Null — implemented as a
+narrow, explicit check (`prim_r==PRIM_TAKE_MID||PRIM_TAKE_PRE`) at that
+one completion point, not a blanket "FSAVE always clears it" rule that
+could have disturbed an ordinary in-progress-dialog Busy-frame save.
+BSUN/`PRIM_TAKE_PRE` are still not raised anywhere (BSUN needs the
+still-stubbed conditional-predicate set) — only the CLEARING side is
+wired, ready for whenever a future phase starts raising it.
+`apu_pipeline_busy` (slot A or B occupied) now also correctly forces the
+Save-frame Busy classification, even when `state_r` itself is idle — a
+real in-flight arithmetic instruction genuinely is "busy" for FSAVE
+purposes, not just an open CU dialog.
+
+**A real, latent bug found and fixed while building this**: the slot-A
+commit path originally set `prim_r<=PRIM_TAKE_MID` without ever touching
+`dr_r` — every OTHER non-Null primitive transition in this codebase
+explicitly sets `dr_r`, and `dr_eff`'s own staleness guard (documented in
+its header comment) only protects reverting TO null, not a genuinely NEW
+non-null primitive that never sets `dr_r` itself. Left as-is, the
+Response CIR's DR bit for a Take-Mid-Instruction-Exception primitive
+would have leaked whatever stale value the last unrelated EA-transfer
+dialog happened to leave there. Fixed by explicitly pinning `dr_r<=0` at
+the same point `prim_r<=PRIM_TAKE_MID` is set.
+
+**A genuine Icarus Verilog tool bug found and fixed (not a logic bug)**:
+building the slot-A combinational arithmetic core caused the ENTIRE
+simulation to hang — a true zero-simulation-time delta-cycle livelock,
+confirmed via direct instrumentation (`$display` inside the suspect
+`always_comb` block showed it re-triggering itself indefinitely at
+`t=0`, never advancing). Bisected by selectively stubbing pieces: the
+cause was TWO SEPARATE `always_comb` processes each independently
+calling the SAME `automatic` task (`fp_add_sub` — once for the original
+instant-FCMP path, once for the new slot-A pipeline). Removing either
+call site individually fixed it; the task's own logic, tested in
+isolation, was never at fault. Rather than work around this with an
+awkward duplicate-logic-avoidance hack, item 4 above (folding FCMP into
+the slot-A pipeline, reusing its ONE call site) fixes the tool issue AND
+is independently the more realistic hardware choice. Documented here as
+a new, general Icarus limitation for this project's own record (joining
+the existing list in the RTL's own header comments): **two independent
+`always_comb` call sites of the same `automatic` task can livelock this
+specific simulator** — consolidate to one call site, don't just retry.
+
+**A real regression found and fixed while wiring up the mandatory-IA
+dispatch restructuring**: splitting the old unconditional
+`ca_r<=0;prim_r<=NULL;state_r<=ST_IDLE;` (which ran regardless of
+whether the opclass-000 extension field matched a real opcode) into an
+if/else-if chain accidentally dropped the fallback for an UNRECOGNIZED
+extension-field opcode (the still-deliberately-stubbed transcendental
+set) — such a dispatch would have left the dialog stuck in
+`ST_WAIT_IADDR` forever, since neither branch matched and nothing else
+reset `state_r`. Caught by `tb/m68882_frame_tb.sv`'s own pre-existing
+"a real Command CIR dialog works normally right afterward" check (which
+happens to dispatch a no-op-extension opcode 000 instruction) failing
+after the restructuring. Fixed by adding back an explicit `else` arm.
+
+**New dedicated test, `tb/m68882_pipeline_tb.sv` (32 checks)**: dispatches
+a slow FDIV (occupies slot A), confirms an FABS dispatched WHILE it's
+busy completes instantly and leaves slot A completely undisturbed,
+confirms a second FADD dispatched while still busy is accepted into slot
+B (Response still Null/CA=0 — the main processor is never blocked),
+confirms a THIRD arithmetic dispatch (FMUL) while both slots are full is
+rejected (CA=1), waits for the FDIV to commit and the FADD to promote
+from slot B into slot A (confirming FPIAR auto-loads the PROMOTED
+instruction's own address, not the stale FDIV one), retries the
+previously-rejected FMUL (now accepted into the freed slot B), confirms
+both remaining results eventually commit correctly, confirms the
+mandatory-Instruction-Address protocol-violation detection (and that AB
+recovers a dialog stuck that way), confirms AB aborting a genuinely
+in-progress external-operand dialog, and confirms the full XA-vs-FSAVE
+exception-primitive-persistence sequence (force an OVFL trap, confirm
+Take-Mid-Instruction-Exception reports, confirm XA alone changes
+nothing, confirm a completing FSAVE clears it). All 4 existing
+testbenches updated for the new mandatory Instruction-Address-CIR
+requirement (every Command CIR dispatch site now followed by an
+Instruction Address CIR write) and, in `tb/m68882_apu_tb.sv`'s case, a
+new `dispatch()` helper that polls the real pipeline-occupancy registers
+instead of a fixed `repeat(2)` — the old fixed-delay assumption
+(register-to-register ops complete within a couple of ticks) is no
+longer true now that real arithmetic has genuine multi-cycle latency.
+**146/146 across all five testbenches** (11+27+48+28+32).
+
+**Deliberately not attempted, and why**: BIU-side instruction prefetch
+overlap and CA=0-skips-the-automatic-Response-recheck micro-optimizations
+were investigated and left out — both would add complexity with no
+independently testable behavioral difference at this project's current
+scope (there is no real "main processor" driving this FPU with its own
+instruction stream yet; that's Phase 7/8 territory). The
+APU/CU-concurrent-exception-attribution nuance (Section 7.5.4.2) is now
+implemented for the case this project can actually exercise (a trapped
+arithmetic exception on slot-A commit); the specific "exception occurs
+in the APU while a DIFFERENT instruction is independently visible via the
+CU's own external-transfer dialog" sub-case remains theoretical without
+a genuine concurrent EA-transfer-plus-arithmetic scenario to test it
+against — noted as a real, still-open sub-case, not silently dropped.
 
 ### Phase 7 — Verification harness
 Mirror MH030's own trace-driven co-simulation methodology. MH030's own

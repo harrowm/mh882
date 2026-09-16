@@ -73,6 +73,7 @@ module m68882_top (
     logic [31:0] cir_d_out, proto_d_out;
     logic        cir_d_oe,  proto_d_oe;
     logic        abort;
+    logic        xa_pulse;
 
     m68882_cir u_cir (
         .clk_4x,
@@ -83,7 +84,8 @@ module m68882_top (
         .d_in  (d),
         .d_out (cir_d_out),
         .d_oe  (cir_d_oe),
-        .abort (abort)
+        .abort (abort),
+        .xa_pulse (xa_pulse)
     );
 
     m68882_proto u_proto (
@@ -93,6 +95,7 @@ module m68882_top (
         .cyc_write,
         .cyc_sel,
         .abort,
+        .xa_pulse,
         .d_in  (d),
         .d_out (proto_d_out),
         .d_oe  (proto_d_oe)

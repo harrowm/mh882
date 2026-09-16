@@ -11,11 +11,23 @@
 //
 // FPCR/FPSR/FPIAR: 32-bit each (Section 1.2/2.3).
 //
-// This is plain storage with simple word-addressed read/write ports --
-// no arithmetic (Phase 4) and no pipeline-stage instruction-address
-// tracking (Phase 6, which needs FPIAR to become 3 separate per-stage
-// registers internally). A single flat FPIAR is sufficient for Phase 3's
-// own protocol-only scope.
+// This is plain storage with simple word-addressed read/write ports.
+//
+// Phase 6: FPIAR gained a SECOND, dedicated write port
+// (fpiar_auto_wr_en/fpiar_auto_wr_data), separate from the general
+// ctrl_wr_en/ctrl_wr_sel/ctrl_wr_data port every other control register
+// still shares. Reason: the APU pipeline (m68882_proto.sv) can need to
+// commit a just-finished instruction's FPSR update AND auto-load FPIAR
+// with the address of the instruction now ENTERING the APU stage (slotB
+// promoted to slotA) on the very same cycle -- two independent control-
+// register writes in one tick, which the old single shared port could
+// never express. FPIAR itself remains the single, real "APU-stage
+// instruction address" register (plan.md's own Phase 0 research: of the
+// 3 per-pipeline-stage instruction-address registers the 68882 genuinely
+// has, FPIAR is specifically the APU one -- the only one visible to the
+// programmer). The CU-stage register (m68882_proto.sv's own
+// cu_instr_addr_r) is internal, not part of this file's programmer-
+// visible register file.
 
 module m68882_regfile (
     input  logic clk_4x,
@@ -50,6 +62,15 @@ module m68882_regfile (
     input  logic [1:0] ctrl_wr_sel,
     input  logic       ctrl_wr_en,
     input  logic [31:0] ctrl_wr_data,
+
+    // Phase 6: dedicated FPIAR auto-load port (see header comment) --
+    // takes priority over ctrl_wr_en/ctrl_wr_sel==FPIAR on any cycle both
+    // happen to be asserted together (the automatic pipeline load is the
+    // architecturally "later" event within the same tick: slotB only
+    // promotes to slotA AFTER slotA's own commit has already claimed the
+    // shared ctrl_wr_en port for the FPSR write).
+    input  logic       fpiar_auto_wr_en,
+    input  logic [31:0] fpiar_auto_wr_data,
 
     // Direct debug/condition-evaluation read ports (Phase 3's own
     // Condition CIR logic needs FPSR's condition-code byte without going
@@ -117,10 +138,14 @@ module m68882_regfile (
                 unique case (ctrl_wr_sel)
                     2'd0: fpcr_r  <= ctrl_wr_data;
                     2'd1: fpsr_r  <= ctrl_wr_data;
-                    2'd2: fpiar_r <= ctrl_wr_data;
+                    2'd2: if (!fpiar_auto_wr_en) fpiar_r <= ctrl_wr_data;
                     default: ;
                 endcase
             end
+            // Phase 6: independent of the block above, so an FPSR commit
+            // write (ctrl_wr_sel==FPSR) and an FPIAR auto-load can both
+            // land in the same cycle.
+            if (fpiar_auto_wr_en) fpiar_r <= fpiar_auto_wr_data;
         end
     end
 

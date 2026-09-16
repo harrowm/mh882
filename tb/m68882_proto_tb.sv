@@ -130,6 +130,7 @@ module m68882_proto_tb;
         // integer converts to extended precision 5.0 = 1.01(binary)*2^2,
         // exp=16385=0x4001, mantissa=0xA000000000000000 (EXT_5_0 below).
         run_cycle(CIR_COMMAND, 1'b1, cmd_word(3'b010, FMT_L, 3'd3, 7'd0), rd);
+        run_cycle(CIR_INSTRADDR, 1'b1, 32'h0000_1000, rd); // Phase 6: mandatory Instruction Address CIR
         run_cycle(CIR_RESPONSE, 1'b0, 32'h0, rd);
         check(rd[31:16] == {1'b1, 1'b0, 1'b0, 13'(PRIM_EVAL_EA)},
               "opclass 010: Response = CA=1,DR=0,PRIM_EVAL_EA");
@@ -143,6 +144,7 @@ module m68882_proto_tb;
 
         // ── opclass 011: FP3 (5.0) -> external Long-Word-Integer operand ─
         run_cycle(CIR_COMMAND, 1'b1, cmd_word(3'b011, FMT_L, 3'd3, 7'd0), rd);
+        run_cycle(CIR_INSTRADDR, 1'b1, 32'h0000_1000, rd); // Phase 6: mandatory Instruction Address CIR
         run_cycle(CIR_RESPONSE, 1'b0, 32'h0, rd);
         check(rd[31:16] == {1'b1, 1'b0, 1'b1, 13'(PRIM_EVAL_EA)},
               "opclass 011: Response = CA=1,DR=1,PRIM_EVAL_EA");
@@ -155,6 +157,7 @@ module m68882_proto_tb;
 
         // ── opclass 100: move to FPCR ────────────────────────────────────
         run_cycle(CIR_COMMAND, 1'b1, cmd_word(3'b100, 3'b100, 3'b000, 7'd0), rd);
+        run_cycle(CIR_INSTRADDR, 1'b1, 32'h0000_1000, rd); // Phase 6: mandatory Instruction Address CIR
         run_cycle(CIR_RESPONSE, 1'b0, 32'h0, rd);
         check(rd[31:16] == {1'b1, 1'b0, 1'b0, 13'(PRIM_XFER_SINGLE)},
               "opclass 100: Response = CA=1,DR=0,PRIM_XFER_SINGLE");
@@ -167,6 +170,7 @@ module m68882_proto_tb;
 
         // ── opclass 101: FPSR -> memory (round-trip via opclass 100 first) ──
         run_cycle(CIR_COMMAND, 1'b1, cmd_word(3'b100, 3'b010, 3'b000, 7'd0), rd); // move to FPSR
+        run_cycle(CIR_INSTRADDR, 1'b1, 32'h0000_1000, rd); // Phase 6: mandatory Instruction Address CIR
         run_cycle(CIR_RESPONSE, 1'b0, 32'h0, rd);
         run_cycle(CIR_OPERAND, 1'b1, 32'h0400_0000, rd); // Z bit (bit26) set
         run_cycle(CIR_RESPONSE, 1'b0, 32'h0, rd);
@@ -174,6 +178,7 @@ module m68882_proto_tb;
         repeat (4) @(posedge clk_4x);
 
         run_cycle(CIR_COMMAND, 1'b1, cmd_word(3'b101, 3'b010, 3'b000, 7'd0), rd); // FPSR to memory
+        run_cycle(CIR_INSTRADDR, 1'b1, 32'h0000_1000, rd); // Phase 6: mandatory Instruction Address CIR
         run_cycle(CIR_RESPONSE, 1'b0, 32'h0, rd);
         check(rd[31:16] == {1'b1, 1'b0, 1'b1, 13'(PRIM_XFER_SINGLE)},
               "opclass 101: Response = CA=1,DR=1,PRIM_XFER_SINGLE");
@@ -191,6 +196,7 @@ module m68882_proto_tb;
 
         // ── opclass 110: move multiple to FP0/FP1 ───────────────────────
         run_cycle(CIR_COMMAND, 1'b1, cmd_word(3'b110, 3'b000, 3'b000, 7'd3), rd); // mask=8'b0000_0011
+        run_cycle(CIR_INSTRADDR, 1'b1, 32'h0000_1000, rd); // Phase 6: mandatory Instruction Address CIR
         run_cycle(CIR_RESPONSE, 1'b0, 32'h0, rd);
         check(rd[31:16] == {1'b1, 1'b0, 1'b0, 13'(PRIM_XFER_MULTI)},
               "opclass 110: Response = CA=1,DR=0,PRIM_XFER_MULTI");
@@ -213,6 +219,7 @@ module m68882_proto_tb;
         // handling) -- -5.0 = -1.01(binary)*2^2, same exp/mantissa as
         // +5.0 with the sign bit set.
         run_cycle(CIR_COMMAND, 1'b1, cmd_word(3'b010, FMT_L, 3'd4, 7'd0), rd);
+        run_cycle(CIR_INSTRADDR, 1'b1, 32'h0000_1000, rd); // Phase 6: mandatory Instruction Address CIR
         run_cycle(CIR_RESPONSE, 1'b0, 32'h0, rd);
         run_cycle(CIR_OPERAND, 1'b1, 32'hFFFF_FFFB, rd); // -5 two's complement
         run_cycle(CIR_RESPONSE, 1'b0, 32'h0, rd);
@@ -226,6 +233,7 @@ module m68882_proto_tb;
         // extended 3.5 = 1.11(binary)*2^1, exp=16384=0x4000,
         // mantissa=0xE000000000000000 (EXT_3_5 above).
         run_cycle(CIR_COMMAND, 1'b1, cmd_word(3'b010, FMT_S, 3'd4, 7'd0), rd);
+        run_cycle(CIR_INSTRADDR, 1'b1, 32'h0000_1000, rd); // Phase 6: mandatory Instruction Address CIR
         run_cycle(CIR_RESPONSE, 1'b0, 32'h0, rd);
         run_cycle(CIR_OPERAND, 1'b1, 32'h4060_0000, rd);
         run_cycle(CIR_RESPONSE, 1'b0, 32'h0, rd);
@@ -236,6 +244,7 @@ module m68882_proto_tb;
 
         // ── opclass 011: FP4 (3.5) -> Single-Precision-Real ──────────────
         run_cycle(CIR_COMMAND, 1'b1, cmd_word(3'b011, FMT_S, 3'd4, 7'd0), rd);
+        run_cycle(CIR_INSTRADDR, 1'b1, 32'h0000_1000, rd); // Phase 6: mandatory Instruction Address CIR
         run_cycle(CIR_RESPONSE, 1'b0, 32'h0, rd);
         run_cycle(CIR_OPERAND, 1'b0, 32'h0, rd);
         check(rd == 32'h4060_0000, "opclass 011: extended-precision 3.5 converts back to Single-Precision 3.5");
@@ -245,6 +254,7 @@ module m68882_proto_tb;
         // ── opclass 010: Double-Precision-Real 3.5 -> FP4 (2 chunks) ─────
         // 3.5 in IEEE double = 0x400C000000000000 (well-known bit pattern).
         run_cycle(CIR_COMMAND, 1'b1, cmd_word(3'b010, FMT_D, 3'd4, 7'd0), rd);
+        run_cycle(CIR_INSTRADDR, 1'b1, 32'h0000_1000, rd); // Phase 6: mandatory Instruction Address CIR
         run_cycle(CIR_RESPONSE, 1'b0, 32'h0, rd);
         run_cycle(CIR_OPERAND, 1'b1, 32'h400C_0000, rd);
         run_cycle(CIR_OPERAND, 1'b1, 32'h0000_0000, rd);
@@ -256,6 +266,7 @@ module m68882_proto_tb;
 
         // ── opclass 011: FP4 (3.5) -> Double-Precision-Real (2 chunks) ───
         run_cycle(CIR_COMMAND, 1'b1, cmd_word(3'b011, FMT_D, 3'd4, 7'd0), rd);
+        run_cycle(CIR_INSTRADDR, 1'b1, 32'h0000_1000, rd); // Phase 6: mandatory Instruction Address CIR
         run_cycle(CIR_RESPONSE, 1'b0, 32'h0, rd);
         run_cycle(CIR_OPERAND, 1'b0, 32'h0, rd);
         check(rd == 32'h400C_0000, "opclass 011: extended 3.5 converts back to Double-Precision 3.5, chunk 0");
@@ -267,6 +278,7 @@ module m68882_proto_tb;
         // ── opclass 010/011: Extended-Precision-Real (X) is a pure
         // passthrough -- 3 chunks, no conversion at all.
         run_cycle(CIR_COMMAND, 1'b1, cmd_word(3'b010, FMT_X, 3'd5, 7'd0), rd);
+        run_cycle(CIR_INSTRADDR, 1'b1, 32'h0000_1000, rd); // Phase 6: mandatory Instruction Address CIR
         run_cycle(CIR_RESPONSE, 1'b0, 32'h0, rd);
         run_cycle(CIR_OPERAND, 1'b1, 32'h1111_2222, rd);
         run_cycle(CIR_OPERAND, 1'b1, 32'h3333_4444, rd);
@@ -278,6 +290,7 @@ module m68882_proto_tb;
         repeat (4) @(posedge clk_4x);
 
         run_cycle(CIR_COMMAND, 1'b1, cmd_word(3'b011, FMT_X, 3'd5, 7'd0), rd);
+        run_cycle(CIR_INSTRADDR, 1'b1, 32'h0000_1000, rd); // Phase 6: mandatory Instruction Address CIR
         run_cycle(CIR_RESPONSE, 1'b0, 32'h0, rd);
         run_cycle(CIR_OPERAND, 1'b0, 32'h0, rd);
         check(rd == 32'h1111_2222, "opclass 011: Extended-Precision (X) passthrough out of FP5, chunk 0");

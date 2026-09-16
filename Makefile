@@ -31,12 +31,16 @@ $(SIM)/apu: $(RTL_SRCS) tb/m68882_apu_tb.sv | $(SIM)
 $(SIM)/frame: $(RTL_SRCS) tb/m68882_frame_tb.sv | $(SIM)
 	$(IV) $(IVFLAGS) -o $@ $^
 
+$(SIM)/pipeline: $(RTL_SRCS) tb/m68882_pipeline_tb.sv | $(SIM)
+	$(IV) $(IVFLAGS) -o $@ $^
+
 .PHONY: test
-test: $(SIM)/biu_smoke $(SIM)/proto $(SIM)/apu $(SIM)/frame
+test: $(SIM)/biu_smoke $(SIM)/proto $(SIM)/apu $(SIM)/frame $(SIM)/pipeline
 	$(VVP) $(SIM)/biu_smoke
 	$(VVP) $(SIM)/proto
 	$(VVP) $(SIM)/apu
 	$(VVP) $(SIM)/frame
+	$(VVP) $(SIM)/pipeline
 
 .PHONY: clean
 clean:

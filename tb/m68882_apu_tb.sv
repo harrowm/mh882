@@ -132,6 +132,29 @@ module m68882_apu_tb;
         u_top.u_proto.u_regfile.fp_r[idx] = val;
     endtask
 
+    // Phase 6: Command CIR dispatch now REQUIRES the mandatory Instruction
+    // Address CIR write next (otherwise proto_violation_r pulses and the
+    // dialog never leaves ST_WAIT_IADDR), and real arithmetic ops (FADD/
+    // FSUB/FMUL/FDIV/FSQRT/FCMP) commit only after a genuine multi-cycle
+    // APU pipeline latency (m68882_proto.sv's own apu_latency()), not
+    // instantly -- a fixed "repeat(2)" is no longer enough. Poll the real
+    // pipeline-occupancy registers instead of hardcoding a cycle count, so
+    // this test stays correct regardless of the exact placeholder latency
+    // values -- FABS/FNEG/FTST (which never occupy a slot) fall straight
+    // through with the wait loop never actually iterating.
+    task automatic dispatch(input logic [31:0] cmdw);
+        logic [31:0] rd2;
+        int wait_ticks;
+        run_cycle(CIR_COMMAND, 1'b1, cmdw, rd2);
+        run_cycle(CIR_INSTRADDR, 1'b1, 32'h0000_2000, rd2);
+        wait_ticks = 0;
+        while ((u_top.u_proto.slotA_valid_r || u_top.u_proto.slotB_valid_r) && wait_ticks < 400) begin
+            @(posedge clk_4x);
+            wait_ticks++;
+        end
+        repeat (2) @(posedge clk_4x);
+    endtask
+
     initial begin
         repeat (4) @(posedge clk_4x);
         rst_n = 1'b1;
@@ -140,8 +163,7 @@ module m68882_apu_tb;
         // ── FADD: FP0=1.0, FP1=2.0 -> FP1 = 3.0 ─────────────────────────
         load_fp(0, EXT_1_0);
         load_fp(1, EXT_2_0);
-        run_cycle(CIR_COMMAND, 1'b1, cmd_word(3'b000, 3'd0, 3'd1, 7'h22), rd); // FADD
-        repeat (2) @(posedge clk_4x);
+        dispatch(cmd_word(3'b000, 3'd0, 3'd1, 7'h22)); // FADD
         check(u_top.u_proto.u_regfile.fp_r[1] == EXT_3_0, "FADD: 1.0 + 2.0 == 3.0");
         check(u_top.u_proto.u_regfile.fpsr_r[27:24] == 4'b0000,
               "FADD: condition codes clear for a positive nonzero result");
@@ -149,197 +171,168 @@ module m68882_apu_tb;
         // ── FSUB: FP0=1.0, FP1=3.0 -> FP1 = 3.0 - 1.0 = 2.0 ─────────────
         load_fp(0, EXT_1_0);
         load_fp(1, EXT_3_0);
-        run_cycle(CIR_COMMAND, 1'b1, cmd_word(3'b000, 3'd0, 3'd1, 7'h28), rd); // FSUB
-        repeat (2) @(posedge clk_4x);
+        dispatch(cmd_word(3'b000, 3'd0, 3'd1, 7'h28)); // FSUB
         check(u_top.u_proto.u_regfile.fp_r[1] == EXT_2_0, "FSUB: 3.0 - 1.0 == 2.0");
 
         // ── FADD with a carry-out normalization: 0.5 + 0.5 = 1.0 ────────
         load_fp(0, EXT_0_5);
         load_fp(1, EXT_0_5);
-        run_cycle(CIR_COMMAND, 1'b1, cmd_word(3'b000, 3'd0, 3'd1, 7'h22), rd); // FADD
-        repeat (2) @(posedge clk_4x);
+        dispatch(cmd_word(3'b000, 3'd0, 3'd1, 7'h22)); // FADD
         check(u_top.u_proto.u_regfile.fp_r[1] == EXT_1_0, "FADD: 0.5 + 0.5 == 1.0 (carry-out renormalization)");
 
         // ── FADD: 1.0 + (-1.0) = 0.0, condition code Z set ──────────────
         load_fp(0, EXT_1_0);
         load_fp(1, EXT_N1_0);
-        run_cycle(CIR_COMMAND, 1'b1, cmd_word(3'b000, 3'd0, 3'd1, 7'h22), rd); // FADD
-        repeat (2) @(posedge clk_4x);
+        dispatch(cmd_word(3'b000, 3'd0, 3'd1, 7'h22)); // FADD
         check(u_top.u_proto.u_regfile.fp_r[1][94:0] == 95'h0, "FADD: 1.0 + (-1.0) == 0.0 (magnitude bits)");
         check(u_top.u_proto.u_regfile.fpsr_r[26] == 1'b1, "FADD: Z condition code set for a zero result");
 
         // ── FSUB: 1.5 - 0.5 = 1.0 (unequal exponents, real alignment) ───
         load_fp(0, EXT_0_5);
         load_fp(1, EXT_1_5);
-        run_cycle(CIR_COMMAND, 1'b1, cmd_word(3'b000, 3'd0, 3'd1, 7'h28), rd); // FSUB
-        repeat (2) @(posedge clk_4x);
+        dispatch(cmd_word(3'b000, 3'd0, 3'd1, 7'h28)); // FSUB
         check(u_top.u_proto.u_regfile.fp_r[1] == EXT_1_0, "FSUB: 1.5 - 0.5 == 1.0 (exponent alignment)");
 
         // ── Negative result: FSUB 1.0 - 2.0 = -1.0, N condition code ────
         load_fp(0, EXT_2_0);
         load_fp(1, EXT_1_0);
-        run_cycle(CIR_COMMAND, 1'b1, cmd_word(3'b000, 3'd0, 3'd1, 7'h28), rd); // FSUB
-        repeat (2) @(posedge clk_4x);
+        dispatch(cmd_word(3'b000, 3'd0, 3'd1, 7'h28)); // FSUB
         check(u_top.u_proto.u_regfile.fp_r[1] == EXT_N1_0, "FSUB: 1.0 - 2.0 == -1.0");
         check(u_top.u_proto.u_regfile.fpsr_r[27] == 1'b1, "FSUB: N condition code set for a negative result");
 
         // ── FMUL: 2.0 * 2.0 = 4.0 (product exactly at a power of 2) ─────
         load_fp(0, EXT_2_0);
         load_fp(1, EXT_2_0);
-        run_cycle(CIR_COMMAND, 1'b1, cmd_word(3'b000, 3'd0, 3'd1, 7'h23), rd); // FMUL
-        repeat (2) @(posedge clk_4x);
+        dispatch(cmd_word(3'b000, 3'd0, 3'd1, 7'h23)); // FMUL
         check(u_top.u_proto.u_regfile.fp_r[1] == EXT_4_0, "FMUL: 2.0 * 2.0 == 4.0");
 
         // ── FMUL: 2.0 * 3.0 = 6.0 (product needs the [2,4) renormalization) ──
         load_fp(0, EXT_2_0);
         load_fp(1, EXT_3_0);
-        run_cycle(CIR_COMMAND, 1'b1, cmd_word(3'b000, 3'd0, 3'd1, 7'h23), rd); // FMUL
-        repeat (2) @(posedge clk_4x);
+        dispatch(cmd_word(3'b000, 3'd0, 3'd1, 7'h23)); // FMUL
         check(u_top.u_proto.u_regfile.fp_r[1] == EXT_6_0, "FMUL: 2.0 * 3.0 == 6.0");
 
         // ── FMUL: 1.5 * 1.5 = 2.25 (no renormalization needed) ───────────
         load_fp(0, EXT_1_5);
         load_fp(1, EXT_1_5);
-        run_cycle(CIR_COMMAND, 1'b1, cmd_word(3'b000, 3'd0, 3'd1, 7'h23), rd); // FMUL
-        repeat (2) @(posedge clk_4x);
+        dispatch(cmd_word(3'b000, 3'd0, 3'd1, 7'h23)); // FMUL
         check(u_top.u_proto.u_regfile.fp_r[1] == EXT_2_25, "FMUL: 1.5 * 1.5 == 2.25");
 
         // ── FMUL: sign combination, -1.0 * 3.0 = -3.0 ────────────────────
         load_fp(0, EXT_N1_0);
         load_fp(1, EXT_3_0);
-        run_cycle(CIR_COMMAND, 1'b1, cmd_word(3'b000, 3'd0, 3'd1, 7'h23), rd); // FMUL
-        repeat (2) @(posedge clk_4x);
+        dispatch(cmd_word(3'b000, 3'd0, 3'd1, 7'h23)); // FMUL
         check(u_top.u_proto.u_regfile.fp_r[1] == EXT_N3_0, "FMUL: -1.0 * 3.0 == -3.0");
         check(u_top.u_proto.u_regfile.fpsr_r[27] == 1'b1, "FMUL: N condition code set for a negative product");
 
         // ── FMUL: 0.5 * 0.5 = 0.25 (both exponents below bias) ───────────
         load_fp(0, EXT_0_5);
         load_fp(1, EXT_0_5);
-        run_cycle(CIR_COMMAND, 1'b1, cmd_word(3'b000, 3'd0, 3'd1, 7'h23), rd); // FMUL
-        repeat (2) @(posedge clk_4x);
+        dispatch(cmd_word(3'b000, 3'd0, 3'd1, 7'h23)); // FMUL
         check(u_top.u_proto.u_regfile.fp_r[1] == EXT_0_25, "FMUL: 0.5 * 0.5 == 0.25");
 
         // ── FDIV: 4.0 / 2.0 = 2.0 (exact, ratio >= 1 branch) ─────────────
         load_fp(0, EXT_2_0);
         load_fp(1, EXT_4_0);
-        run_cycle(CIR_COMMAND, 1'b1, cmd_word(3'b000, 3'd0, 3'd1, 7'h20), rd); // FDIV
-        repeat (2) @(posedge clk_4x);
+        dispatch(cmd_word(3'b000, 3'd0, 3'd1, 7'h20)); // FDIV
         check(u_top.u_proto.u_regfile.fp_r[1] == EXT_2_0, "FDIV: 4.0 / 2.0 == 2.0");
 
         // ── FDIV: 3.0 / 2.0 = 1.5 (ratio < 1 branch on the mantissa divide) ──
         load_fp(0, EXT_2_0);
         load_fp(1, EXT_3_0);
-        run_cycle(CIR_COMMAND, 1'b1, cmd_word(3'b000, 3'd0, 3'd1, 7'h20), rd); // FDIV
-        repeat (2) @(posedge clk_4x);
+        dispatch(cmd_word(3'b000, 3'd0, 3'd1, 7'h20)); // FDIV
         check(u_top.u_proto.u_regfile.fp_r[1] == EXT_1_5, "FDIV: 3.0 / 2.0 == 1.5");
 
         // ── FDIV: 6.0 / 2.0 = 3.0 ────────────────────────────────────────
         load_fp(0, EXT_2_0);
         load_fp(1, EXT_6_0);
-        run_cycle(CIR_COMMAND, 1'b1, cmd_word(3'b000, 3'd0, 3'd1, 7'h20), rd); // FDIV
-        repeat (2) @(posedge clk_4x);
+        dispatch(cmd_word(3'b000, 3'd0, 3'd1, 7'h20)); // FDIV
         check(u_top.u_proto.u_regfile.fp_r[1] == EXT_3_0, "FDIV: 6.0 / 2.0 == 3.0");
 
         // ── FDIV: -6.0 / 2.0 = -3.0 (sign combination) ──────────────────
         load_fp(0, EXT_2_0);
         load_fp(1, {1'b1, EXT_6_0[94:0]}); // -6.0
-        run_cycle(CIR_COMMAND, 1'b1, cmd_word(3'b000, 3'd0, 3'd1, 7'h20), rd); // FDIV
-        repeat (2) @(posedge clk_4x);
+        dispatch(cmd_word(3'b000, 3'd0, 3'd1, 7'h20)); // FDIV
         check(u_top.u_proto.u_regfile.fp_r[1] == EXT_N3_0, "FDIV: -6.0 / 2.0 == -3.0");
 
         // ── FDIV: 1.0 / 0.0 -> signed Infinity, DZ flag set ──────────────
         load_fp(0, 96'h0); // +0.0
         load_fp(1, EXT_1_0);
-        run_cycle(CIR_COMMAND, 1'b1, cmd_word(3'b000, 3'd0, 3'd1, 7'h20), rd); // FDIV
-        repeat (2) @(posedge clk_4x);
+        dispatch(cmd_word(3'b000, 3'd0, 3'd1, 7'h20)); // FDIV
         check(u_top.u_proto.u_regfile.fp_r[1] == {1'b0, 15'h7FFF, 16'h0, 64'h8000_0000_0000_0000},
               "FDIV: 1.0 / 0.0 == +Infinity");
         check(u_top.u_proto.u_regfile.fpsr_r[10] == 1'b1, "FDIV: DZ exception-status bit set for divide-by-zero");
 
         // ── FABS: |-3.0| = 3.0 (source in RX, result to RY) ──────────────
         load_fp(0, EXT_N3_0);
-        run_cycle(CIR_COMMAND, 1'b1, cmd_word(3'b000, 3'd0, 3'd1, 7'h18), rd); // FABS
-        repeat (2) @(posedge clk_4x);
+        dispatch(cmd_word(3'b000, 3'd0, 3'd1, 7'h18)); // FABS
         check(u_top.u_proto.u_regfile.fp_r[1] == EXT_3_0, "FABS: |-3.0| == 3.0");
 
         // ── FABS: |3.0| = 3.0 (already positive, no change in sign) ─────
         load_fp(0, EXT_3_0);
-        run_cycle(CIR_COMMAND, 1'b1, cmd_word(3'b000, 3'd0, 3'd1, 7'h18), rd); // FABS
-        repeat (2) @(posedge clk_4x);
+        dispatch(cmd_word(3'b000, 3'd0, 3'd1, 7'h18)); // FABS
         check(u_top.u_proto.u_regfile.fp_r[1] == EXT_3_0, "FABS: |3.0| == 3.0");
 
         // ── FNEG: -(2.0) = -2.0 ───────────────────────────────────────────
         load_fp(0, EXT_2_0);
-        run_cycle(CIR_COMMAND, 1'b1, cmd_word(3'b000, 3'd0, 3'd1, 7'h1A), rd); // FNEG
-        repeat (2) @(posedge clk_4x);
+        dispatch(cmd_word(3'b000, 3'd0, 3'd1, 7'h1A)); // FNEG
         check(u_top.u_proto.u_regfile.fp_r[1] == {1'b1, EXT_2_0[94:0]}, "FNEG: -(2.0) == -2.0");
 
         // ── FNEG: -(-1.0) = 1.0 (double negation) ────────────────────────
         load_fp(0, EXT_N1_0);
-        run_cycle(CIR_COMMAND, 1'b1, cmd_word(3'b000, 3'd0, 3'd1, 7'h1A), rd); // FNEG
-        repeat (2) @(posedge clk_4x);
+        dispatch(cmd_word(3'b000, 3'd0, 3'd1, 7'h1A)); // FNEG
         check(u_top.u_proto.u_regfile.fp_r[1] == EXT_1_0, "FNEG: -(-1.0) == 1.0");
 
         // ── FCMP: destination register (RY) is never written ────────────
         load_fp(0, EXT_2_0);
         load_fp(1, EXT_3_0); // dest pre-loaded with a sentinel value
-        run_cycle(CIR_COMMAND, 1'b1, cmd_word(3'b000, 3'd0, 3'd1, 7'h38), rd); // FCMP
-        repeat (2) @(posedge clk_4x);
+        dispatch(cmd_word(3'b000, 3'd0, 3'd1, 7'h38)); // FCMP
         check(u_top.u_proto.u_regfile.fp_r[1] == EXT_3_0, "FCMP: destination register FP1 is never written");
 
         load_fp(0, EXT_2_0);
         load_fp(1, EXT_2_0);
-        run_cycle(CIR_COMMAND, 1'b1, cmd_word(3'b000, 3'd0, 3'd1, 7'h38), rd); // FCMP: FP1(2.0) vs 2.0
-        repeat (2) @(posedge clk_4x);
+        dispatch(cmd_word(3'b000, 3'd0, 3'd1, 7'h38)); // FCMP: FP1(2.0) vs 2.0
         check(u_top.u_proto.u_regfile.fpsr_r[26] == 1'b1, "FCMP: Z condition code set when both operands are equal");
 
         load_fp(0, EXT_3_0);
         load_fp(1, EXT_2_0);
-        run_cycle(CIR_COMMAND, 1'b1, cmd_word(3'b000, 3'd0, 3'd1, 7'h38), rd); // FCMP: FP1(2.0) vs 3.0 -> 2.0-3.0<0
-        repeat (2) @(posedge clk_4x);
+        dispatch(cmd_word(3'b000, 3'd0, 3'd1, 7'h38)); // FCMP: FP1(2.0) vs 3.0 -> 2.0-3.0<0
         check(u_top.u_proto.u_regfile.fpsr_r[27] == 1'b1, "FCMP: N condition code set when FPn < source");
 
         // ── FTST: tests the SOURCE operand alone, sets condition codes ───
         load_fp(0, 96'h0); // +0.0
-        run_cycle(CIR_COMMAND, 1'b1, cmd_word(3'b000, 3'd0, 3'd1, 7'h3A), rd); // FTST +0.0
-        repeat (2) @(posedge clk_4x);
+        dispatch(cmd_word(3'b000, 3'd0, 3'd1, 7'h3A)); // FTST +0.0
         check(u_top.u_proto.u_regfile.fpsr_r[26] == 1'b1, "FTST: Z condition code set for a zero source operand");
 
         load_fp(0, EXT_N1_0);
-        run_cycle(CIR_COMMAND, 1'b1, cmd_word(3'b000, 3'd0, 3'd1, 7'h3A), rd); // FTST -1.0
-        repeat (2) @(posedge clk_4x);
+        dispatch(cmd_word(3'b000, 3'd0, 3'd1, 7'h3A)); // FTST -1.0
         check(u_top.u_proto.u_regfile.fpsr_r[27] == 1'b1, "FTST: N condition code set for a negative source operand");
 
         // ── FSQRT: sqrt(4.0) = 2.0 (even exponent, exact) ────────────────
         load_fp(0, EXT_4_0);
-        run_cycle(CIR_COMMAND, 1'b1, cmd_word(3'b000, 3'd0, 3'd1, 7'h04), rd); // FSQRT
-        repeat (2) @(posedge clk_4x);
+        dispatch(cmd_word(3'b000, 3'd0, 3'd1, 7'h04)); // FSQRT
         check(u_top.u_proto.u_regfile.fp_r[1] == EXT_2_0, "FSQRT: sqrt(4.0) == 2.0");
 
         // ── FSQRT: sqrt(1.0) = 1.0 (odd exponent path: exp(1.0)=0, even -- ─
         // use sqrt(2.25)=1.5 instead to exercise a non-trivial mantissa) ──
         load_fp(0, EXT_2_25);
-        run_cycle(CIR_COMMAND, 1'b1, cmd_word(3'b000, 3'd0, 3'd1, 7'h04), rd); // FSQRT
-        repeat (2) @(posedge clk_4x);
+        dispatch(cmd_word(3'b000, 3'd0, 3'd1, 7'h04)); // FSQRT
         check(u_top.u_proto.u_regfile.fp_r[1] == EXT_1_5, "FSQRT: sqrt(2.25) == 1.5");
 
         // ── FSQRT: sqrt(9.0) = 3.0 (odd real exponent: 9.0 has exp=3) ────
         load_fp(0, 96'h4002_0000_9000_0000_0000_0000); // 9.0
-        run_cycle(CIR_COMMAND, 1'b1, cmd_word(3'b000, 3'd0, 3'd1, 7'h04), rd); // FSQRT
-        repeat (2) @(posedge clk_4x);
+        dispatch(cmd_word(3'b000, 3'd0, 3'd1, 7'h04)); // FSQRT
         check(u_top.u_proto.u_regfile.fp_r[1] == EXT_3_0, "FSQRT: sqrt(9.0) == 3.0 (odd-exponent path)");
 
         // ── FSQRT: sqrt(-4.0) -> NaN, OPERR set ──────────────────────────
         load_fp(0, {1'b1, EXT_4_0[94:0]}); // -4.0
-        run_cycle(CIR_COMMAND, 1'b1, cmd_word(3'b000, 3'd0, 3'd1, 7'h04), rd); // FSQRT
-        repeat (2) @(posedge clk_4x);
+        dispatch(cmd_word(3'b000, 3'd0, 3'd1, 7'h04)); // FSQRT
         check(u_top.u_proto.u_regfile.fpsr_r[24] == 1'b1, "FSQRT: NAN condition code set for sqrt of a negative operand");
         check(u_top.u_proto.u_regfile.fpsr_r[13] == 1'b1, "FSQRT: OPERR exception-status bit set for sqrt of a negative operand");
 
         // ── FSQRT: sqrt(+0.0) = +0.0 ──────────────────────────────────────
         load_fp(0, 96'h0);
-        run_cycle(CIR_COMMAND, 1'b1, cmd_word(3'b000, 3'd0, 3'd1, 7'h04), rd); // FSQRT
-        repeat (2) @(posedge clk_4x);
+        dispatch(cmd_word(3'b000, 3'd0, 3'd1, 7'h04)); // FSQRT
         check(u_top.u_proto.u_regfile.fp_r[1] == 96'h0, "FSQRT: sqrt(+0.0) == +0.0");
 
         // ── Phase 4d: SNAN detection ──────────────────────────────────────
@@ -348,8 +341,7 @@ module m68882_apu_tb;
         // a nonzero fraction bit to distinguish from Infinity).
         load_fp(0, {1'b0, 15'h7FFF, 16'h0, 64'h8000_0000_0000_0001}); // sNaN
         load_fp(1, EXT_1_0);
-        run_cycle(CIR_COMMAND, 1'b1, cmd_word(3'b000, 3'd0, 3'd1, 7'h22), rd); // FADD
-        repeat (2) @(posedge clk_4x);
+        dispatch(cmd_word(3'b000, 3'd0, 3'd1, 7'h22)); // FADD
         check(u_top.u_proto.u_regfile.fpsr_r[14] == 1'b1, "Phase 4d: SNAN exception-status bit set for a signaling NaN input");
         check(u_top.u_proto.u_regfile.fpsr_r[7] == 1'b1, "Phase 4d: AEXC IOP bit set (SNAN contributes to IOP)");
 
@@ -358,8 +350,7 @@ module m68882_apu_tb;
         // ── Phase 4d: INEX2 (inexact result) via FDIV 1.0/3.0 ────────────
         load_fp(0, {1'b0, 15'h3FFF + 15'd1, 16'h0, 64'hC000_0000_0000_0000}); // 3.0 (source)
         load_fp(1, EXT_1_0); // FPn (dest)
-        run_cycle(CIR_COMMAND, 1'b1, cmd_word(3'b000, 3'd0, 3'd1, 7'h20), rd); // FDIV: FP1 = 1.0/3.0
-        repeat (2) @(posedge clk_4x);
+        dispatch(cmd_word(3'b000, 3'd0, 3'd1, 7'h20)); // FDIV: FP1 = 1.0/3.0
         check(u_top.u_proto.u_regfile.fpsr_r[9] == 1'b1, "Phase 4d: INEX2 exception-status bit set for an inexact FDIV result");
         check(u_top.u_proto.u_regfile.fpsr_r[3] == 1'b1, "Phase 4d: AEXC INEX bit set (INEX2 contributes to AEXC INEX)");
 
@@ -368,8 +359,7 @@ module m68882_apu_tb;
         // ── Phase 4d: OVFL via FADD pushing the exponent past 32767 ──────
         load_fp(0, {1'b0, 15'd32766, 16'h0, 64'h8000_0000_0000_0000});
         load_fp(1, {1'b0, 15'd32766, 16'h0, 64'h8000_0000_0000_0000});
-        run_cycle(CIR_COMMAND, 1'b1, cmd_word(3'b000, 3'd0, 3'd1, 7'h22), rd); // FADD (doubles -> exponent+1 overflow)
-        repeat (2) @(posedge clk_4x);
+        dispatch(cmd_word(3'b000, 3'd0, 3'd1, 7'h22)); // FADD (doubles -> exponent+1 overflow)
         check(u_top.u_proto.u_regfile.fpsr_r[12] == 1'b1, "Phase 4d: OVFL exception-status bit set on exponent overflow");
         check(u_top.u_proto.u_regfile.fpsr_r[6] == 1'b1, "Phase 4d: AEXC OVFL bit set");
         check(u_top.u_proto.u_regfile.fp_r[1] == {1'b0, 15'h7FFF, 16'h0, 64'h8000_0000_0000_0000},
@@ -380,8 +370,7 @@ module m68882_apu_tb;
         // ── Phase 4d: UNFL (+ INEX2) via FMUL pushing the exponent below 1 ──
         load_fp(0, {1'b0, 15'd10, 16'h0, 64'hC000_0000_0000_0001}); // tiny, non-power-of-2 mantissa
         load_fp(1, {1'b0, 15'd10, 16'h0, 64'hC000_0000_0000_0001});
-        run_cycle(CIR_COMMAND, 1'b1, cmd_word(3'b000, 3'd0, 3'd1, 7'h23), rd); // FMUL
-        repeat (2) @(posedge clk_4x);
+        dispatch(cmd_word(3'b000, 3'd0, 3'd1, 7'h23)); // FMUL
         check(u_top.u_proto.u_regfile.fpsr_r[11] == 1'b1, "Phase 4d: UNFL exception-status bit set on exponent underflow");
         check(u_top.u_proto.u_regfile.fp_r[1] == 96'h0, "Phase 4d: underflowed result flushes to zero");
 
@@ -390,13 +379,11 @@ module m68882_apu_tb;
         // ── Phase 4d: AEXC is sticky across separate, unrelated operations ──
         load_fp(0, 96'h0); // +0.0
         load_fp(1, EXT_1_0);
-        run_cycle(CIR_COMMAND, 1'b1, cmd_word(3'b000, 3'd0, 3'd1, 7'h20), rd); // FDIV 1.0/0.0 -> DZ
-        repeat (2) @(posedge clk_4x);
+        dispatch(cmd_word(3'b000, 3'd0, 3'd1, 7'h20)); // FDIV 1.0/0.0 -> DZ
         check(u_top.u_proto.u_regfile.fpsr_r[4] == 1'b1, "Phase 4d: AEXC DZ bit set after a divide-by-zero");
         load_fp(0, EXT_1_0);
         load_fp(1, EXT_2_0);
-        run_cycle(CIR_COMMAND, 1'b1, cmd_word(3'b000, 3'd0, 3'd1, 7'h22), rd); // an unrelated, exact FADD
-        repeat (2) @(posedge clk_4x);
+        dispatch(cmd_word(3'b000, 3'd0, 3'd1, 7'h22)); // an unrelated, exact FADD
         check(u_top.u_proto.u_regfile.fpsr_r[4] == 1'b1,
               "Phase 4d: AEXC DZ bit stays set (sticky) after a later, unrelated operation");
         check(u_top.u_proto.u_regfile.fpsr_r[10] == 1'b0,

@@ -125,6 +125,7 @@ module m68882_frame_tb;
 
         // ── Populate the programmer's model (write FPCR via opclass 100) ──
         run_cycle(CIR_COMMAND, 1'b1, cmd_word(3'b100, 3'b100, 3'b000, 7'd0), rd); // move to FPCR
+        run_cycle(CIR_INSTRADDR, 1'b1, 32'h0000_3000, rd); // Phase 6: mandatory Instruction Address CIR
         run_cycle(CIR_RESPONSE, 1'b0, 32'h0, rd);
         run_cycle(CIR_OPERAND, 1'b1, 32'h0000_1000, rd); // any nonzero value
         run_cycle(CIR_RESPONSE, 1'b0, 32'h0, rd);
@@ -134,7 +135,7 @@ module m68882_frame_tb;
         // ── FSAVE: Idle frame (populated model, no dialog in progress) ────
         run_cycle(CIR_SAVE, 1'b0, 32'h0, rd);
         check(rd[31:16] == FRAME_IDLE_FMT, "FSAVE: a populated programmer's model reports the Idle format word");
-        check(u_top.u_proto.state_r == 4, "FSAVE: Idle frame transitions to ST_WAIT_SAVE_XFER (state 4)");
+        check(u_top.u_proto.state_r == 5, "FSAVE: Idle frame transitions to ST_WAIT_SAVE_XFER (state 5)"); // Phase 6: ST_WAIT_IADDR inserted at 1, shifting this from 4
 
         // Idle frame payload: 13 placeholder longwords, all zero.
         for (int i = 0; i < 13; i++) begin
@@ -157,7 +158,7 @@ module m68882_frame_tb;
         run_cycle(CIR_RESTORE, 1'b1, {FRAME_IDLE_FMT, 16'h0}, rd);
         run_cycle(CIR_RESTORE, 1'b0, 32'h0, rd);
         check(rd[31:16] == FRAME_IDLE_FMT, "FRESTORE: a valid Idle format word echoes back unchanged");
-        check(u_top.u_proto.state_r == 5, "FRESTORE: valid Idle format word transitions to ST_WAIT_RESTORE_XFER (state 5)");
+        check(u_top.u_proto.state_r == 6, "FRESTORE: valid Idle format word transitions to ST_WAIT_RESTORE_XFER (state 6)"); // Phase 6: ST_WAIT_IADDR inserted at 1, shifting this from 5
         for (int i = 0; i < 13; i++) begin
             run_cycle(CIR_OPERAND, 1'b1, 32'hDEAD_0000 + i, rd); // discarded placeholder payload
         end
@@ -165,6 +166,7 @@ module m68882_frame_tb;
 
         // Confirm the dialog machinery is genuinely usable again afterward.
         run_cycle(CIR_COMMAND, 1'b1, cmd_word(3'b000, 3'd0, 3'd1, 7'd0), rd); // FPm to FPn, no-op ext
+        run_cycle(CIR_INSTRADDR, 1'b1, 32'h0000_3004, rd); // Phase 6: mandatory Instruction Address CIR
         run_cycle(CIR_RESPONSE, 1'b0, 32'h0, rd);
         check(rd[31:16] == 16'h0000, "FRESTORE: a real Command CIR dialog works normally right afterward");
 
