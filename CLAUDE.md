@@ -717,9 +717,44 @@ derivation and the Phase 9d+ plan (the real trig/log/exp set, the last
 remaining category, not yet started). **292/292 across all eight
 testbenches.**
 
+**Phase 9d (FSIN/FCOS) is also complete — the first genuinely
+APPROXIMATED op this project implements** (real silicon isn't bit-exact
+here either, per Section 4.3, unlike the arithmetic ops). New shared
+`fp_sincos` task: argument reduction to `r = a - k*(pi/2)`, quadrant
+from `k mod 4`, 9-term Taylor polynomials for cos(r)/sin(r)/r evaluated
+via Horner's method through a shared `for`-loop call site (same
+call-site-minimization discipline as `fp_mod_rem`). `PI_OVER_2` and both
+coefficient tables were independently re-derived this session as a
+sanity check on values carried over from an earlier session — confirmed
+bit-identical, though the re-derivation script itself had a real
+off-by-one bug on the first attempt (explicit-integer-bit convention
+needs `mantissa = v*2^63`, not `2^64`), caught only by cross-checking
+against the already-trusted `PI_OVER_2` constant. **FSINCOS itself
+deliberately NOT implemented** (documented scope cut, not silently
+dropped): this architecture's slot pipeline only ever commits one
+result to one register per op, and FSINCOS's own real dual-register
+write needs commit-path plumbing this project doesn't have yet — FSIN
+and FCOS individually cover the same two numeric results via the same
+shared task. Verified via a new `check_close` ULP-tolerance task in
+`tb/m68882_apu_tb.sv` (not the bit-exact Musashi cosim battery — Musashi's
+own FSIN/FCOS round-trip through a libc `double` sin/cos call, a
+different and less accurate path than this project's own, so bit-exact
+comparison there would test nothing useful) against independently
+Python-computed (60-digit `Decimal` Taylor series) reference values;
+measured accuracy 0-5 ULP against a documented `ulp_tol=4096` gate
+(Section 4.3's own real-hardware worst-case bound). Also found and fixed
+a real testbench bug along the way: the pipeline-drain wait bound
+(`wait_ticks < 1000`) was too small for FSIN/FCOS's own real 1576-tick
+latency, silently observing still-in-flight results and failing every
+check — bumped to 3000. **306/306 across all eight testbenches** (APU
+grew 69→85 checks; Musashi cosim battery unchanged at 54 vectors,
+FSIN/FCOS deliberately excluded from it per above).
+
 See `plan.md` for the full phased build plan and the complete list of
-what remains deliberately out of scope (Phase 9d+, W/B/P formats,
-BSUN/INEX1, denormals, and the rest).
+what remains deliberately out of scope (Phase 9e+ — the remaining 18
+log/exp/hyperbolic/inverse-trig functions plus FSINCOS's own deferred
+dual-write plumbing — W/B/P formats, BSUN/INEX1, denormals, and the
+rest).
 
 ```bash
 make test   # builds and runs all eight testbenches via Icarus Verilog

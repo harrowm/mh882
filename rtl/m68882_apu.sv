@@ -1531,4 +1531,192 @@ package m68882_apu_pkg;
         end
     endtask
 
+    // ── Phase 9d: FSIN ($0E) / FCOS ($1D) -- the first genuinely
+    // APPROXIMATED transcendental this project implements (everything
+    // through Phase 9c was exact or double-rounding-exact). Section 4.3
+    // "Computational Accuracy" confirms real silicon does NOT compute
+    // these bit-exact either: "the worst-case accuracy is 4096 units in
+    // the last place... the typical error bound... is approximately 64
+    // units in the last place" -- unlike FADD/FSUB/FMUL/FDIV/FSQRT
+    // (IEEE-exact to 0.5 ULP since Phase 4a), this task targets that
+    // same realistic tolerance, not bit-exact agreement with any
+    // reference.
+    //
+    // Algorithm: classic argument reduction to [-pi/4,+pi/4] (Section
+    // 4.x's own text confirms real hardware does exactly this: "If the
+    // source operand is not in the range of [-2pi...+2pi], the argument
+    // is reduced... large arguments may lose accuracy during
+    // reduction, and very large arguments (greater than approximately
+    // 10^20) lose all accuracy" -- this project's own reduction below
+    // has the IDENTICAL large-argument degradation, for the identical
+    // reason: real hardware doesn't solve full Payne-Hanek reduction
+    // either, and the manual says so outright), then a 9-term Taylor
+    // series (NOT a minimax polynomial -- a plain Taylor series is
+    // trivially independently verifiable term-by-term, and the margin
+    // it gives at this reduced range comfortably clears the target
+    // tolerance, so the extra complexity of deriving and justifying a
+    // minimax polynomial wasn't needed). Coefficients and PI_OVER_2
+    // below were computed independently in Python to 50 significant
+    // decimal digits and rounded to the nearest extended-precision bit
+    // pattern -- see plan.md's own Phase 9d writeup for the exact
+    // generating script and the accuracy-margin derivation (Taylor
+    // truncation error at |r|<=pi/4 after 9 terms is ~1e-18 to 2e-20,
+    // comfortably inside the manual's own 64-ULP-typical target of
+    // ~7e-18).
+    localparam logic [95:0] PI_OVER_2 = 96'h3fff_0000_c90fdaa22168c235;
+
+    // cos(r) = sum_{k=0}^{8} COS_C[k] * r^(2k) -- stored highest-degree
+    // first (index 0 = r^16 coefficient) for direct Horner evaluation.
+    localparam logic [95:0] COS_C0 = 96'h3fd2_0000_d73f9f399dc0f88f; // r^16
+    localparam logic [95:0] COS_C1 = 96'hbfda_0000_c9cba54603e4e906; // r^14
+    localparam logic [95:0] COS_C2 = 96'h3fe2_0000_8f76c77fc6c4bdaa; // r^12
+    localparam logic [95:0] COS_C3 = 96'hbfe9_0000_93f27dbbc4fae397; // r^10
+    localparam logic [95:0] COS_C4 = 96'h3fef_0000_d00d00d00d00d00d; // r^8
+    localparam logic [95:0] COS_C5 = 96'hbff5_0000_b60b60b60b60b60b; // r^6
+    localparam logic [95:0] COS_C6 = 96'h3ffa_0000_aaaaaaaaaaaaaaab; // r^4
+    localparam logic [95:0] COS_C7 = 96'hbffe_0000_8000000000000000; // r^2
+    localparam logic [95:0] COS_C8 = 96'h3fff_0000_8000000000000000; // r^0
+
+    // sin(r)/r = sum_{k=0}^{8} SIN_C[k] * r^(2k) -- same Horner shape;
+    // the caller multiplies the final Horner result by r once at the end.
+    localparam logic [95:0] SIN_C0 = 96'h3fce_0000_ca963b81856a5359; // r^16 (of r^17/r)
+    localparam logic [95:0] SIN_C1 = 96'hbfd6_0000_d73f9f399dc0f88f; // r^14
+    localparam logic [95:0] SIN_C2 = 96'h3fde_0000_b092309d43684be5; // r^12
+    localparam logic [95:0] SIN_C3 = 96'hbfe5_0000_d7322b3faa271c7f; // r^10
+    localparam logic [95:0] SIN_C4 = 96'h3fec_0000_b8ef1d2ab6399c7d; // r^8
+    localparam logic [95:0] SIN_C5 = 96'hbff2_0000_d00d00d00d00d00d; // r^6
+    localparam logic [95:0] SIN_C6 = 96'h3ff8_0000_8888888888888889; // r^4
+    localparam logic [95:0] SIN_C7 = 96'hbffc_0000_aaaaaaaaaaaaaaab; // r^2
+    localparam logic [95:0] SIN_C8 = 96'h3fff_0000_8000000000000000; // r^0
+
+    // Evaluate one Horner step (acc <- acc*w + coeff) using the SAME two
+    // call sites of fp_mul/fp_add_sub throughout (a `for` loop over both
+    // 9-term polynomials, NOT 16 separately unrolled textual calls) --
+    // deliberately, to keep the total distinct call-site count for these
+    // two tasks as low as Phase 9c's own already-proven-safe count
+    // (empirically tested: repeated LOOPED invocation of the same
+    // textual call site is a fundamentally different, and so far always
+    // safe, shape than multiple SEPARATE textual call sites -- see
+    // fp_mod_rem's own header comment for the original finding this
+    // reasoning extends).
+    task automatic fp_sincos(
+        input  logic [95:0]  a_raw,
+        output logic [95:0]  sin_result,
+        output logic [95:0]  cos_result,
+        output logic         flag_operr
+    );
+        fpx_t a;
+        logic a_nan, a_inf, a_zero;
+
+        a = unpack_fpx(a_raw);
+        a_nan  = is_nan_fpx(a);
+        a_inf  = is_inf_fpx(a);
+        a_zero = is_zero_fpx(a);
+        flag_operr = 1'b0;
+
+        if (a_nan) begin
+            sin_result = a_raw;
+            cos_result = a_raw;
+        end else if (a_inf) begin
+            flag_operr = 1'b1;
+            sin_result = {1'b0, 15'h7FFF, 16'h0, 64'hC000_0000_0000_0000};
+            cos_result = {1'b0, 15'h7FFF, 16'h0, 64'hC000_0000_0000_0000};
+        end else if (a_zero) begin
+            sin_result = a_raw; // sign preserved (Operation Table: +0.0/-0.0)
+            cos_result = {1'b0, 15'd16383, 16'h0, 64'h8000_0000_0000_0000}; // +1.0
+        end else begin
+            logic [95:0] q_ext, k_ext, prod, r, w, cos_acc, sin_acc, tmp;
+            logic [95:0] cos_coeff [0:8];
+            logic [95:0] sin_coeff [0:8];
+            logic        qz, qn, qi, qnan, qoperr, qdz, qovfl, qunfl, qinex2;
+            logic        pz, pn, pi_, pnan, poperr, povfl, punfl, pinex2;
+            logic        rz, rn, ri, rnan, roperr, rovfl, runfl, rinex2;
+            logic        quot_sign;
+            logic [63:0] n_mag;
+            logic signed [17:0] real_exp;
+            logic [1:0]  k_mod4;
+            int          i;
+
+            cos_coeff = '{COS_C0, COS_C1, COS_C2, COS_C3, COS_C4, COS_C5, COS_C6, COS_C7, COS_C8};
+            sin_coeff = '{SIN_C0, SIN_C1, SIN_C2, SIN_C3, SIN_C4, SIN_C5, SIN_C6, SIN_C7, SIN_C8};
+
+            // ── Argument reduction: k = round(a / (pi/2)), r = a - k*(pi/2) ──
+            fp_div(PI_OVER_2, a_raw, RND_NEAREST, q_ext, qz, qn, qi, qnan, qoperr, qdz, qovfl, qunfl, qinex2);
+
+            quot_sign = qn;
+            if (qz) begin
+                n_mag = 64'h0;
+            end else begin
+                fpx_t qx;
+                qx = unpack_fpx(q_ext);
+                real_exp = $signed({3'b0, qx.exp}) - 18'sd16383;
+                if (real_exp < 18'sd0) begin
+                    logic round_to_1;
+                    round_to_1 = (real_exp == -18'sd1) && (qx.mant[62:0] != 63'h0);
+                    n_mag = round_to_1 ? 64'd1 : 64'd0;
+                end else if (real_exp >= 18'sd63) begin
+                    n_mag = 64'hFFFF_FFFF_FFFF_FFFF; // saturate -- see fp_mod_rem's own identical note
+                end else begin
+                    logic [6:0]  frac_bits;
+                    logic [63:0] int_part, sticky_mask;
+                    logic        guard, round_bit, sticky, round_up, carry;
+
+                    frac_bits   = 7'(63 - real_exp);
+                    int_part    = qx.mant >> frac_bits;
+                    guard       = (frac_bits >= 7'd1) ? ((qx.mant >> (frac_bits - 7'd1)) & 64'h1) : 1'b0;
+                    round_bit   = (frac_bits >= 7'd2) ? ((qx.mant >> (frac_bits - 7'd2)) & 64'h1) : 1'b0;
+                    sticky_mask = (frac_bits >= 7'd3) ? ((64'h1 << (frac_bits - 7'd2)) - 64'h1) : 64'h0;
+                    sticky      = |(qx.mant & sticky_mask);
+                    round_up    = guard && (round_bit || sticky || int_part[0]);
+                    {carry, int_part} = {1'b0, int_part} + (round_up ? 65'd1 : 65'd0);
+                    n_mag = int_part;
+                end
+            end
+
+            k_mod4 = quot_sign ? (2'd0 - n_mag[1:0]) : n_mag[1:0];
+
+            if (n_mag == 64'h0) begin
+                r = a_raw;
+            end else begin
+                logic [6:0] n_lz;
+                n_lz  = lzc64(n_mag);
+                k_ext = {quot_sign, 15'd16383 + (15'd63 - {8'b0, n_lz}), 16'h0, n_mag << n_lz};
+                fp_mul(k_ext, PI_OVER_2, RND_NEAREST, prod, pz, pn, pi_, pnan, poperr, povfl, punfl, pinex2);
+                fp_add_sub(prod, a_raw, 1'b1, RND_NEAREST, r, rz, rn, ri, rnan, roperr, rovfl, runfl, rinex2);
+            end
+
+            // ── Polynomial core: cos(r) and sin(r)/r, both as 9-term
+            // Horner evaluations in w=r^2, sharing the SAME two call
+            // sites for the whole loop. ──────────────────────────────
+            fp_mul(r, r, RND_NEAREST, w, pz, pn, pi_, pnan, poperr, povfl, punfl, pinex2);
+
+            cos_acc = cos_coeff[0];
+            sin_acc = sin_coeff[0];
+            for (i = 1; i < 9; i++) begin
+                fp_mul(cos_acc, w, RND_NEAREST, tmp, pz, pn, pi_, pnan, poperr, povfl, punfl, pinex2);
+                fp_add_sub(cos_coeff[i], tmp, 1'b0, RND_NEAREST, cos_acc, rz, rn, ri, rnan, roperr, rovfl, runfl, rinex2);
+                fp_mul(sin_acc, w, RND_NEAREST, tmp, pz, pn, pi_, pnan, poperr, povfl, punfl, pinex2);
+                fp_add_sub(sin_coeff[i], tmp, 1'b0, RND_NEAREST, sin_acc, rz, rn, ri, rnan, roperr, rovfl, runfl, rinex2);
+            end
+            // sin(r) = r * (sin(r)/r series)
+            fp_mul(sin_acc, r, RND_NEAREST, tmp, pz, pn, pi_, pnan, poperr, povfl, punfl, pinex2);
+
+            // ── Quadrant reconstruction (k mod 4) ────────────────────
+            // Plain case with a `default` (not `unique case`) -- k_mod4
+            // is arithmetically exhaustive over 2'd0..2'd3 for any real
+            // input, but at simulation time 0 (before reset/first valid
+            // operand) a_raw is still X, which propagates through to an
+            // X k_mod4; `unique case` would flag that as a real
+            // priority violation every run. The `default` arm exists
+            // solely to absorb that transient X, not because a 5th real
+            // case exists.
+            case (k_mod4)
+                2'd0: begin sin_result = tmp;                              cos_result = cos_acc; end
+                2'd1: begin sin_result = cos_acc;                          cos_result = {!tmp[95], tmp[94:0]}; end
+                2'd2: begin sin_result = {!tmp[95], tmp[94:0]};            cos_result = {!cos_acc[95], cos_acc[94:0]}; end
+                default: begin sin_result = {!cos_acc[95], cos_acc[94:0]}; cos_result = tmp; end
+            endcase
+        end
+    endtask
+
 endpackage

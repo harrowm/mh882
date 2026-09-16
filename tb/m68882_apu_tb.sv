@@ -72,6 +72,31 @@ module m68882_apu_tb;
         end
     endtask
 
+    // Phase 9d: FSIN/FCOS are the first genuinely APPROXIMATED op this
+    // project implements (see fp_sincos's own header comment in
+    // rtl/m68882_apu.sv) -- exact bit-for-bit comparison against an
+    // independently-computed reference isn't the right check (nor is it
+    // what real silicon itself guarantees, per Section 4.3's own
+    // documented "typical error bound of approximately 64 units in the
+    // last place"). This task compares sign+exponent exactly (a real
+    // mismatch there is always a genuine bug, never rounding noise) and
+    // the 64-bit mantissa to within a fixed ULP tolerance.
+    task automatic check_close(
+        input logic [95:0] actual, input logic [95:0] expected,
+        input int ulp_tol, input string msg
+    );
+        logic [15:0] a_se, e_se;
+        logic [63:0] a_m, e_m;
+        longint      diff;
+        a_se = actual[95:80];   e_se = expected[95:80];
+        a_m  = actual[63:0];    e_m  = expected[63:0];
+        diff = longint'(a_m) - longint'(e_m);
+        if (diff < 0) diff = -diff;
+        check((a_se == e_se) && (diff <= ulp_tol),
+              $sformatf("%s (sign/exp %s, mantissa diff %0d ULP, tol %0d)",
+                        msg, (a_se == e_se) ? "match" : "MISMATCH", diff, ulp_tol));
+    endtask
+
     task automatic run_cycle(
         input  logic [3:0]  sel_a4_a1,
         input  logic        is_write,
@@ -154,7 +179,7 @@ module m68882_apu_tb;
         run_cycle(CIR_COMMAND, 1'b1, cmdw, rd2);
         run_cycle(CIR_INSTRADDR, 1'b1, 32'h0000_2000, rd2);
         wait_ticks = 0;
-        while ((u_top.u_proto.slotA_valid_r || u_top.u_proto.slotB_valid_r) && wait_ticks < 1000) begin
+        while ((u_top.u_proto.slotA_valid_r || u_top.u_proto.slotB_valid_r) && wait_ticks < 3000) begin
             @(posedge clk_4x);
             wait_ticks++;
         end
@@ -167,7 +192,7 @@ module m68882_apu_tb;
     task automatic wait_ticks_apu_drain();
         int wait_ticks;
         wait_ticks = 0;
-        while ((u_top.u_proto.slotA_valid_r || u_top.u_proto.slotB_valid_r) && wait_ticks < 1000) begin
+        while ((u_top.u_proto.slotA_valid_r || u_top.u_proto.slotB_valid_r) && wait_ticks < 3000) begin
             @(posedge clk_4x);
             wait_ticks++;
         end
@@ -539,6 +564,92 @@ module m68882_apu_tb;
         dispatch(cmd_word(3'b000, 3'd0, 3'd1, 7'h21)); // FMOD: -7.0 mod 2.0
         check(u_top.u_proto.u_regfile.fp_r[1] == EXT_N1_0, "Phase 9c: FMOD(2.0, -7.0) == -7.0 - 2.0*trunc(-3.5) == -7.0 - 2.0*(-3) == -1.0");
         check(u_top.u_proto.u_regfile.fpsr_r[23] == 1'b1, "Phase 9c: FMOD(2.0, -7.0) quotient sign == 1 (positive/negative division)");
+
+        // ── Phase 9d: FSIN/FCOS ──────────────────────────────────────
+        // Reference values below computed independently in Python via a
+        // Decimal-precision (80-digit) Taylor series summed to full
+        // extended-precision convergence (NOT Python's own math.sin/cos,
+        // which is only IEEE double, i.e. ~16 decimal digits -- too
+        // coarse a reference for an 80-bit-extended result), then
+        // rounded to the nearest extended-precision bit pattern the
+        // same way every other constant in this file was derived.
+        // ulp_tol=4096 matches Section 4.3's own documented worst-case
+        // accuracy bound for real 68881/2 silicon ("4096 units in the
+        // last place") -- this project's own 9-term-Taylor
+        // implementation measures far tighter than that in practice
+        // (single-digit-to-low-double-digit ULP for these vectors), but
+        // the manual's own real-hardware bound is the correct thing to
+        // gate the test on, not an arbitrarily tighter number this
+        // project's own implementation happens to hit today.
+        load_fp(0, EXT_0_5);
+        dispatch(cmd_word(3'b000, 3'd0, 3'd1, 7'h0E)); // FSIN(0.5)
+        check_close(u_top.u_proto.u_regfile.fp_r[1], 96'h3ffd_0000_f57743a2582f7f44,
+                    4096, "Phase 9d: FSIN(0.5) ~= 0.4794255386...");
+
+        load_fp(0, EXT_0_5);
+        dispatch(cmd_word(3'b000, 3'd0, 3'd1, 7'h1D)); // FCOS(0.5)
+        check_close(u_top.u_proto.u_regfile.fp_r[1], 96'h3ffe_0000_e0a94032dbea7cee,
+                    4096, "Phase 9d: FCOS(0.5) ~= 0.8775825619...");
+
+        load_fp(0, EXT_1_0);
+        dispatch(cmd_word(3'b000, 3'd0, 3'd1, 7'h0E)); // FSIN(1.0)
+        check_close(u_top.u_proto.u_regfile.fp_r[1], 96'h3ffe_0000_d76aa47848677021,
+                    4096, "Phase 9d: FSIN(1.0) ~= 0.8414709848...");
+
+        load_fp(0, EXT_1_0);
+        dispatch(cmd_word(3'b000, 3'd0, 3'd1, 7'h1D)); // FCOS(1.0)
+        check_close(u_top.u_proto.u_regfile.fp_r[1], 96'h3ffe_0000_8a51407da8345c92,
+                    4096, "Phase 9d: FCOS(1.0) ~= 0.5403023059...");
+
+        load_fp(0, EXT_2_0);
+        dispatch(cmd_word(3'b000, 3'd0, 3'd1, 7'h0E)); // FSIN(2.0)
+        check_close(u_top.u_proto.u_regfile.fp_r[1], 96'h3ffe_0000_e8c7b7568da22efd,
+                    4096, "Phase 9d: FSIN(2.0) ~= 0.9092974268...");
+
+        load_fp(0, EXT_2_0);
+        dispatch(cmd_word(3'b000, 3'd0, 3'd1, 7'h1D)); // FCOS(2.0)
+        check_close(u_top.u_proto.u_regfile.fp_r[1], 96'hbffd_0000_d51132ba9b902522,
+                    4096, "Phase 9d: FCOS(2.0) ~= -0.4161468365...");
+
+        load_fp(0, EXT_N1_0);
+        dispatch(cmd_word(3'b000, 3'd0, 3'd1, 7'h0E)); // FSIN(-1.0), sign of source
+        check_close(u_top.u_proto.u_regfile.fp_r[1], 96'hbffe_0000_d76aa47848677021,
+                    4096, "Phase 9d: FSIN(-1.0) ~= -0.8414709848...");
+
+        load_fp(0, EXT_10_0);
+        dispatch(cmd_word(3'b000, 3'd0, 3'd1, 7'h0E)); // FSIN(10.0), argument reduction exercised (k=6)
+        check_close(u_top.u_proto.u_regfile.fp_r[1], 96'hbffe_0000_8b44f7af9a7a92ce,
+                    4096, "Phase 9d: FSIN(10.0) ~= -0.5440211109... (argument reduction, k=6)");
+
+        load_fp(0, EXT_10_0);
+        dispatch(cmd_word(3'b000, 3'd0, 3'd1, 7'h1D)); // FCOS(10.0)
+        check_close(u_top.u_proto.u_regfile.fp_r[1], 96'hbffe_0000_d6cd64486358f905,
+                    4096, "Phase 9d: FCOS(10.0) ~= -0.8390715291... (argument reduction, k=6)");
+
+        // Operation Table special cases (Section 4, confirmed directly):
+        // FCOS(+-0.0) = +1.0; FSIN(+-0.0) = +-0.0 (sign preserved);
+        // FSIN/FCOS(+-inf) = NaN + OPERR. All exact, not tolerance-based.
+        load_fp(0, 96'h0000_0000_0000_0000_0000_0000); // +0.0
+        dispatch(cmd_word(3'b000, 3'd0, 3'd1, 7'h0E)); // FSIN(+0.0)
+        check(u_top.u_proto.u_regfile.fp_r[1] == 96'h0, "Phase 9d: FSIN(+0.0) == +0.0");
+
+        load_fp(0, 96'h8000_0000_0000_0000_0000_0000); // -0.0
+        dispatch(cmd_word(3'b000, 3'd0, 3'd1, 7'h0E)); // FSIN(-0.0)
+        check(u_top.u_proto.u_regfile.fp_r[1] == 96'h8000_0000_0000_0000_0000_0000, "Phase 9d: FSIN(-0.0) == -0.0 (sign preserved)");
+
+        load_fp(0, 96'h0000_0000_0000_0000_0000_0000); // +0.0
+        dispatch(cmd_word(3'b000, 3'd0, 3'd1, 7'h1D)); // FCOS(+0.0)
+        check(u_top.u_proto.u_regfile.fp_r[1] == EXT_1_0, "Phase 9d: FCOS(+0.0) == +1.0");
+
+        load_fp(0, 96'h7fff_0000_8000_0000_0000_0000); // +inf
+        dispatch(cmd_word(3'b000, 3'd0, 3'd1, 7'h0E)); // FSIN(+inf)
+        check(u_top.u_proto.u_regfile.fpsr_r[24] == 1'b1, "Phase 9d: FSIN(+inf) NAN condition code set");
+        check(u_top.u_proto.u_regfile.fpsr_r[13] == 1'b1, "Phase 9d: FSIN(+inf) OPERR exception-status bit set");
+
+        load_fp(0, 96'h7fff_0000_8000_0000_0000_0000); // +inf
+        dispatch(cmd_word(3'b000, 3'd0, 3'd1, 7'h1D)); // FCOS(+inf)
+        check(u_top.u_proto.u_regfile.fpsr_r[24] == 1'b1, "Phase 9d: FCOS(+inf) NAN condition code set");
+        check(u_top.u_proto.u_regfile.fpsr_r[13] == 1'b1, "Phase 9d: FCOS(+inf) OPERR exception-status bit set");
 
         $display("---");
         $display("%0d passed, %0d failed", pass_count, fail_count);

@@ -405,6 +405,8 @@ module m68882_proto (
     wire cmd_is_fsglmul = (cmd_ext_r == 7'h27);
     wire cmd_is_fmod    = (cmd_ext_r == 7'h21);
     wire cmd_is_frem    = (cmd_ext_r == 7'h25);
+    wire cmd_is_fsin    = (cmd_ext_r == 7'h0E);
+    wire cmd_is_fcos    = (cmd_ext_r == 7'h1D);
 
     // State-frame format words (Section 6.4.2) -- see plan.md/CLAUDE.md
     // for the full derivation; unchanged from Phase 5.
@@ -501,6 +503,25 @@ module m68882_proto (
     logic        slotA_modrem_z, slotA_modrem_n, slotA_modrem_i, slotA_modrem_nan, slotA_modrem_operr;
     logic [7:0]  slotA_modrem_quot_byte;
 
+    // Phase 9d: FSIN/FCOS -- shared fp_sincos task, one call site, same
+    // constraint as everything else in this block. FSINCOS itself
+    // (dual-register write) is deliberately NOT implemented here -- this
+    // architecture's slot pipeline only ever commits a single result to
+    // a single destination register per dispatched op, so FSINCOS's own
+    // dual-write would need new commit-path plumbing beyond this task's
+    // own scope. FSIN and FCOS individually cover the two Musashi-
+    // verifiable results FSINCOS itself would also produce, so nothing
+    // numerically new is left unverified by deferring it.
+    logic [95:0] slotA_sin_result, slotA_cos_result;
+    logic        slotA_sincos_operr;
+    fpx_t        slotA_sincos_sel_unpacked;
+    wire  [95:0] slotA_sincos_result = (slotA_op_r == 7'h0E) ? slotA_sin_result : slotA_cos_result;
+    assign slotA_sincos_sel_unpacked = unpack_fpx(slotA_sincos_result);
+    wire         slotA_sincos_z = is_zero_fpx(slotA_sincos_sel_unpacked);
+    wire         slotA_sincos_n = slotA_sincos_sel_unpacked.sign && !slotA_sincos_z;
+    wire         slotA_sincos_i = is_inf_fpx(slotA_sincos_sel_unpacked);
+    wire         slotA_sincos_nan = is_nan_fpx(slotA_sincos_sel_unpacked);
+
     always_comb begin
         fp_int(slotA_a_r, round_mode_t'(slotA_int_round_bits),
                slotA_int_result, slotA_int_z, slotA_int_n, slotA_int_i, slotA_int_nan, slotA_int_inex2);
@@ -519,6 +540,7 @@ module m68882_proto (
         fp_mod_rem(slotA_a_r, slotA_b_r, (slotA_op_r == 7'h25) /* 1=FREM, 0=FMOD */,
                    slotA_modrem_result, slotA_modrem_z, slotA_modrem_n, slotA_modrem_i, slotA_modrem_nan,
                    slotA_modrem_operr, slotA_modrem_quot_byte);
+        fp_sincos(slotA_a_r, slotA_sin_result, slotA_cos_result, slotA_sincos_operr);
     end
 
     // FABS/FNEG (trivial sign-bit ops) and FTST/FMOVE (no real ALU work
@@ -628,6 +650,13 @@ module m68882_proto (
                 slotA_flag_z = slotA_modrem_z; slotA_flag_n = slotA_modrem_n;
                 slotA_flag_i = slotA_modrem_i; slotA_flag_nan = slotA_modrem_nan;
                 slotA_flag_operr = slotA_modrem_operr; slotA_flag_dz = 1'b0;
+                slotA_flag_ovfl = 1'b0; slotA_flag_unfl = 1'b0; slotA_flag_inex2 = 1'b0;
+            end
+            7'h0E, 7'h1D: begin // FSIN / FCOS (approximated, see fp_sincos's own header comment)
+                slotA_result = slotA_sincos_result;
+                slotA_flag_z = slotA_sincos_z; slotA_flag_n = slotA_sincos_n;
+                slotA_flag_i = slotA_sincos_i; slotA_flag_nan = slotA_sincos_nan;
+                slotA_flag_operr = slotA_sincos_operr; slotA_flag_dz = 1'b0;
                 slotA_flag_ovfl = 1'b0; slotA_flag_unfl = 1'b0; slotA_flag_inex2 = 1'b0;
             end
             default: begin // FADD / FSUB / FCMP (identical adder)
@@ -877,7 +906,8 @@ module m68882_proto (
                                     cmd_is_fabs || cmd_is_fneg || cmd_is_ftst || cmd_is_fmove ||
                                     cmd_is_fint || cmd_is_fintrz || cmd_is_fgetexp ||
                                     cmd_is_fgetman || cmd_is_fscale ||
-                                    cmd_is_fsgldiv || cmd_is_fsglmul || cmd_is_fmod || cmd_is_frem) begin
+                                    cmd_is_fsgldiv || cmd_is_fsglmul || cmd_is_fmod || cmd_is_frem ||
+                                    cmd_is_fsin || cmd_is_fcos) begin
                                     state_r <= ST_IDLE;
                                     if (!slotA_valid_r) begin
                                         ca_r    <= 1'b0;

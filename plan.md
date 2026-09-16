@@ -1524,17 +1524,111 @@ explanation, tested directly instead). **292/292 across all eight
 testbenches** (11+27+69+28+32+109+12+2 — APU gained 9 new checks,
 Musashi cosim gained 10).
 
-### Phase 9d+ — The real trig/log/exp set, NOT YET STARTED
+### Phase 9d — FSIN/FCOS, COMPLETE
 
-19 functions (FACOS/FASIN/FATAN/FATANH/FCOS/FCOSH/FETOX/FETOXM1/FLOGN/
-FLOGNP1/FLOG10/FLOG2/FSIN/FSINCOS/FSINH/FTAN/FTANH/FTENTOX/FTWOTOX).
-Needs a genuine numerical algorithm per function (polynomial/rational
-minimax approximation, the standard technique for this class of
-problem) verified to the manual's own ~64 ULP typical / 4096 ULP
-worst-case tolerance — Musashi-cross-checkable for FSIN/FCOS/FSINCOS,
-Python/mpmath-generated reference vectors for the rest. Sequenced last
-deliberately — every other opclass-000 instruction (all the exact and
-double-rounding-exact ones) is now implemented and tested first; this
-is the one remaining category needing genuine numerical approximation
-rather than bit manipulation or reuse of already-proven arithmetic
-primitives.
+The first genuinely APPROXIMATED op this project implements (Section
+4.3 "Computational Accuracy" confirms real silicon isn't bit-exact
+here either — "worst-case accuracy is 4096 units in the last place,"
+"typical error bound... approximately 64 units in the last place" —
+unlike FADD/FSUB/FMUL/FDIV/FSQRT, which are IEEE-exact). New shared
+task `fp_sincos` in `rtl/m68882_apu.sv`: argument reduction to
+`r = a - k*(pi/2)` (`k = round(a/(pi/2))`, computed via `fp_div` +
+inline dynamic-shift-and-mask integer rounding — NOT a second
+`fp_int` call site, per the established Icarus livelock-avoidance
+discipline), quadrant determined from `k mod 4` via 2-bit modular
+arithmetic on the quotient's sign+magnitude (a plain `case` with a
+`default` arm, not `unique case` — `unique case` flagged a spurious
+"unhandled value" warning at simulation time 0 before any real operand
+reaches the task, since `k_mod4` is transiently X then; the `default`
+arm absorbs that, not a 5th real quadrant), then 9-term Taylor
+polynomials for cos(r) and sin(r)/r evaluated via Horner's method in
+`w=r²` through a `for` loop (one shared pair of `fp_mul`/`fp_add_sub`
+call sites for both polynomials, not 16 unrolled ones — same
+call-site-minimization discipline `fp_mod_rem` established, empirically
+re-confirmed safe here too: full `make test` clean, no hang).
+
+`PI_OVER_2` and both 9-term coefficient tables were independently
+re-derived this session (Python, `Decimal` arbitrary precision, 60
+significant digits, rounded to the nearest extended-precision bit
+pattern) as a sanity check on values carried over from an earlier
+session — confirmed bit-for-bit identical to what was already in the
+RTL, so no correctness issue, but worth recording: the derivation
+script's first pass had a real off-by-one bug (used `mantissa =
+v * 2^64` instead of `2^63` for the explicit-integer-bit convention,
+silently producing wrong constants that happened to still "look like"
+valid hex) — caught only by cross-checking against the already-trusted
+`PI_OVER_2` constant, not by inspection. A reminder that even a
+from-scratch Python re-derivation needs its own output sanity-checked
+against a known-good value before being trusted.
+
+FSIN ($0E) / FCOS ($1D) wired into `rtl/m68882_proto.sv` following the
+exact Phase 9b/9c pattern (new `cmd_is_fsin`/`cmd_is_fcos` wires,
+extended dispatch condition, one `fp_sincos` call site in the slot-A
+combinational block, `7'h0E`/`7'h1D` result-mux cases) — `apu_latency`
+already had real Table 8-3 entries for both (394 cyc, ×4 = 1576 ticks)
+from Phase 9a's own original opcode-space sweep, so no latency-table
+change was needed here.
+
+**FSINCOS itself deliberately NOT implemented** — a scope cut decided
+during implementation and recorded here rather than silently dropped.
+This project's slot-A/B pipeline only ever commits a single result to
+a single destination register per dispatched op; FSINCOS's own real
+semantics (write sin to FPn, cos to a SECOND, opmode-encoded register,
+in one instruction) needs dual-register commit-path plumbing this
+architecture doesn't have yet. FSIN and FCOS individually, computed via
+the same shared `fp_sincos` task, produce the identical two numeric
+results FSINCOS itself would — nothing numerically new is left
+unverified by deferring the dual-write plumbing alone.
+
+**Musashi-comparable in principle, not exercised via the shared exact-
+match vector battery**: Musashi's own FSIN/FCOS (`m68kfpu.c`, `case
+0xe`/`case 0x1d`) round-trip through a **libc `double` sin/cos call**
+(`double_to_fx80(sin(fx80_to_double(source)))`) — a fundamentally
+different, and less accurate (53-bit double mantissa vs. this
+project's own 64-bit extended-precision Taylor evaluation) computation
+path than this project's own. `tb/m68882_musashi_cosim_tb.sv` compares
+bit-for-bit, which is the right check for every other op in that
+battery (all exact or double-rounding-exact) but not for two
+independently-approximated transcendentals — a bit-for-bit mismatch
+there would be near-certain even with a perfectly correct
+implementation on both sides, testing nothing useful. Verified instead
+directly in `tb/m68882_apu_tb.sv` (new `check_close` task, sign+exponent
+exact match + mantissa within a ULP tolerance) against reference values
+computed independently in Python (60-digit `Decimal`-precision Taylor
+series, NOT `math.sin`/`math.cos` — those are only IEEE double, too
+coarse a reference for an 80-bit-extended result). `ulp_tol=4096`
+matches Section 4.3's own documented real-hardware worst-case bound —
+the principled choice, not an arbitrarily tightened number; measured
+accuracy in practice is far tighter (0-5 ULP across all 8 numeric
+vectors tested, including one exercising argument reduction with
+k=6 at FSIN/FCOS(10.0)). 8 new numeric checks plus 8 exact-match
+Operation Table checks (FSIN(±0.0)=±0.0 sign-preserved, FCOS(0.0)=
++1.0, FSIN/FCOS(+inf)=NaN+OPERR) — **APU test grew 69→85 checks, `make
+test` 8/8 suites clean** (Musashi cosim battery unchanged at 54
+vectors — FSIN/FCOS deliberately excluded from it, per above).
+
+A real testbench-infrastructure bug was found and fixed along the way:
+`tb/m68882_apu_tb.sv`'s and `tb/m68882_musashi_cosim_tb.sv`'s own
+pipeline-drain wait loops were capped at `wait_ticks < 1000` (bumped
+from 400 at Phase 9a) — FSIN/FCOS's own real latency (1576 ticks) and
+FSINH/FCOSH's own even longer latency (2760/2440 ticks, needed for
+future phases already in `apu_latency`'s own table) exceed that bound,
+so every FSIN/FCOS check silently observed a still-in-flight, not-yet-
+committed result and failed outright (including trivially-should-pass
+cases like `FSIN(+0.0)==+0.0`) until the bound was raised to 3000 —
+comfortably above every entry in the latency table (max 2784, FACOS).
+
+### Phase 9e+ — The remaining log/exp/hyperbolic/inverse-trig set, NOT YET STARTED
+
+18 functions (FACOS/FASIN/FATAN/FATANH/FCOSH/FETOX/FETOXM1/FLOGN/
+FLOGNP1/FLOG10/FLOG2/FSINH/FTAN/FTANH/FTENTOX/FTWOTOX, plus FSINCOS's
+own deferred dual-register-write plumbing). Needs a genuine numerical
+algorithm per function (polynomial/rational minimax approximation, or
+argument-reduction + series the way FSIN/FCOS's own `fp_sincos` now
+does) verified to the manual's own ~64 ULP typical / 4096 ULP
+worst-case tolerance. None of these are Musashi-verifiable at all —
+that emulator's own printed version simply doesn't implement any of
+them (confirmed at Phase 9's own initial research) — so this phase
+needs Python/mpmath-generated reference vectors throughout, the same
+`check_close`-style tolerance comparison Phase 9d's own FSIN/FCOS
+tests established rather than bit-exact comparison.
