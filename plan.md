@@ -2008,10 +2008,46 @@ opcode-assembly harness for the same 32-entry table was judged not
 worth the additional effort right now; can be added later if ever in
 doubt. **`make test` grew to 9 suites (was 8), all clean.**
 
-## Phase 11 — Word (W) and Byte (B) integer external-operand formats, NOT YET STARTED
+## Phase 11 — Word (W) and Byte (B) integer external-operand formats (COMPLETE)
 
-Next in the gap-closure plan. Mechanical width-narrowing of Phase 4c's
-own already-proven `int32_to_ext`/`ext_to_int32` tasks to 16-bit and
-8-bit signed integers, plus wiring `FMT_W`/`FMT_B` (already real enum
-values with correct byte-counts in `fmt_bytes()`) into the existing
-`supply_staged`/`receive_converted` muxes in `rtl/m68882_proto.sv`.
+Mechanical width-narrowing of Phase 4c's own already-proven
+`int32_to_ext`/`ext_to_int32` tasks to 16-bit and 8-bit signed integers
+(`int16_to_ext`/`ext_to_int16`/`int8_to_ext`/`ext_to_int8` in
+`rtl/m68882_apu.sv`) — same widen-before-negate INT_MIN trick, same
+leading-zero-count/shift derivation, same dynamic-shift-and-mask
+guard/round/sticky extraction, same documented "`real_exp<0` always
+truncates toward zero regardless of rounding mode" simplification
+Long-Word-Integer already carries — deliberately not re-derived from
+first principles, to keep this phase low-risk.
+
+**One real design point resolved by reading the manual directly, not
+assumed**: Figure 7-4 ("Operand CIR Data Alignment") confirms operands
+narrower than 4 bytes are "aligned with the most significant byte" of
+the single 32-bit Operand CIR access — the Word value sits in the TOP
+16 bits, the Byte value in the TOP 8, never the bottom. `fmt_bytes()`
+and `chunks_for_bytes()` already correctly classified W/B as one
+32-bit-chunk transfers (matching L/S) even before this phase, since
+that plumbing was format-size-driven from the start — only the VALUE
+CONVERSION and its MSB-justified placement within the chunk were
+missing, wired into the existing `supply_staged`/`receive_converted`
+muxes in `rtl/m68882_proto.sv` (`receive_assembled[95:80]`/`[95:88]`
+for RECEIVE; `{supply_int16,16'h0,64'h0}`/`{supply_int8,24'h0,64'h0}`
+for SUPPLY).
+
+**Testing**: `tb/m68882_proto_tb.sv` gained 6 checks (27→33) — Word and
+Byte round trips for both +5 and -5 (sign handling), mirroring the
+existing Long-Word-Integer checks exactly, confirming the MSB-
+justified alignment on both the RECEIVE and SUPPLY sides. **`make
+test`: 9/9 suites clean.**
+
+## Phase 12 — Trap-enabled destination-register-write suppression for SNAN/OPERR/DZ, NOT YET STARTED
+
+Next in the gap-closure plan. Section 6.1.2/6.1.3/6.1.6's own "Trap
+Enabled Results" text (confirmed directly, transcribed in full in
+`wobbly-honking-cascade.md`) says a floating-point-register destination
+is left UNMODIFIED for SNAN/OPERR/DZ when that exception's trap is
+enabled — the opposite of OVFL/UNFL, whose own text says the result
+IS stored regardless. Current RTL writes `apu_wr_data<=slotA_result`
+unconditionally; fix gates that write on
+`!(slotA_exc_trap && (slotA_flag_snan || slotA_flag_operr ||
+slotA_flag_dz))`.

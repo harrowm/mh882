@@ -858,6 +858,164 @@ package m68882_apu_pkg;
         end
     endtask
 
+    // ── Phase 11: Word Integer (W, 16-bit) and Byte Integer (B, 8-bit)
+    // -- the same signed-integer conversion CLASS as Long-Word Integer
+    // (L) above, just narrower. Each task below is a direct, mechanical
+    // width-narrowing of int32_to_ext/ext_to_int32's own already-proven
+    // pattern (same widen-before-negate INT_MIN trick, same
+    // leading-zero-count/shift derivation, same dynamic-shift-and-mask
+    // guard/round/sticky extraction, same documented "real_exp<0 always
+    // truncates toward zero regardless of rounding mode" simplification
+    // for values with magnitude <1.0) -- not re-derived from first
+    // principles, deliberately, to keep this phase low-risk.
+    task automatic int16_to_ext(input logic signed [15:0] val, output logic [95:0] result);
+        if (val == 16'sd0) begin
+            result = 96'h0;
+        end else begin
+            logic signed [16:0] wide_val, wide_mag;
+            logic [63:0] mag64;
+            logic [6:0]  lz;
+            logic [6:0]  shift;
+            logic [63:0] mant;
+            logic [14:0] exp;
+
+            wide_val = {val[15], val}; // sign-extend to 17 bits, avoids
+                                        // the INT16_MIN (-2^15) negation trap
+            wide_mag = val[15] ? -wide_val : wide_val;
+            mag64    = {47'b0, wide_mag[16:0]};
+            lz       = lzc64(mag64) - 7'd47; // 0..16: leading zeros within
+                                              // the real 17-bit magnitude
+            shift    = 7'd47 + lz;           // aligns the magnitude's own
+                                              // leading 1 bit to bit63
+            mant     = mag64 << shift;
+            exp      = 15'd16383 + (15'd16 - {11'b0, lz});
+
+            result = {val[15], exp, 16'h0, mant};
+        end
+    endtask
+
+    task automatic ext_to_int16(
+        input  logic [95:0]  ext,
+        input  round_mode_t  rmode,
+        output logic [15:0]  val,
+        output logic         flag_operr
+    );
+        fpx_t x;
+        logic signed [17:0] real_exp;
+
+        x = unpack_fpx(ext);
+        flag_operr = 1'b0;
+
+        if (is_nan_fpx(x) || is_inf_fpx(x)) begin
+            flag_operr = 1'b1;
+            val = x.sign ? 16'h8000 : 16'h7FFF;
+        end else if (is_zero_fpx(x)) begin
+            val = 16'h0;
+        end else begin
+            real_exp = $signed({3'b0, x.exp}) - 18'sd16383;
+            if (real_exp < 18'sd0) begin
+                val = 16'h0; // same documented simplification as ext_to_int32
+            end else if (real_exp > 18'sd14) begin
+                // magnitude >= 2^15: out of Word-Integer range
+                flag_operr = 1'b1;
+                val = x.sign ? 16'h8000 : 16'h7FFF;
+            end else begin
+                logic [63:0] shifted;
+                logic [63:0] dropped_mask;
+                logic [63:0] dropped_bits;
+                logic        guard, any_lower;
+                logic [15:0] mag;
+                logic        round_up;
+                int unsigned drop;
+                drop = 63 - real_exp;
+                shifted      = x.mant >> drop;
+                dropped_mask = (drop == 0) ? 64'h0 : ((64'h1 << drop) - 64'h1);
+                dropped_bits = x.mant & dropped_mask;
+                guard        = (drop > 0) && ((dropped_bits >> (drop - 1)) & 64'h1);
+                any_lower    = (drop > 1) && ((dropped_bits & ((64'h1 << (drop - 1)) - 64'h1)) != 0);
+                round_up     = (guard && ((rmode == RND_NEAREST) && (any_lower || shifted[0]))) ||
+                               ((rmode == RND_PINF) && !x.sign && (dropped_bits != 0)) ||
+                               ((rmode == RND_MINF) && x.sign && (dropped_bits != 0));
+                mag = shifted[15:0] + (round_up ? 16'd1 : 16'd0);
+                val = x.sign ? (~mag + 16'd1) : mag;
+            end
+        end
+    endtask
+
+    task automatic int8_to_ext(input logic signed [7:0] val, output logic [95:0] result);
+        if (val == 8'sd0) begin
+            result = 96'h0;
+        end else begin
+            logic signed [8:0]  wide_val, wide_mag;
+            logic [63:0] mag64;
+            logic [6:0]  lz;
+            logic [6:0]  shift;
+            logic [63:0] mant;
+            logic [14:0] exp;
+
+            wide_val = {val[7], val}; // sign-extend to 9 bits, avoids
+                                       // the INT8_MIN (-2^7) negation trap
+            wide_mag = val[7] ? -wide_val : wide_val;
+            mag64    = {55'b0, wide_mag[8:0]};
+            lz       = lzc64(mag64) - 7'd55; // 0..8: leading zeros within
+                                              // the real 9-bit magnitude
+            shift    = 7'd55 + lz;           // aligns the magnitude's own
+                                              // leading 1 bit to bit63
+            mant     = mag64 << shift;
+            exp      = 15'd16383 + (15'd8 - {11'b0, lz});
+
+            result = {val[7], exp, 16'h0, mant};
+        end
+    endtask
+
+    task automatic ext_to_int8(
+        input  logic [95:0]  ext,
+        input  round_mode_t  rmode,
+        output logic [7:0]   val,
+        output logic         flag_operr
+    );
+        fpx_t x;
+        logic signed [17:0] real_exp;
+
+        x = unpack_fpx(ext);
+        flag_operr = 1'b0;
+
+        if (is_nan_fpx(x) || is_inf_fpx(x)) begin
+            flag_operr = 1'b1;
+            val = x.sign ? 8'h80 : 8'h7F;
+        end else if (is_zero_fpx(x)) begin
+            val = 8'h0;
+        end else begin
+            real_exp = $signed({3'b0, x.exp}) - 18'sd16383;
+            if (real_exp < 18'sd0) begin
+                val = 8'h0; // same documented simplification as ext_to_int32
+            end else if (real_exp > 18'sd6) begin
+                // magnitude >= 2^7: out of Byte-Integer range
+                flag_operr = 1'b1;
+                val = x.sign ? 8'h80 : 8'h7F;
+            end else begin
+                logic [63:0] shifted;
+                logic [63:0] dropped_mask;
+                logic [63:0] dropped_bits;
+                logic        guard, any_lower;
+                logic [7:0]  mag;
+                logic        round_up;
+                int unsigned drop;
+                drop = 63 - real_exp;
+                shifted      = x.mant >> drop;
+                dropped_mask = (drop == 0) ? 64'h0 : ((64'h1 << drop) - 64'h1);
+                dropped_bits = x.mant & dropped_mask;
+                guard        = (drop > 0) && ((dropped_bits >> (drop - 1)) & 64'h1);
+                any_lower    = (drop > 1) && ((dropped_bits & ((64'h1 << (drop - 1)) - 64'h1)) != 0);
+                round_up     = (guard && ((rmode == RND_NEAREST) && (any_lower || shifted[0]))) ||
+                               ((rmode == RND_PINF) && !x.sign && (dropped_bits != 0)) ||
+                               ((rmode == RND_MINF) && x.sign && (dropped_bits != 0));
+                mag = shifted[7:0] + (round_up ? 8'd1 : 8'd0);
+                val = x.sign ? (~mag + 8'd1) : mag;
+            end
+        end
+    endtask
+
     // ── Single Precision Real (S, IEEE-754 binary32) <-> extended ────
     task automatic single_to_ext(input logic [31:0] bits, output logic [95:0] result);
         logic        sign;

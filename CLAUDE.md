@@ -886,10 +886,20 @@ predicates across 5 representative condition-code states plus the
 BSUN/Take-Pre behavior itself. **`make test` grew to 9 suites, all
 clean.**
 
+**Phase 11 (Word/Byte integer external-operand formats) is complete.**
+Mechanical width-narrowing of Phase 4c's own `int32_to_ext`/
+`ext_to_int32` to 16-bit/8-bit (`int16_to_ext`/`ext_to_int16`/
+`int8_to_ext`/`ext_to_int8`, `rtl/m68882_apu.sv`), wired into the
+existing format muxes with the correct MSB-justified alignment within
+the single 32-bit Operand CIR access (Figure 7-4, confirmed directly —
+these operands live in the TOP 16/8 bits of the chunk, not the
+bottom). `tb/m68882_proto_tb.sv` gained 6 checks (27→33, Word/Byte
+round trips for ±5). **`make test`: 9/9 suites clean.**
+
 See `plan.md` for the full phased build plan, including the remaining
-gap-closure phases (W/B/P integer/packed-decimal formats, denormals,
-trap-enabled destination-write semantics, and — cross-repo — MH030's
-own coprocessor-conditional instructions).
+gap-closure phases (Packed Decimal, denormals, trap-enabled
+destination-write semantics, and — cross-repo — MH030's own
+coprocessor-conditional instructions).
 
 ```bash
 make test   # builds and runs all nine testbenches via Icarus Verilog

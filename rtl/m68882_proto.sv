@@ -941,20 +941,32 @@ module m68882_proto (
     logic [31:0] supply_int32;
     logic [31:0] supply_single;
     logic [63:0] supply_double;
+    logic [15:0] supply_int16;
+    logic [7:0]  supply_int8;
     logic        supply_int32_operr, supply_single_operr, supply_double_operr;
+    logic        supply_int16_operr, supply_int8_operr;
     logic [95:0] supply_staged;
 
     always_comb begin
         ext_to_int32(apu_b_rd, round_mode_t'(fpcr_o[5:4]), supply_int32, supply_int32_operr);
         ext_to_single(apu_b_rd, round_mode_t'(fpcr_o[5:4]), supply_single, supply_single_operr);
         ext_to_double(apu_b_rd, round_mode_t'(fpcr_o[5:4]), supply_double, supply_double_operr);
+        ext_to_int16(apu_b_rd, round_mode_t'(fpcr_o[5:4]), supply_int16, supply_int16_operr);
+        ext_to_int8(apu_b_rd, round_mode_t'(fpcr_o[5:4]), supply_int8, supply_int8_operr);
 
+        // Phase 11: Word/Byte, like every format under 4 bytes (Figure
+        // 7-4, "Operand CIR Data Alignment," confirmed directly), are
+        // aligned with the MOST SIGNIFICANT byte of the (single) 32-bit
+        // Operand CIR access -- the value sits in the TOP 16/8 bits of
+        // the chunk, not the bottom.
         unique case (cmd_rx_r)
             FMT_L:   supply_staged = {supply_int32, 64'h0};
             FMT_S:   supply_staged = {supply_single, 64'h0};
             FMT_D:   supply_staged = {supply_double, 32'h0};
             FMT_X:   supply_staged = apu_b_rd; // native format, pure passthrough
-            default: supply_staged = 96'h0; // W/B/P: not yet implemented (Phase 4c scope)
+            FMT_W:   supply_staged = {supply_int16, 16'h0, 64'h0};
+            FMT_B:   supply_staged = {supply_int8, 24'h0, 64'h0};
+            default: supply_staged = 96'h0; // P: not yet implemented (Phase 4c/14 scope)
         endcase
     end
 
@@ -970,10 +982,16 @@ module m68882_proto (
     end
 
     logic [95:0] receive_int32_ext, receive_single_ext, receive_double_ext;
+    logic [95:0] receive_int16_ext, receive_int8_ext;
     always_comb begin
         int32_to_ext(receive_assembled[95:64], receive_int32_ext);
         single_to_ext(receive_assembled[95:64], receive_single_ext);
         double_to_ext(receive_assembled[95:32], receive_double_ext);
+        // Phase 11: same MSB-alignment convention as supply_staged above
+        // -- the Word/Byte value lives in the TOP 16/8 bits of the
+        // single 32-bit chunk this format ever transfers.
+        int16_to_ext(receive_assembled[95:80], receive_int16_ext);
+        int8_to_ext(receive_assembled[95:88], receive_int8_ext);
     end
 
     logic [95:0] receive_converted;
@@ -983,7 +1001,9 @@ module m68882_proto (
             FMT_S:   receive_converted = receive_single_ext;
             FMT_D:   receive_converted = receive_double_ext;
             FMT_X:   receive_converted = receive_assembled; // native format, pure passthrough
-            default: receive_converted = 96'h0; // W/B/P: not yet implemented
+            FMT_W:   receive_converted = receive_int16_ext;
+            FMT_B:   receive_converted = receive_int8_ext;
+            default: receive_converted = 96'h0; // P: not yet implemented
         endcase
     end
 

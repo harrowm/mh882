@@ -228,6 +228,72 @@ module m68882_proto_tb;
 
         repeat (4) @(posedge clk_4x);
 
+        // ── Phase 11: opclass 010/011, Word Integer (W) round trip, +-5 --
+        // same conversion CLASS as Long-Word Integer above, just a
+        // narrower external representation; Figure 7-4's own "aligned
+        // with the most significant byte" rule (confirmed directly)
+        // means the 16-bit value sits in the TOP half of the single
+        // 32-bit Operand CIR access, not the bottom.
+        run_cycle(CIR_COMMAND, 1'b1, cmd_word(3'b010, FMT_W, 3'd5, 7'd0), rd);
+        run_cycle(CIR_INSTRADDR, 1'b1, 32'h0000_1000, rd);
+        run_cycle(CIR_RESPONSE, 1'b0, 32'h0, rd);
+        run_cycle(CIR_OPERAND, 1'b1, 32'h0005_0000, rd); // +5, MSB-justified in the 32-bit access
+        run_cycle(CIR_RESPONSE, 1'b0, 32'h0, rd);
+        check(u_top.u_proto.u_regfile.fp_r[5] == EXT_5_0,
+              "opclass 010: Word-Integer 5 converts to extended-precision 5.0 in FP5");
+
+        repeat (4) @(posedge clk_4x);
+
+        run_cycle(CIR_COMMAND, 1'b1, cmd_word(3'b011, FMT_W, 3'd5, 7'd0), rd);
+        run_cycle(CIR_INSTRADDR, 1'b1, 32'h0000_1000, rd);
+        run_cycle(CIR_RESPONSE, 1'b0, 32'h0, rd);
+        run_cycle(CIR_OPERAND, 1'b0, 32'h0, rd);
+        check(rd == 32'h0005_0000, "opclass 011: FP5's own extended 5.0 converts back to Word-Integer 5, MSB-justified");
+        run_cycle(CIR_RESPONSE, 1'b0, 32'h0, rd);
+
+        repeat (4) @(posedge clk_4x);
+
+        run_cycle(CIR_COMMAND, 1'b1, cmd_word(3'b010, FMT_W, 3'd5, 7'd0), rd);
+        run_cycle(CIR_INSTRADDR, 1'b1, 32'h0000_1000, rd);
+        run_cycle(CIR_RESPONSE, 1'b0, 32'h0, rd);
+        run_cycle(CIR_OPERAND, 1'b1, 32'hFFFB_0000, rd); // -5 two's complement, MSB-justified
+        run_cycle(CIR_RESPONSE, 1'b0, 32'h0, rd);
+        check(u_top.u_proto.u_regfile.fp_r[5] == {1'b1, EXT_5_0[94:0]},
+              "opclass 010: Word-Integer -5 converts to extended-precision -5.0");
+
+        repeat (4) @(posedge clk_4x);
+
+        // ── Phase 11: opclass 010/011, Byte Integer (B) round trip, +-5 --
+        // same shape again, one byte, MSB-justified (bits[31:24]).
+        run_cycle(CIR_COMMAND, 1'b1, cmd_word(3'b010, FMT_B, 3'd5, 7'd0), rd);
+        run_cycle(CIR_INSTRADDR, 1'b1, 32'h0000_1000, rd);
+        run_cycle(CIR_RESPONSE, 1'b0, 32'h0, rd);
+        run_cycle(CIR_OPERAND, 1'b1, 32'h0500_0000, rd); // +5, MSB-justified
+        run_cycle(CIR_RESPONSE, 1'b0, 32'h0, rd);
+        check(u_top.u_proto.u_regfile.fp_r[5] == EXT_5_0,
+              "opclass 010: Byte-Integer 5 converts to extended-precision 5.0 in FP5");
+
+        repeat (4) @(posedge clk_4x);
+
+        run_cycle(CIR_COMMAND, 1'b1, cmd_word(3'b011, FMT_B, 3'd5, 7'd0), rd);
+        run_cycle(CIR_INSTRADDR, 1'b1, 32'h0000_1000, rd);
+        run_cycle(CIR_RESPONSE, 1'b0, 32'h0, rd);
+        run_cycle(CIR_OPERAND, 1'b0, 32'h0, rd);
+        check(rd == 32'h0500_0000, "opclass 011: FP5's own extended 5.0 converts back to Byte-Integer 5, MSB-justified");
+        run_cycle(CIR_RESPONSE, 1'b0, 32'h0, rd);
+
+        repeat (4) @(posedge clk_4x);
+
+        run_cycle(CIR_COMMAND, 1'b1, cmd_word(3'b010, FMT_B, 3'd5, 7'd0), rd);
+        run_cycle(CIR_INSTRADDR, 1'b1, 32'h0000_1000, rd);
+        run_cycle(CIR_RESPONSE, 1'b0, 32'h0, rd);
+        run_cycle(CIR_OPERAND, 1'b1, 32'hFB00_0000, rd); // -5 two's complement, MSB-justified
+        run_cycle(CIR_RESPONSE, 1'b0, 32'h0, rd);
+        check(u_top.u_proto.u_regfile.fp_r[5] == {1'b1, EXT_5_0[94:0]},
+              "opclass 010: Byte-Integer -5 converts to extended-precision -5.0");
+
+        repeat (4) @(posedge clk_4x);
+
         // ── opclass 010: Single-Precision-Real 3.5 -> FP4 ────────────────
         // 3.5f = 0x40600000 (well-known IEEE-754 single bit pattern);
         // extended 3.5 = 1.11(binary)*2^1, exp=16384=0x4000,
