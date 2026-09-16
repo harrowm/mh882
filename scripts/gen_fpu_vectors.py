@@ -42,6 +42,9 @@ VALUES = {
     "-0.75": (0xbffe, 0xc000000000000000),
     "8.0":   (0x4002, 0x8000000000000000),
     "-8.0":  (0xc002, 0x8000000000000000),
+    "7.0":   (0x4001, 0xe000000000000000),
+    "-7.0":  (0xc001, 0xe000000000000000),
+    "10.0":  (0x4002, 0xa000000000000000),
 }
 
 # (ext, name, rx, ry, round) -- round: 0=Nearest,1=Zero,2=-Inf,3=+Inf
@@ -120,6 +123,30 @@ CASES = [
     (0x1E, "FGETEXP", "8.0",  "0.0", 0), # 8.0 = 1.0*2^3 -> 3.0
     (0x1E, "FGETEXP", "0.75", "0.0", 0), # 0.75 = 1.5*2^-1 -> -1.0
     (0x1E, "FGETEXP", "1.0",  "0.0", 0), # 1.0 = 1.0*2^0 -> 0.0
+    # Phase 9c: FSGLDIV/FSGLMUL (single-precision-rounded, round=0/nearest
+    # only -- Musashi's own C-cast-based rounding for these two doesn't
+    # respect FPCR's rounding mode at all, so it's only a valid reference
+    # at round=0 where both sides agree regardless) and FMOD/FREM (result
+    # only -- the FPSR quotient byte isn't captured by this vector format
+    # at all, checked directly in tb/m68882_apu_tb.sv instead).
+    (0x24, "FSGLDIV", "2.0", "3.0", 0),  # 3.0 / 2.0 == 1.5, exact in single precision
+    (0x27, "FSGLMUL", "2.0", "3.0", 0),  # 2.0 * 3.0 == 6.0
+    # FMOD(2.0, 7.0) deliberately excluded: a THIRD real, confirmed
+    # Musashi bug (m68kfpu.c's own `case 0x21: FMOD` calls `floatx80_rem`
+    # -- the IDENTICAL softfloat function FREM's own `case 0x25` calls --
+    # so Musashi's FMOD never actually truncates the quotient at all; it
+    # is silently just an alias for FREM. Confirmed empirically: Musashi
+    # returns -1.0 for BOTH FMOD(2.0,7.0) and FREM(2.0,7.0), when the
+    # manual's own documented distinction (FMOD truncates the quotient
+    # toward zero, FREM rounds it to nearest) requires them to differ
+    # here (N=trunc(3.5)=3 for FMOD vs N=round(3.5)=4 for FREM, giving
+    # +1.0 vs -1.0 respectively) -- this project's own RTL is tested
+    # directly in tb/m68882_apu_tb.sv instead, including the real FPSR
+    # quotient-byte values Musashi's own results don't expose at all
+    # through this vector format anyway.
+    (0x25, "FREM",    "2.0", "7.0", 0),  # N=round(7/2)=round(3.5)=4 (ties to even) -> 7-2*4=-1.0
+    (0x21, "FMOD",    "3.0", "10.0", 0), # N=trunc(10/3)=3 -> 10-3*3=1.0 (agrees with FREM here, doesn't distinguish the bug)
+    (0x25, "FREM",    "3.0", "10.0", 0), # N=round(10/3)=round(3.33)=3 -> 10-3*3=1.0
 ]
 
 

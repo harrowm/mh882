@@ -696,14 +696,30 @@ so a negative source that truncates to zero always comes back +0.0
 there regardless of real hardware. Both confirmed by direct source
 inspection, both documented and worked around in the test battery
 (tested directly instead of via the Musashi comparison for those
-specific cases). See plan.md's own Phase 9 section for the full
-derivation, the complete opcode table, and the Phase 9c+ plan (the real
-trig/log/exp set, not yet started). **271/271 across all eight
+specific cases). **271/271 across all eight testbenches.**
+
+**Phase 9c (FSGLDIV/FSGLMUL/FMOD/FREM) is also complete.** FSGLDIV/
+FSGLMUL are exact double-rounding operations (divide/multiply then round
+to single precision regardless of FPCR's own precision setting),
+implemented by reusing `fp_div`/`fp_mul` + `ext_to_single`/`single_to_ext`
+directly. FMOD/FREM compute `FPn - Source×N` (N = truncated or
+round-to-nearest quotient) and load the real FPSR quotient byte — the
+one instruction pair that reuses `fp_div`/`fp_mul`/`fp_add_sub` from a
+SECOND call site each, empirically confirmed safe (not just assumed) by
+running the full test suite, since these new calls fire unconditionally
+every cycle regardless of the active op. Found a THIRD confirmed Musashi
+bug in the process: its own `FMOD` opcode silently calls the same
+softfloat function `FREM` does, so it never actually truncates the
+quotient — confirmed with a deliberately rounding-boundary test case
+where the two genuinely diverge (`docs/musashi_bugs_found.md` now
+documents all 3). See plan.md's own Phase 9 section for the full
+derivation and the Phase 9d+ plan (the real trig/log/exp set, the last
+remaining category, not yet started). **292/292 across all eight
 testbenches.**
 
 See `plan.md` for the full phased build plan and the complete list of
-what remains deliberately out of scope (the rest of Phase 9, W/B/P
-formats, BSUN/INEX1, denormals, and the rest).
+what remains deliberately out of scope (Phase 9d+, W/B/P formats,
+BSUN/INEX1, denormals, and the rest).
 
 ```bash
 make test   # builds and runs all eight testbenches via Icarus Verilog

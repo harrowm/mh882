@@ -129,6 +129,8 @@ module m68882_apu_tb;
     localparam logic [95:0] EXT_12_0  = 96'h4002_0000_c000_0000_0000_0000;
     localparam logic [95:0] EXT_N8_0  = 96'hc002_0000_8000_0000_0000_0000;
     localparam logic [95:0] EXT_N4_0  = 96'hc001_0000_8000_0000_0000_0000;
+    localparam logic [95:0] EXT_7_0   = 96'h4001_0000_e000_0000_0000_0000;
+    localparam logic [95:0] EXT_10_0  = 96'h4002_0000_a000_0000_0000_0000;
 
     logic [31:0] rd;
 
@@ -494,6 +496,49 @@ module m68882_apu_tb;
         dispatch(cmd_word(3'b000, 3'd0, 3'd1, 7'h03)); // FINTRZ -0.75
         check(u_top.u_proto.u_regfile.fp_r[1] == {1'b1, 95'h0}, "Phase 9b: FINTRZ(-0.75) == -0.0 (sign preserved on truncation to zero)");
         check(u_top.u_proto.u_regfile.fpsr_r[26] == 1'b1, "Phase 9b: FINTRZ(-0.75) sets the Z condition code (a signed zero is still zero)");
+
+        // ── Phase 9c: FSGLDIV ($24) / FSGLMUL ($27) -- single-precision-
+        // rounded divide/multiply.
+        load_fp(0, EXT_2_0);
+        load_fp(1, EXT_3_0);
+        dispatch(cmd_word(3'b000, 3'd0, 3'd1, 7'h24)); // FSGLDIV: 3.0/2.0
+        check(u_top.u_proto.u_regfile.fp_r[1] == EXT_1_5, "Phase 9c: FSGLDIV(2.0, 3.0) == 3.0/2.0 == 1.5 (exact in single precision)");
+
+        load_fp(0, EXT_2_0);
+        load_fp(1, EXT_3_0);
+        dispatch(cmd_word(3'b000, 3'd0, 3'd1, 7'h27)); // FSGLMUL: 2.0*3.0
+        check(u_top.u_proto.u_regfile.fp_r[1] == EXT_6_0, "Phase 9c: FSGLMUL(2.0, 3.0) == 2.0*3.0 == 6.0");
+
+        // ── Phase 9c: FMOD ($21) vs FREM ($25) -- the real, documented
+        // distinction (truncated vs round-to-nearest quotient) that
+        // Musashi's own FMOD/FREM implementation FAILS to make (a third
+        // confirmed Musashi bug -- m68kfpu.c's own `case 0x21: FMOD`
+        // calls the identical `floatx80_rem` FREM's own `case 0x25`
+        // calls, so Musashi's FMOD is silently just an alias for FREM).
+        // 7.0/2.0 = 3.5 exactly -- FMOD truncates the quotient to 3,
+        // FREM rounds it to nearest-even, 4 -- genuinely different
+        // results (+1.0 vs -1.0), not just different intermediate
+        // rounding noise.
+        load_fp(0, EXT_2_0); // source (divisor)
+        load_fp(1, EXT_7_0); // dest (dividend)
+        dispatch(cmd_word(3'b000, 3'd0, 3'd1, 7'h21)); // FMOD: 7.0 mod 2.0, N=trunc(3.5)=3
+        check(u_top.u_proto.u_regfile.fp_r[1] == EXT_1_0, "Phase 9c: FMOD(2.0, 7.0) == 7.0 - 2.0*trunc(3.5) == 7.0 - 2.0*3 == 1.0");
+        check(u_top.u_proto.u_regfile.fpsr_r[22:16] == 7'd3, "Phase 9c: FMOD(2.0, 7.0) quotient byte == 3 (the truncated quotient, unsigned bits)");
+        check(u_top.u_proto.u_regfile.fpsr_r[23] == 1'b0, "Phase 9c: FMOD(2.0, 7.0) quotient sign == 0 (positive/positive division)");
+
+        load_fp(0, EXT_2_0);
+        load_fp(1, EXT_7_0);
+        dispatch(cmd_word(3'b000, 3'd0, 3'd1, 7'h25)); // FREM: 7.0 mod 2.0, N=round(3.5)=4 (ties to even)
+        check(u_top.u_proto.u_regfile.fp_r[1] == EXT_N1_0, "Phase 9c: FREM(2.0, 7.0) == 7.0 - 2.0*round(3.5) == 7.0 - 2.0*4 == -1.0 -- genuinely different from FMOD's own +1.0 (NOT the Musashi bug's aliasing)");
+        check(u_top.u_proto.u_regfile.fpsr_r[22:16] == 7'd4, "Phase 9c: FREM(2.0, 7.0) quotient byte == 4 (the rounded quotient)");
+
+        // Quotient sign = XOR of operand signs (Section 2.3.2, confirmed
+        // directly) -- verify with a negative dividend.
+        load_fp(0, EXT_2_0);
+        load_fp(1, {1'b1, EXT_7_0[94:0]}); // -7.0
+        dispatch(cmd_word(3'b000, 3'd0, 3'd1, 7'h21)); // FMOD: -7.0 mod 2.0
+        check(u_top.u_proto.u_regfile.fp_r[1] == EXT_N1_0, "Phase 9c: FMOD(2.0, -7.0) == -7.0 - 2.0*trunc(-3.5) == -7.0 - 2.0*(-3) == -1.0");
+        check(u_top.u_proto.u_regfile.fpsr_r[23] == 1'b1, "Phase 9c: FMOD(2.0, -7.0) quotient sign == 1 (positive/negative division)");
 
         $display("---");
         $display("%0d passed, %0d failed", pass_count, fail_count);

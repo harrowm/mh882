@@ -1461,15 +1461,80 @@ instead alongside FGETMAN/FSCALE, neither of which Musashi implements
 at all). **271/271 across all eight testbenches** (11+27+60+28+32+99+
 12+2 — APU gained 8 new checks, Musashi cosim gained 36).
 
-### Phase 9c+ — The real trig/log/exp set, NOT YET STARTED
+### Phase 9c — FSGLDIV/FSGLMUL/FMOD/FREM, COMPLETE
+
+**FSGLDIV ($24) / FSGLMUL ($27)**: confirmed exact operations (not
+subject to the ~64-ULP transcendental tolerance) — Section 4.x's own
+"divides... stores the result... rounded to single precision (regardless
+of the current rounding precision)" wording directly describes a genuine
+double-rounding structure (extended-precision divide/multiply, THEN
+round to single, THEN re-extend), which `fp_sgldiv`/`fp_sglmul`
+implement by reusing `fp_div`/`fp_mul` followed by the already-tested
+`ext_to_single`/`single_to_ext` pair rather than re-deriving
+single-precision rounding a second time. Confirmed to match Musashi's
+own implementation shape too (`m68kfpu.c`: `double_to_fx80((float)
+fx80_to_double(floatx80_div(...)))` — the identical double-rounding
+idea, though Musashi's own C-cast-based rounding always uses
+round-to-nearest regardless of FPCR, unlike this project's own
+rmode-respecting version, so Musashi is only a valid cross-check at
+round=0 for these two specifically).
+
+**FMOD ($21) / FREM ($25)**: `result = FPn - (Source × N)`, where N is
+the quotient `FPn ÷ Source` truncated (FMOD) or rounded-to-nearest
+(FREM) — confirmed directly (Section 4.x, both instructions' own
+"Operation"/"Description" text). Also loads the real FPSR quotient byte
+(bits[23:16]: bit23=sign, bits[22:16]=7 LSBs of the unsigned quotient —
+Section 2.3.2/Figure 2-5, confirmed directly), which no other
+instruction touches. `fp_mod_rem` determines N from `fp_div`'s own
+extended-precision quotient via the SAME dynamic-shift-and-mask
+integer-boundary-rounding technique `fp_int` uses, but does NOT call
+`fp_int` itself (a second independent call site of that specific task
+is the confirmed Icarus livelock class this project already hit once —
+see `fp_int`'s own header comment). `fp_mod_rem` DOES call `fp_div`,
+`fp_mul`, and `fp_add_sub` internally, each already having their own
+call site elsewhere in the same file — empirically tested (not just
+assumed safe) and confirmed NOT to livelock, unlike the original
+`fp_add_sub` case: these new calls run unconditionally every cycle
+inside the same always_comb block regardless of which op is actually
+dispatched, so the full existing test suite exercised the "2 call
+sites" scenario continuously across every single test tick with zero
+hangs, not just in a narrow window — a materially stronger empirical
+signal than the original bug's own discovery circumstance.
+
+**A THIRD real, confirmed Musashi bug found while cross-checking**:
+`m68kfpu.c`'s own `case 0x21: FMOD` calls `floatx80_rem()` — the
+IDENTICAL softfloat function `case 0x25: FREM` also calls, with
+identical arguments — so Musashi's FMOD is silently just an alias for
+FREM; it never actually truncates the quotient at all. Confirmed
+empirically: `FMOD(2.0, 7.0)` and `FREM(2.0, 7.0)` (true quotient
+exactly 3.5, a deliberately-chosen rounding-boundary case) both return
+Musashi's own `-1.0` (FREM's own correct N=4 answer), when FMOD's own
+truncated N=3 must give `+1.0` instead. This project's own RTL is
+verified directly in `tb/m68882_apu_tb.sv` to produce the genuinely
+different, correct results for both, including the real quotient-byte
+values (`docs/musashi_bugs_found.md` now documents all 3 confirmed
+Musashi bugs found across Phases 9b/9c, ready to file upstream against
+https://github.com/kstenerud/Musashi).
+
+`scripts/gen_fpu_vectors.py`'s battery grew from 49 to 54 vectors (5
+new: FSGLDIV/FSGLMUL basic correctness, FREM(2.0,7.0) and 2 FMOD/FREM
+cases that happen to agree — the ONE vector that would have exposed the
+Musashi aliasing bug is deliberately excluded with a full inline
+explanation, tested directly instead). **292/292 across all eight
+testbenches** (11+27+69+28+32+109+12+2 — APU gained 9 new checks,
+Musashi cosim gained 10).
+
+### Phase 9d+ — The real trig/log/exp set, NOT YET STARTED
 
 19 functions (FACOS/FASIN/FATAN/FATANH/FCOS/FCOSH/FETOX/FETOXM1/FLOGN/
-FLOGNP1/FLOG10/FLOG2/FSIN/FSINCOS/FSINH/FTAN/FTANH/FTENTOX/FTWOTOX) plus
-FMOD/FREM/FSGLDIV/FSGLMUL. Needs a genuine numerical algorithm per
-function (polynomial/rational minimax approximation, the standard
-technique for this class of problem) verified to the manual's own ~64
-ULP typical / 4096 ULP worst-case tolerance — Musashi-cross-checkable
-for FSIN/FCOS/FSINCOS/FMOD/FREM/FSGLDIV/FSGLMUL, Python/mpmath-
-generated reference vectors for the rest. Sequenced after Phase 9b
-deliberately — get the simpler, exact-semantics ops (and the pipeline
-infrastructure correction) landed and tested first.
+FLOGNP1/FLOG10/FLOG2/FSIN/FSINCOS/FSINH/FTAN/FTANH/FTENTOX/FTWOTOX).
+Needs a genuine numerical algorithm per function (polynomial/rational
+minimax approximation, the standard technique for this class of
+problem) verified to the manual's own ~64 ULP typical / 4096 ULP
+worst-case tolerance — Musashi-cross-checkable for FSIN/FCOS/FSINCOS,
+Python/mpmath-generated reference vectors for the rest. Sequenced last
+deliberately — every other opclass-000 instruction (all the exact and
+double-rounding-exact ones) is now implemented and tested first; this
+is the one remaining category needing genuine numerical approximation
+rather than bit manipulation or reuse of already-proven arithmetic
+primitives.

@@ -1273,4 +1273,262 @@ package m68882_apu_pkg;
         end
     endtask
 
+    // ── Phase 9c: FSGLDIV ($24) / FSGLMUL ($27) -- Section 4.x,
+    // confirmed directly: "divides... Stores the result... rounded to
+    // single precision (regardless of the current rounding precision)."
+    // Both are EXACT relative to that specification (not subject to the
+    // ~64-ULP transcendental tolerance) -- genuine double-rounding
+    // (extended-precision divide/multiply, THEN round to single, THEN
+    // re-extend), matching the manual's own "converts... divides...
+    // stores... rounded to single" ordering directly, and matching
+    // Musashi's own implementation shape too (confirmed by inspection of
+    // m68kfpu.c's own FSGLDIV/FSGLMUL cases: `double_to_fx80((float)
+    // fx80_to_double(floatx80_div(...)))` -- the identical double-
+    // rounding structure, though Musashi's own C-cast-based rounding
+    // always uses round-to-nearest regardless of FPCR, unlike this
+    // project's own rmode-respecting ext_to_single reuse below -- Musashi
+    // is therefore only a valid cross-check for round=0/nearest on these
+    // two ops specifically). Reuses ext_to_single/single_to_ext directly
+    // rather than re-deriving single-precision rounding a second time.
+    task automatic fp_sgldiv(
+        input  logic [95:0]  a_raw,
+        input  logic [95:0]  b_raw,
+        input  round_mode_t  rmode,
+        output logic [95:0]  result,
+        output logic         flag_z,
+        output logic         flag_n,
+        output logic         flag_i,
+        output logic         flag_nan,
+        output logic         flag_operr,
+        output logic         flag_dz,
+        output logic         flag_ovfl,
+        output logic         flag_unfl,
+        output logic         flag_inex2
+    );
+        logic [95:0] div_result;
+        logic        div_z, div_n, div_i, div_nan, div_operr, div_dz, div_ovfl, div_unfl, div_inex2;
+        logic [31:0] single_bits;
+        logic        single_operr;
+
+        fp_div(a_raw, b_raw, rmode, div_result, div_z, div_n, div_i, div_nan,
+               div_operr, div_dz, div_ovfl, div_unfl, div_inex2);
+
+        flag_operr = div_operr;
+        flag_dz    = div_dz;
+
+        if (div_nan || div_i || div_z) begin
+            // Already exact in any format -- no further rounding needed
+            // or meaningful.
+            result     = div_result;
+            flag_ovfl  = div_ovfl;
+            flag_unfl  = div_unfl;
+            flag_inex2 = div_inex2;
+        end else begin
+            ext_to_single(div_result, rmode, single_bits, single_operr);
+            single_to_ext(single_bits, result);
+            // single_operr here means "exceeded single precision's own
+            // (much narrower) range" -- the real OVFL/UNFL this
+            // instruction's own Exception Byte table points to (6.1.4/
+            // 6.1.5), not a genuine OPERR (that's reserved for the
+            // division's own 0/0, inf/inf domain errors, already
+            // captured via div_operr above).
+            flag_ovfl  = div_ovfl || (single_operr && !is_zero_fpx(unpack_fpx(result)));
+            flag_unfl  = div_unfl || (single_operr && is_zero_fpx(unpack_fpx(result)));
+            flag_inex2 = div_inex2 || (result != div_result);
+        end
+
+        begin
+            fpx_t r;
+            r = unpack_fpx(result);
+            flag_z   = is_zero_fpx(r);
+            flag_n   = r.sign && !flag_z;
+            flag_i   = is_inf_fpx(r);
+            flag_nan = is_nan_fpx(r);
+        end
+    endtask
+
+    task automatic fp_sglmul(
+        input  logic [95:0]  a_raw,
+        input  logic [95:0]  b_raw,
+        input  round_mode_t  rmode,
+        output logic [95:0]  result,
+        output logic         flag_z,
+        output logic         flag_n,
+        output logic         flag_i,
+        output logic         flag_nan,
+        output logic         flag_operr,
+        output logic         flag_ovfl,
+        output logic         flag_unfl,
+        output logic         flag_inex2
+    );
+        logic [95:0] mul_result;
+        logic        mul_z, mul_n, mul_i, mul_nan, mul_operr, mul_ovfl, mul_unfl, mul_inex2;
+        logic [31:0] single_bits;
+        logic        single_operr;
+
+        fp_mul(a_raw, b_raw, rmode, mul_result, mul_z, mul_n, mul_i, mul_nan,
+               mul_operr, mul_ovfl, mul_unfl, mul_inex2);
+
+        flag_operr = mul_operr;
+
+        if (mul_nan || mul_i || mul_z) begin
+            result     = mul_result;
+            flag_ovfl  = mul_ovfl;
+            flag_unfl  = mul_unfl;
+            flag_inex2 = mul_inex2;
+        end else begin
+            ext_to_single(mul_result, rmode, single_bits, single_operr);
+            single_to_ext(single_bits, result);
+            flag_ovfl  = mul_ovfl || (single_operr && !is_zero_fpx(unpack_fpx(result)));
+            flag_unfl  = mul_unfl || (single_operr && is_zero_fpx(unpack_fpx(result)));
+            flag_inex2 = mul_inex2 || (result != mul_result);
+        end
+
+        begin
+            fpx_t r;
+            r = unpack_fpx(result);
+            flag_z   = is_zero_fpx(r);
+            flag_n   = r.sign && !flag_z;
+            flag_i   = is_inf_fpx(r);
+            flag_nan = is_nan_fpx(r);
+        end
+    endtask
+
+    // ── Phase 9c: FMOD ($21) / FREM ($25) -- Section 4.x, confirmed
+    // directly: result = FPn - (Source x N), where N = INT(FPn/Source)
+    // -- truncated (round-to-zero) for FMOD, round-to-nearest for FREM
+    // (the ONLY difference between the two instructions). Also stores
+    // the sign and 7 LSBs of the (unsigned) quotient N in the FPSR
+    // quotient byte (bits[23:16]: bit23=sign, bits[22:16]=7 LSBs --
+    // Section 2.3.2/Figure 2-5, confirmed directly). Undefined (OPERR,
+    // NaN result) for a zero source or an infinite destination.
+    //
+    // N is determined from fp_div's own extended-precision quotient
+    // (64-bit mantissa precision, ample margin for correctly determining
+    // a realistic integer N in all but deliberately-adversarial inputs
+    // sitting exactly on a rounding boundary after 2 rounding steps -- a
+    // documented, reasonable approximation, not exact for truly
+    // arbitrary inputs) via the SAME dynamic-shift-and-mask boundary-
+    // rounding technique fp_int uses (NOT a second call to fp_int
+    // itself, deliberately -- see fp_int's own header comment on why a
+    // second independent call site of the SAME task is a confirmed
+    // Icarus livelock risk this project has already hit once).
+    task automatic fp_mod_rem(
+        input  logic [95:0]  a_raw,           // RX: source (modulus/divisor)
+        input  logic [95:0]  b_raw,           // RY: dest (dividend), also destination
+        input  logic         use_round_nearest, // 0=FMOD (truncate quotient), 1=FREM (round-nearest quotient)
+        output logic [95:0]  result,
+        output logic         flag_z,
+        output logic         flag_n,
+        output logic         flag_i,
+        output logic         flag_nan,
+        output logic         flag_operr,
+        output logic [7:0]   quot_byte // bit7=sign, bits[6:0]=7 LSBs of |quotient|
+    );
+        fpx_t a, b, qx;
+        logic a_nan, b_nan, a_inf, b_inf, a_zero, b_zero;
+        logic [95:0] q_ext;
+        logic        qz, qn, qi, qnan, qoperr, qdz, qovfl, qunfl, qinex2;
+        logic        quot_sign;
+        logic [63:0] n_mag;
+        logic signed [17:0] real_exp;
+
+        a = unpack_fpx(a_raw);
+        b = unpack_fpx(b_raw);
+        a_nan  = is_nan_fpx(a);  b_nan  = is_nan_fpx(b);
+        a_inf  = is_inf_fpx(a);  b_inf  = is_inf_fpx(b);
+        a_zero = is_zero_fpx(a); b_zero = is_zero_fpx(b);
+        flag_operr = 1'b0;
+        quot_byte  = 8'h0;
+
+        if (a_nan) begin
+            result = a_raw;
+        end else if (b_nan) begin
+            result = b_raw;
+        end else if (a_zero || b_inf) begin
+            // Undefined per the manual's own Operation Table -- OPERR, NaN.
+            flag_operr = 1'b1;
+            result = {1'b0, 15'h7FFF, 16'h0, 64'hC000_0000_0000_0000};
+        end else if (b_zero) begin
+            result = b_raw; // signed zero, dest's own sign preserved
+        end else if (a_inf) begin
+            result = b_raw; // Note 2: returns FPn's own pre-operation value
+        end else begin
+            fp_div(a_raw, b_raw, RND_NEAREST, q_ext, qz, qn, qi, qnan, qoperr, qdz, qovfl, qunfl, qinex2);
+            quot_sign = qn; // sign of FPn/Source == XOR of the operand signs
+
+            if (qz) begin
+                result    = b_raw; // |FPn| << |Source| -- quotient rounds to 0
+                n_mag     = 64'h0;
+                quot_byte = {quot_sign, 7'h0};
+            end else begin
+                qx = unpack_fpx(q_ext);
+                real_exp = $signed({3'b0, qx.exp}) - 18'sd16383;
+
+                if (real_exp < 18'sd0) begin
+                    // |q| < 1.0 -- N is 0, unless FREM rounds it up to
+                    // exactly 1 (FMOD always truncates to 0 here).
+                    logic round_to_1;
+                    round_to_1 = use_round_nearest &&
+                                 (real_exp == -18'sd1) && (qx.mant[62:0] != 63'h0);
+                    n_mag = round_to_1 ? 64'd1 : 64'd0;
+                end else if (real_exp >= 18'sd63) begin
+                    // Magnitude already has no fractional part to round
+                    // away -- saturate at this register's own width
+                    // (this project's own documented limit; the
+                    // manual's own 7-bit quotient-byte convention
+                    // implies N is never expected to need more
+                    // precision than this in realistic use).
+                    n_mag = 64'hFFFF_FFFF_FFFF_FFFF;
+                end else begin
+                    logic [6:0]  frac_bits;
+                    logic [63:0] int_part, sticky_mask;
+                    logic        guard, round_bit, sticky, round_up, carry;
+
+                    frac_bits   = 7'(63 - real_exp);
+                    int_part    = qx.mant >> frac_bits;
+                    guard       = (frac_bits >= 7'd1) ? ((qx.mant >> (frac_bits - 7'd1)) & 64'h1) : 1'b0;
+                    round_bit   = (frac_bits >= 7'd2) ? ((qx.mant >> (frac_bits - 7'd2)) & 64'h1) : 1'b0;
+                    sticky_mask = (frac_bits >= 7'd3) ? ((64'h1 << (frac_bits - 7'd2)) - 64'h1) : 64'h0;
+                    sticky      = |(qx.mant & sticky_mask);
+
+                    round_up = use_round_nearest && guard && (round_bit || sticky || int_part[0]);
+                    {carry, int_part} = {1'b0, int_part} + (round_up ? 65'd1 : 65'd0);
+                    n_mag = int_part;
+                end
+
+                quot_byte = {quot_sign, n_mag[6:0]};
+
+                if (n_mag == 64'h0) begin
+                    result = b_raw;
+                end else begin
+                    logic [6:0]  n_lz;
+                    logic [95:0] n_ext_built, prod;
+                    logic        pz, pn, pi, pnan, poperr, povfl, punfl, pinex2;
+                    logic        dz2, dn2, di2, dnan2, doperr2, dovfl2, dunfl2, dinex2b;
+
+                    // Build N as a signed extended-precision value
+                    // directly (no int32 round-trip needed) so fp_mul/
+                    // fp_add_sub -- already-proven, already-tested tasks
+                    // -- can compute Source*N and FPn-that without any
+                    // new arithmetic core logic.
+                    n_lz = lzc64(n_mag);
+                    n_ext_built = {quot_sign, 15'd16383 + (15'd63 - {8'b0, n_lz}), 16'h0, n_mag << n_lz};
+
+                    fp_mul(a_raw, n_ext_built, RND_NEAREST, prod, pz, pn, pi, pnan, poperr, povfl, punfl, pinex2);
+                    fp_add_sub(prod, b_raw, 1'b1, RND_NEAREST, result, dz2, dn2, di2, dnan2, doperr2, dovfl2, dunfl2, dinex2b);
+                end
+            end
+        end
+
+        begin
+            fpx_t r;
+            r = unpack_fpx(result);
+            flag_z   = is_zero_fpx(r);
+            flag_n   = r.sign && !flag_z;
+            flag_i   = is_inf_fpx(r);
+            flag_nan = is_nan_fpx(r);
+        end
+    endtask
+
 endpackage

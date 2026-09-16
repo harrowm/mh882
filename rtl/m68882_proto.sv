@@ -401,6 +401,10 @@ module m68882_proto (
     wire cmd_is_fgetexp = (cmd_ext_r == 7'h1E);
     wire cmd_is_fgetman = (cmd_ext_r == 7'h1F);
     wire cmd_is_fscale  = (cmd_ext_r == 7'h26);
+    wire cmd_is_fsgldiv = (cmd_ext_r == 7'h24);
+    wire cmd_is_fsglmul = (cmd_ext_r == 7'h27);
+    wire cmd_is_fmod    = (cmd_ext_r == 7'h21);
+    wire cmd_is_frem    = (cmd_ext_r == 7'h25);
 
     // State-frame format words (Section 6.4.2) -- see plan.md/CLAUDE.md
     // for the full derivation; unchanged from Phase 5.
@@ -487,6 +491,16 @@ module m68882_proto (
     logic        slotA_getman_z, slotA_getman_n, slotA_getman_i, slotA_getman_nan, slotA_getman_operr;
     logic        slotA_scale_z, slotA_scale_n, slotA_scale_i, slotA_scale_nan, slotA_scale_ovfl, slotA_scale_unfl;
 
+    // Phase 9c: FSGLDIV/FSGLMUL/FMOD/FREM -- one call site each, same
+    // constraint as everything else in this block.
+    logic [95:0] slotA_sgldiv_result, slotA_sglmul_result, slotA_modrem_result;
+    logic        slotA_sgldiv_z, slotA_sgldiv_n, slotA_sgldiv_i, slotA_sgldiv_nan, slotA_sgldiv_operr,
+                 slotA_sgldiv_dz, slotA_sgldiv_ovfl, slotA_sgldiv_unfl, slotA_sgldiv_inex2;
+    logic        slotA_sglmul_z, slotA_sglmul_n, slotA_sglmul_i, slotA_sglmul_nan, slotA_sglmul_operr,
+                 slotA_sglmul_ovfl, slotA_sglmul_unfl, slotA_sglmul_inex2;
+    logic        slotA_modrem_z, slotA_modrem_n, slotA_modrem_i, slotA_modrem_nan, slotA_modrem_operr;
+    logic [7:0]  slotA_modrem_quot_byte;
+
     always_comb begin
         fp_int(slotA_a_r, round_mode_t'(slotA_int_round_bits),
                slotA_int_result, slotA_int_z, slotA_int_n, slotA_int_i, slotA_int_nan, slotA_int_inex2);
@@ -496,6 +510,15 @@ module m68882_proto (
                   slotA_getman_nan, slotA_getman_operr);
         fp_scale(slotA_a_r, slotA_b_r, slotA_scale_result, slotA_scale_z, slotA_scale_n, slotA_scale_i,
                  slotA_scale_nan, slotA_scale_ovfl, slotA_scale_unfl);
+        fp_sgldiv(slotA_a_r, slotA_b_r, round_mode_t'(slotA_round_r),
+                  slotA_sgldiv_result, slotA_sgldiv_z, slotA_sgldiv_n, slotA_sgldiv_i, slotA_sgldiv_nan,
+                  slotA_sgldiv_operr, slotA_sgldiv_dz, slotA_sgldiv_ovfl, slotA_sgldiv_unfl, slotA_sgldiv_inex2);
+        fp_sglmul(slotA_a_r, slotA_b_r, round_mode_t'(slotA_round_r),
+                  slotA_sglmul_result, slotA_sglmul_z, slotA_sglmul_n, slotA_sglmul_i, slotA_sglmul_nan,
+                  slotA_sglmul_operr, slotA_sglmul_ovfl, slotA_sglmul_unfl, slotA_sglmul_inex2);
+        fp_mod_rem(slotA_a_r, slotA_b_r, (slotA_op_r == 7'h25) /* 1=FREM, 0=FMOD */,
+                   slotA_modrem_result, slotA_modrem_z, slotA_modrem_n, slotA_modrem_i, slotA_modrem_nan,
+                   slotA_modrem_operr, slotA_modrem_quot_byte);
     end
 
     // FABS/FNEG (trivial sign-bit ops) and FTST/FMOVE (no real ALU work
@@ -584,6 +607,29 @@ module m68882_proto (
                 slotA_flag_operr = 1'b0; slotA_flag_dz = 1'b0; slotA_flag_ovfl = slotA_scale_ovfl;
                 slotA_flag_unfl = slotA_scale_unfl; slotA_flag_inex2 = 1'b0;
             end
+            7'h24: begin // FSGLDIV
+                slotA_result = slotA_sgldiv_result;
+                slotA_flag_z = slotA_sgldiv_z; slotA_flag_n = slotA_sgldiv_n;
+                slotA_flag_i = slotA_sgldiv_i; slotA_flag_nan = slotA_sgldiv_nan;
+                slotA_flag_operr = slotA_sgldiv_operr; slotA_flag_dz = slotA_sgldiv_dz;
+                slotA_flag_ovfl = slotA_sgldiv_ovfl; slotA_flag_unfl = slotA_sgldiv_unfl;
+                slotA_flag_inex2 = slotA_sgldiv_inex2;
+            end
+            7'h27: begin // FSGLMUL
+                slotA_result = slotA_sglmul_result;
+                slotA_flag_z = slotA_sglmul_z; slotA_flag_n = slotA_sglmul_n;
+                slotA_flag_i = slotA_sglmul_i; slotA_flag_nan = slotA_sglmul_nan;
+                slotA_flag_operr = slotA_sglmul_operr; slotA_flag_dz = 1'b0;
+                slotA_flag_ovfl = slotA_sglmul_ovfl; slotA_flag_unfl = slotA_sglmul_unfl;
+                slotA_flag_inex2 = slotA_sglmul_inex2;
+            end
+            7'h21, 7'h25: begin // FMOD / FREM (quotient byte handled separately at commit)
+                slotA_result = slotA_modrem_result;
+                slotA_flag_z = slotA_modrem_z; slotA_flag_n = slotA_modrem_n;
+                slotA_flag_i = slotA_modrem_i; slotA_flag_nan = slotA_modrem_nan;
+                slotA_flag_operr = slotA_modrem_operr; slotA_flag_dz = 1'b0;
+                slotA_flag_ovfl = 1'b0; slotA_flag_unfl = 1'b0; slotA_flag_inex2 = 1'b0;
+            end
             default: begin // FADD / FSUB / FCMP (identical adder)
                 slotA_result = slotA_addsub_result; slotA_flag_z = slotA_addsub_z; slotA_flag_n = slotA_addsub_n;
                 slotA_flag_i = slotA_addsub_i; slotA_flag_nan = slotA_addsub_nan; slotA_flag_operr = slotA_addsub_operr;
@@ -594,6 +640,15 @@ module m68882_proto (
     end
 
     wire slotA_flag_snan = is_snan_fpx(unpack_fpx(slotA_a_r)) || is_snan_fpx(unpack_fpx(slotA_b_r));
+
+    // Single call site for fpsr_next (a function, but kept to one call
+    // site anyway as a matter of consistent style with every task in
+    // this file) -- the commit block below either uses this value
+    // directly, or splices FMOD/FREM's own quotient byte into it.
+    wire [31:0] slotA_fpsr_next_val = fpsr_next(fpsr_o, slotA_flag_n, slotA_flag_z, slotA_flag_i,
+                                                 slotA_flag_nan, slotA_flag_snan, slotA_flag_operr,
+                                                 slotA_flag_dz, slotA_flag_ovfl, slotA_flag_unfl,
+                                                 slotA_flag_inex2);
 
     // Phase 6: FPCR ENABLE byte (bits[15:8], same bit positions as the
     // EXC byte -- Section 2.3/Figure 2-6) requesting a trap for whichever
@@ -821,7 +876,8 @@ module m68882_proto (
                                     cmd_is_fdiv || cmd_is_fsqrt || cmd_is_fcmp ||
                                     cmd_is_fabs || cmd_is_fneg || cmd_is_ftst || cmd_is_fmove ||
                                     cmd_is_fint || cmd_is_fintrz || cmd_is_fgetexp ||
-                                    cmd_is_fgetman || cmd_is_fscale) begin
+                                    cmd_is_fgetman || cmd_is_fscale ||
+                                    cmd_is_fsgldiv || cmd_is_fsglmul || cmd_is_fmod || cmd_is_frem) begin
                                     state_r <= ST_IDLE;
                                     if (!slotA_valid_r) begin
                                         ca_r    <= 1'b0;
@@ -1149,10 +1205,16 @@ module m68882_proto (
                     end
                     ctrl_wr_en    <= 1'b1;
                     ctrl_wr_sel_r <= 2'd1; // FPSR
-                    ctrl_wr_data  <= fpsr_next(fpsr_o, slotA_flag_n, slotA_flag_z, slotA_flag_i,
-                                                slotA_flag_nan, slotA_flag_snan, slotA_flag_operr,
-                                                slotA_flag_dz, slotA_flag_ovfl, slotA_flag_unfl,
-                                                slotA_flag_inex2);
+                    // Section 2.3.2/Figure 2-5: FMOD/FREM ALONE also load
+                    // the FPSR quotient byte (bits[23:16]) -- every other
+                    // instruction's own Status Register table entry reads
+                    // "Quotient Byte: Not affected," confirmed directly.
+                    if (slotA_op_r == 7'h21 || slotA_op_r == 7'h25) begin
+                        ctrl_wr_data <= {slotA_fpsr_next_val[31:24], slotA_modrem_quot_byte,
+                                          slotA_fpsr_next_val[15:0]};
+                    end else begin
+                        ctrl_wr_data <= slotA_fpsr_next_val;
+                    end
                     if (slotA_exc_trap) begin
                         prim_r <= PRIM_TAKE_MID;
                         ca_r   <= 1'b1;
