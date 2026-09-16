@@ -162,13 +162,22 @@ module m68882_biu_smoke_tb;
         run_cycle(CIR_RESTORE, 1'b0, 1'b1, 1'b0, 32'h0, lat, dsack, rdata);
         check(rdata[31:16] == 16'h1234, "Restore CIR write/read-back round-trips on the D16-D31 lane");
 
+        // Phase 3 finding: Operand CIR is now dialog-gated by
+        // m68882_proto.sv (Section 7.2.8: an Operand CIR access outside
+        // one of its 5 legal contexts is a protocol violation on real
+        // silicon). A raw, contextless Operand access -- no Command CIR
+        // dialog ever issued -- still completes at the BUS level (biu.sv
+        // doesn't know or care about dialog state, only Table 9-3 port
+        // timing), but the PROTOCOL layer correctly refuses to drive
+        // real data for it. See tb/m68882_proto_tb.sv for the real
+        // dialog-driven Operand CIR transfer tests.
         repeat (20) @(posedge clk_4x);
         run_cycle(CIR_OPERAND, 1'b1, 1'b1, 1'b1, 32'hDEAD_BEEF, lat, dsack, rdata);
-        $display("INFO: Operand write latency=%0d", lat);
         repeat (20) @(posedge clk_4x);
         run_cycle(CIR_OPERAND, 1'b0, 1'b1, 1'b1, 32'h0, lat, dsack, rdata);
-        $display("INFO: Operand read-back latency=%0d rdata=%h dsack=%b", lat, rdata, dsack);
-        check(rdata == 32'hDEAD_BEEF, "Operand CIR (32-bit) write/read-back round-trips on D31-D00");
+        $display("INFO: contextless Operand read latency=%0d rdata=%h dsack=%b", lat, rdata, dsack);
+        check(dsack == 2'b00, "contextless Operand access still completes at the bus/DSACK level");
+        check(rdata === 32'hzzzzzzzz, "contextless Operand access is correctly refused at the protocol level (no data driven)");
 
         $display("---");
         $display("%0d passed, %0d failed", pass_count, fail_count);

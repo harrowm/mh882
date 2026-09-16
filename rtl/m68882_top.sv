@@ -70,8 +70,9 @@ module m68882_top (
         .cyc_sel
     );
 
-    logic [31:0] d_out;
-    logic        d_oe;
+    logic [31:0] cir_d_out, proto_d_out;
+    logic        cir_d_oe,  proto_d_oe;
+    logic        abort;
 
     m68882_cir u_cir (
         .clk_4x,
@@ -80,11 +81,28 @@ module m68882_top (
         .cyc_write,
         .cyc_sel,
         .d_in  (d),
-        .d_out (d_out),
-        .d_oe  (d_oe)
+        .d_out (cir_d_out),
+        .d_oe  (cir_d_oe),
+        .abort (abort)
     );
 
-    assign d = d_oe ? d_out : 32'bz;
+    m68882_proto u_proto (
+        .clk_4x,
+        .rst_n,
+        .cyc_ack,
+        .cyc_write,
+        .cyc_sel,
+        .abort,
+        .d_in  (d),
+        .d_out (proto_d_out),
+        .d_oe  (proto_d_oe)
+    );
+
+    // u_cir and u_proto each own a disjoint subset of CIRs (see both
+    // modules' own header comments) -- their own d_oe outputs are
+    // mutually exclusive by construction, so a plain OR/priority-mux is
+    // safe, not a real arbitration.
+    assign d = cir_d_oe ? cir_d_out : (proto_d_oe ? proto_d_out : 32'bz);
     assign sense_n = 1'bz;
 
 endmodule

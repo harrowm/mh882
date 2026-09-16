@@ -99,4 +99,85 @@ package m68882_cir_pkg;
         endcase
     endfunction
 
+    // ────────────────────────────────────────────────────────────────
+    // Phase 3: Command word decode (Section 4.7.1, Table 4-11) and the
+    // Operand CIR data-format table (confirmed via the FADD/general
+    // instruction field description: 000=L, 001=S, 010=X, 011=P, 100=W,
+    // 101=D, 110=B, 111=unused).
+    // ────────────────────────────────────────────────────────────────
+
+    // The 16-bit word written to the Command CIR ($0A) is the general
+    // instruction format's own "command word" (Section 4.7.1): OPCLASS
+    // (bits 15-13), RX (bits 12-10), RY (bits 9-7), EXTENSION (bits 6-0).
+    function automatic logic [2:0] cmd_opclass(logic [15:0] cmd);
+        return cmd[15:13];
+    endfunction
+    function automatic logic [2:0] cmd_rx(logic [15:0] cmd);
+        return cmd[12:10];
+    endfunction
+    function automatic logic [2:0] cmd_ry(logic [15:0] cmd);
+        return cmd[9:7];
+    endfunction
+    function automatic logic [6:0] cmd_ext(logic [15:0] cmd);
+        return cmd[6:0];
+    endfunction
+
+    // Data-format code (used as the RX field for opclass 010 "external
+    // operand to FPn", and as the RX field for opclass 011 "FPm to
+    // external destination") -- confirmed directly (the FADD instruction
+    // field description, "Source Specifier Field"): 000=L, 001=S, 010=X,
+    // 011=P, 100=W, 101=D, 110=B. 111 is unused for this field (opclass
+    // 010 repurposes RX=111 to mean "move constant" instead, a different
+    // instruction class entirely -- see Table 4-11).
+    localparam logic [2:0] FMT_L = 3'b000; // Long Word Integer, 4 bytes
+    localparam logic [2:0] FMT_S = 3'b001; // Single Precision Real, 4 bytes
+    localparam logic [2:0] FMT_X = 3'b010; // Extended Precision Real, 12 bytes
+    localparam logic [2:0] FMT_P = 3'b011; // Packed Decimal Real, 12 bytes
+    localparam logic [2:0] FMT_W = 3'b100; // Word Integer, 2 bytes
+    localparam logic [2:0] FMT_D = 3'b101; // Double Precision Real, 8 bytes
+    localparam logic [2:0] FMT_B = 3'b110; // Byte Integer, 1 byte
+
+    // Total operand byte count per format (Figure 7-4, Operand CIR Data
+    // Alignment: B/W/3-byte/L-or-S are each ONE Operand CIR access;
+    // D is TWO; X/P are THREE -- matching each FP register's own 12-byte
+    // internal storage size).
+    function automatic int unsigned fmt_bytes(logic [2:0] fmt);
+        unique case (fmt)
+            FMT_B: return 1;
+            FMT_W: return 2;
+            FMT_L, FMT_S: return 4;
+            FMT_D: return 8;
+            FMT_X, FMT_P: return 12;
+            default: return 4;
+        endcase
+    endfunction
+
+    // ────────────────────────────────────────────────────────────────
+    // Response Primitive protocol (Section 7.4.2). Bit positions
+    // CA(15)/PC(14)/DR(13) are confirmed directly against the manual.
+    // The primitive-identifying payload in bits[12:0] is NOT confirmed
+    // against an explicit numeric encoding table in this project's own
+    // manual extraction (the relevant sub-section's exact bit-level
+    // primitive codes were not located) -- the 6 values below are this
+    // project's OWN internally-consistent assignment, sufficient to
+    // drive and test the real dialog-sequencing logic Phase 3 exists to
+    // build, but should be treated as unconfirmed against real silicon
+    // until cross-checked (e.g. against Musashi's own 68881 emulation
+    // source, MH030's tools/musashi/, a clean non-OCR reference this
+    // project already has on hand).
+    typedef enum logic [12:0] {
+        PRIM_NULL       = 13'h0000,
+        PRIM_EVAL_EA    = 13'h0001, // Evaluate EA and Transfer Data
+        PRIM_XFER_SINGLE= 13'h0002, // Transfer Single Main Processor Register
+        PRIM_XFER_MULTI = 13'h0003, // Transfer Multiple Coprocessor Registers
+        PRIM_TAKE_PRE   = 13'h0004, // Take Pre-Instruction Exception
+        PRIM_TAKE_MID   = 13'h0005  // Take Mid-Instruction Exception
+    } prim_id_t;
+
+    function automatic logic [15:0] response_word(
+        logic ca, logic pc, logic dr, logic [12:0] payload
+    );
+        return {ca, pc, dr, payload};
+    endfunction
+
 endpackage

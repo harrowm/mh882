@@ -1,6 +1,6 @@
 # MC68882 FPU — Phased Scope Plan
 
-## Status: Phases 0-2 complete. Phase 3 (programming model + primitive protocol) is next.
+## Status: Phases 0-3 complete. Phase 4 (real arithmetic core) is next.
 
 ## Origin
 
@@ -308,14 +308,101 @@ detailed per-signal timing charts MH030's own diagram pipeline crops from
 MC68030UM.pdf). Revisit if a future phase's own verification work turns
 up a case where a visual diagram would clarify a real ambiguity.
 
-### Phase 3 — Programming model and primitive protocol (no real math yet)
-FP0-FP7 (80-bit), FPCR/FPSR/FPIAR, Command CIR op-word decode, Response
-Primitive generation for all 6 primitives this FPU uses, Condition CIR
-evaluation. Arithmetic results can be stubbed/pass-through — this phase
-is entirely about the CIR handshake protocol (CA/PC/DR bits, primitive
-sequencing) independent of computed-value correctness. This is also the
-phase that later enables real testing of MH030's own cpBcc/cpDBcc/cpScc/
-cpTRAPcc gap (see integration note above) — not itself required here.
+### Phase 3 — Programming model and primitive protocol (COMPLETE, no real math yet)
+`rtl/m68882_regfile.sv` (FP0-7 as 96-bit registers — confirmed directly,
+Section 7.2.9: "Each FPCP floating-point data register is 12 bytes
+long"; FPCR/FPSR/FPIAR as 32-bit), and `rtl/m68882_proto.sv` (the real
+instruction-dialog state machine): Command CIR decode of the genuine
+command word (Section 4.7.1/Table 4-11 — opclass/RX/RY/extension, not a
+synthetic testbed, since the command word IS the real, confirmed
+instruction encoding), Response Primitive generation for all 6
+primitives, Operand CIR / Register Select CIR transfer sequencing for
+every one of the 6 general-instruction opclasses, and Condition CIR
+evaluation (EQ/NE only — see below). Arithmetic/format-conversion is
+genuinely stubbed (raw bytes pass through unconverted) — this phase is
+about the CIR handshake protocol shape, not computed-value correctness,
+per its own original scope.
+
+**New facts confirmed while building this** (beyond what Phase 0
+gathered): the command word's exact field layout and per-opclass
+semantics (Section 4.7.1/Table 4-11); the exact 3-bit data-format code
+table (000=L,001=S,010=X,011=P,100=W,101=D,110=B — the "Source Specifier
+Field" description under the FADD instruction); Operand CIR's own
+MSB-aligned multi-longword transfer convention for wide operands
+(Figure 7-4); Register Select CIR's real content shape (MSB 8 bits =
+register mask, LSB 8 bits always zero, Section 7.2.9); the fixed
+FPCR-first/FPSR-second/FPIAR-third transfer order for system-control-
+register moves (Section 4.7.1's own FMOVEM description); and the real
+APU/CU concurrent-exception-attribution and FSAVE-clears-the-exception-
+primitive protocol detail (Section 7.5.4.2/7.5.4.3, folded into Phase 0's
+own CLAUDE.md entry, relevant to Phase 6).
+
+**Explicitly NOT confirmed, flagged rather than silently assumed**:
+Response CIR's own primitive-identifying payload bits[12:0] have no
+located numeric encoding table in this project's own manual extraction —
+this project picked its own internally-consistent 6 values, to be
+cross-checked later (e.g. against Musashi's own 68881 emulation source,
+MH030's `tools/musashi/`) before relying on them as "real." 30 of the 32
+Condition CIR predicates have real Boolean formulas in the manual's own
+Table 4-8, but the OCR extraction corrupted the logical operators badly
+enough that transcribing them wasn't trustworthy — only EQ/NE (both
+unambiguous, Z and !Z) are evaluated for real; the other 30 always
+return false, flagged in `m68882_proto.sv`'s own header rather than
+silently wrong. The FPcr-select field's bit-to-register assignment is
+inferred (3-bit field width + confirmed transfer order), not read off
+an explicit bit-position statement.
+
+**Four real bugs found and fixed via simulation while building this**
+(the same "confirmed via direct trace, not assumed" rigor this session
+already applied twice in Phase 2):
+1. A register-file write-target race: `fp_sel`/`fp_chunk_idx` were
+   originally live combinational aliases of the dialog's own "current
+   register" pointer — but that pointer ADVANCES in the same cycle the
+   write is issued, so by the time the write actually lands one tick
+   later, the selector had already moved to the NEXT register. Fixed by
+   giving the register file dedicated write-side selector ports,
+   captured via nonblocking assignment alongside the write-enable pulse
+   itself (freezing the pre-advance value) — `m68882_regfile.sv`'s own
+   header comment documents this.
+2. `dr_r` (the Response primitive's own DR/direction bit) was never
+   cleared when a dialog reverted to Null, so a stale direction bit from
+   the JUST-FINISHED dialog leaked into the next Response read even
+   though CA and the primitive ID were both correctly Null. Fixed with a
+   single combinational gate (`dr_eff`) rather than patching every one
+   of the several "revert to Null" transition sites individually.
+3. `cond_tf_r` (a Condition CIR evaluation's TF result, folded into the
+   Null primitive's own payload) was likewise never cleared once read —
+   it kept bleeding into every LATER, unrelated Null response until the
+   next Condition CIR write overwrote it. Fixed by clearing it on the
+   next Response CIR read (matching the manual's own general "reading a
+   primitive consumes it" principle).
+4. A genuine bit-order mismatch: the command word's own FPcr-select
+   field was decoded directly into `reg_idx_r` using the field's OWN bit
+   position (bit2=FPCR), but `m68882_regfile.sv`'s own `ctrl_sel`
+   indexing runs the opposite direction (0=FPCR). An FPCR-only select
+   silently resolved to `ctrl_sel`=2 (FPIAR) instead of 0 (FPCR) —
+   caught via a real simulation mismatch (the FPCR round-trip test
+   failing), not by inspection. Fixed with one explicit bit-reversal at
+   the point of decode (`c_ctrl_mask`), documented inline.
+5. (Found alongside #4, same root cause class) `is_ctrl_reg_r` was never
+   reset to 0 in the opclass 110/111 (move-multiple) command decode, so
+   it stayed stuck at 1 from an EARLIER, unrelated FPCR/FPSR dialog in
+   the same test run — every subsequent FMOVEM-class write silently
+   went to the wrong register file (FPCR/FPSR) instead of FP0-7. Fixed
+   by explicitly clearing it in both branches.
+
+**Verified**: `tb/m68882_proto_tb.sv` (new, dialog-driven — 17/17 checks:
+opclass 010/011 single-EA-transfer round trip, opclass 100/101 FPCR/FPSR
+move round trip, Condition CIR EQ evaluation, opclass 110 move-multiple
+across 2 registers/6 chunks) plus `tb/m68882_biu_smoke_tb.sv` updated for
+the new dialog gating (a contextless Operand CIR access — no Command
+dialog ever issued — now correctly completes at the bus level but is
+refused at the protocol level, matching Section 7.2.8's own "any other
+access causes a protocol violation" wording) — 11/11.
+
+This is also the phase that later enables real testing of MH030's own
+cpBcc/cpDBcc/cpScc/cpTRAPcc gap (see integration note above) — not
+itself required here.
 
 ### Phase 4 — Real arithmetic core (APU)
 Extended-precision datapath: format conversion, add/sub/mul/div/sqrt,

@@ -271,13 +271,17 @@ m68882_top            Pin-compatible top level. clk_4x is a plain port (Phase 1
 ├── m68882_biu          Pin-level bus interface: sync-vs-async cycle-type dispatch,
 │                       real Table 9-3 DSACK encoding, Section 10.5 inter-cycle busy
 │                       timer (IMPLEMENTED, Phase 2)
-├── m68882_cir_pkg      CIR offset constants, port-size and DSACK-encoding tables,
-│                       single source of truth (IMPLEMENTED, Phase 2)
-├── m68882_cir          CIR register storage, D16-D31/D31-D0 lane placement
+├── m68882_cir_pkg      CIR offset constants, port-size/DSACK-encoding tables, command-word
+│                       and data-format decode, Response Primitive encoding — single source
+│                       of truth (IMPLEMENTED, Phases 2-3)
+├── m68882_cir          Control/Restore/Save/Instruction-Address/Operand-Address storage
 │                       (IMPLEMENTED, Phase 2 — 32-bit-port only, see Current State)
+├── m68882_proto        Response/Command/Condition/Operand/Register-Select CIR instruction
+│                       dialog (IMPLEMENTED, Phase 3 — genuine command-word decode for all
+│                       6 opclasses; arithmetic/format-conversion stubbed, see Current State)
+├── m68882_regfile      FP0-FP7 (96-bit each), FPCR, FPSR, FPIAR (IMPLEMENTED, Phase 3)
 ├── m68882_cu           Conversion unit (format conversion, 68882-only pipeline stage) (Phase 6)
 ├── m68882_apu          Arithmetic processing unit (the actual math) (Phase 4)
-├── m68882_regfile      FP0-FP7, FPCR, FPSR, FPIAR (Phase 3)
 └── m68882_frame        FSAVE/FRESTORE state-frame generation and parsing (Phase 5)
 ```
 
@@ -310,7 +314,7 @@ doesn't need to (and can't) account for.
 
 ## Current State
 
-**Phases 0-2 are complete.**
+**Phases 0-3 are complete.**
 
 - **Phase 0** (spec foundation): this file.
 - **Phase 1** (clock domain + pin-level BIU skeleton): `rtl/m68882_sync.sv`
@@ -358,9 +362,39 @@ protocol-correct code for the 8-bit case, but `m68882_cir.sv`'s own data
 path doesn't implement the multi-cycle transfer that would actually be
 needed to complete such a transfer.
 
-See `plan.md` for the full phased build plan. Phase 3 (programming model
-+ primitive protocol) is next.
+- **Phase 3** (programming model + primitive protocol): `rtl/m68882_regfile.sv`
+  (FP0-7 as 96-bit registers, FPCR/FPSR/FPIAR as 32-bit) and
+  `rtl/m68882_proto.sv` (the real instruction-dialog state machine —
+  genuine command-word decode for all 6 general-instruction opclasses,
+  Response Primitive generation, Operand/Register-Select CIR transfer
+  sequencing, Condition CIR evaluation). Arithmetic/format-conversion is
+  a deliberate stub (raw bytes pass through unconverted — real
+  conversion is Phase 4/6's own job). `make test` is 11/11
+  (`tb/m68882_biu_smoke_tb.sv`) + 17/17 (new `tb/m68882_proto_tb.sv`).
+
+**Five real bugs found and fixed while building Phase 3** (see `plan.md`
+for full detail): a register-file write-target race (write-side
+selectors needed their own captured registers, decoupled from the
+live "current position" pointer that advances the same cycle); a stale
+`dr_r` (Response direction bit) leaking into later, unrelated Null
+responses; a stale `cond_tf_r` (Condition CIR TF result) leaking the
+same way; a genuine bit-order mismatch between the command word's own
+FPcr-select field and `ctrl_sel`'s indexing (an FPCR-only select
+silently resolved to FPIAR); and `is_ctrl_reg_r` never being reset for
+the move-multiple opclasses, misrouting FMOVEM-class writes to the
+control registers instead of FP0-7. All five were caught by the new
+dialog-driven test failing, not by inspection.
+
+**Explicitly flagged, not silently assumed** (Response CIR's own
+primitive-payload encoding; 30 of the 32 Condition CIR predicates,
+Table 4-8's own OCR-corrupted Boolean formulas; the FPcr-select field's
+bit assignment) — see `rtl/m68882_proto.sv`'s own header comment and
+`plan.md`'s Phase 3 writeup for the full list of what still needs
+cross-checking before Phase 4+ builds on top of it.
+
+See `plan.md` for the full phased build plan. Phase 4 (real arithmetic
+core) is next.
 
 ```bash
-make test   # builds and runs tb/m68882_biu_smoke_tb.sv via Icarus Verilog
+make test   # builds and runs both testbenches via Icarus Verilog
 ```
