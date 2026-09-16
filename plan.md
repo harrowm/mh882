@@ -1,6 +1,6 @@
 # MC68882 FPU — Phased Scope Plan
 
-## Status: Phases 0-3 complete. Phase 4a (FADD/FSUB) complete. Phase 4b in progress (FMUL/FDIV/FABS/FNEG/FCMP/FTST done; FSQRT/transcendentals next).
+## Status: Phases 0-3 complete. Phase 4a (FADD/FSUB) complete. Phase 4b in progress (FMUL/FDIV/FABS/FNEG/FCMP/FTST/FSQRT done; only the transcendental set remains).
 
 ## Origin
 
@@ -552,6 +552,67 @@ double-negation round trip, FCMP confirming the destination register is
 genuinely never written plus both a Z-set (equal) and N-set (FPn<source)
 comparison, and FTST's Z/N condition codes from a zero and a negative
 source operand respectively.
+
+**FSQRT ($04), COMPLETE**: `m68882_apu_pkg::isqrt134` (a standard binary
+digit-recurrence "shift and subtract" integer square root, verified by
+hand against sqrt(25)=5 before use — the trace is worth keeping on
+record: processing pairs of bits MSB-first, root=0,rem=0 →
+(rem,root)=(0,1)→(2,2)→(0,5), matching floor(sqrt(25))=5 exactly) plus
+`fp_sqrt` (Table 4-13's $04) wrapping it with the real exponent-parity
+handling: `sqrt(m*2^E)` needs `m*2^E`'s own exponent to be even to
+factor cleanly, so `a.mant` (which always represents `m*2^63`, and 63 is
+odd) is scaled by an EXTRA shift `S` whose own PARITY is chosen opposite
+real_exp's parity (S=69 when real_exp is even, S=68 when odd) before
+taking the integer sqrt — this was verified computationally (Python,
+not just derived on paper) to land the resulting root's own top bit at
+a FIXED, exponent-independent position for each parity (root[66] for
+even real_exp, root[65] for odd), never needing a data-dependent
+runtime bucket check the way fp_mul/fp_div's own renormalization does.
+Special cases: NaN propagation; sqrt of a negative nonzero operand sets
+OPERR and returns NaN; sqrt(+0)=+0, sqrt(-0)=-0 (sign preserved through
+the pass-through path); sqrt(+Infinity)=+Infinity.
+
+**One real bug found via direct numeric cross-check, not by staring at
+the RTL** (documented in `m68882_apu.sv`'s own header comment): the
+first version of this code had the exponent-parity handling backwards
+in TWO separate ways at once — it doubled the mantissa for the WRONG
+parity (odd instead of even), used a single FIXED shift amount for both
+cases instead of a parity-dependent one, and applied a spurious `-1`
+exponent adjustment to the "other" bucket that turned out not to be
+needed at all once the shift amount was corrected. `sqrt(4.0)` came out
+as `sqrt(2)` (≈1.41421356) instead of `2.0` — a wrong result whose OWN
+numeric value (visibly matching a well-known irrational constant)
+was itself the clue that pointed at an exponent-parity/scaling error
+rather than a rounding or off-by-one bug. Root-caused by writing a small
+standalone Python cross-check (computing the exact integer-sqrt bit
+patterns for several real/synthetic exponent-mantissa pairs at a few
+candidate shift amounts) rather than continuing to re-derive the algebra
+by hand, which had already produced two further incorrect derivations
+in a row before this — a useful general lesson for any future work on
+this file's own remaining arithmetic (MUL/DIV/SQRT's own edge cases,
+and especially the transcendental set): when hand-derived bit-position
+algebra keeps producing plausible-looking but wrong answers, switch to
+computing a concrete numeric cross-check instead of re-deriving again.
+
+**A second, independent bug found while writing up this phase's own
+documentation** (not by a failing test): `apu_flag_operr` had been
+computed by every arithmetic task since Phase 4a (FADD/FSUB's own
+infinity-minus-infinity case, FMUL's 0×Infinity, FDIV's Infinity/
+Infinity and 0/0, and now FSQRT's negative-operand case) but never
+actually reached FPSR at all — `rtl/m68882_proto.sv`'s own FPSR-update
+expression only ever OR'd in the DZ bit, silently dropping OPERR on the
+floor the entire time. No test had ever checked OPERR, so nothing caught
+this until drafting this writeup prompted a check of what actually gets
+written. Fixed the same way DZ already was: OR'd into bit13 of the
+exception-status byte alongside DZ's own bit10, not overwritten.
+
+**Verified**: `tb/m68882_apu_tb.sv` gained 6 more checks (36/36 total) —
+sqrt(4.0)=2.0 (even real_exp, exact), sqrt(2.25)=1.5 and sqrt(9.0)=3.0
+(both odd real_exp, the trickier of the two parity branches, one via a
+fractional mantissa and one via a larger exact value), sqrt(-4.0)→NaN
+with both the NAN condition code AND (once the OPERR-wiring fix above
+landed) the OPERR exception-status bit confirmed set, and
+sqrt(+0.0)=+0.0.
 
 #### Phase 4c — External-operand format conversion (not started)
 Phase 3's own Operand CIR transfer path is still a raw-bytes stub (no

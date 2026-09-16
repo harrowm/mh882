@@ -282,10 +282,10 @@ m68882_top            Pin-compatible top level. clk_4x is a plain port (Phase 1
 ├── m68882_regfile      FP0-FP7 (96-bit each), FPCR, FPSR, FPIAR (IMPLEMENTED, Phase 3)
 ├── m68882_cu           Conversion unit (format conversion, 68882-only pipeline stage) (Phase 6)
 ├── m68882_apu          Arithmetic processing unit. FADD/FSUB/FMUL/FDIV/FABS/FNEG/
-│                       FCMP/FTST register-to-register IMPLEMENTED (Phase 4a/4b, real
-│                       extended-precision arithmetic, all 4 rounding modes); FSQRT/
-│                       transcendentals and format conversion still Phase 4b/4c (see
-│                       Current State/plan.md)
+│                       FCMP/FTST/FSQRT register-to-register IMPLEMENTED (Phase 4a/4b,
+│                       real extended-precision arithmetic, all 4 rounding modes); the
+│                       transcendental set and format conversion still Phase 4b/4c
+│                       (see Current State/plan.md)
 └── m68882_frame        FSAVE/FRESTORE state-frame generation and parsing (Phase 5)
 ```
 
@@ -443,17 +443,41 @@ register write; FTST classifies the source operand alone via the
 existing `is_zero_fpx`/`is_inf_fpx`/`is_nan_fpx` functions, also with no
 register write. 9 more `tb/m68882_apu_tb.sv` checks (30/30 total).
 
-**NOT yet implemented** (explicitly, not silently): FSQRT/
-transcendentals (Phase 4b, remaining — extension-field opcodes already
+**FSQRT ($04) is also implemented** (`m68882_apu_pkg::isqrt134` + `fp_sqrt`):
+a real binary digit-recurrence integer square root (verified by hand
+against sqrt(25)=5 before use), wrapped with real exponent-parity
+handling — `a.mant` is scaled by an extra shift whose PARITY is chosen
+opposite `real_exp`'s own parity, which lands the integer-sqrt result at
+a fixed, exponent-independent bit position for each case (verified
+computationally, not just derived on paper). **A real bug found via a
+Python numeric cross-check, not by inspection**: the first version had
+the exponent-parity handling backwards in two ways at once (doubled the
+mantissa for the wrong parity, used one fixed shift for both cases) —
+`sqrt(4.0)` came out as `sqrt(2)` instead of `2.0`, a wrong result whose
+own value was the clue. See `plan.md` for the full trace and the general
+lesson (switch to a numeric cross-check once hand-derived bit-position
+algebra produces a second wrong answer in a row, rather than re-deriving
+a third time).
+
+**A second, independent bug found while writing up this phase's own
+documentation**: `apu_flag_operr` had been computed by every arithmetic
+task since Phase 4a but never actually reached FPSR — only DZ was ever
+OR'd in. Fixed the same way (OPERR now OR'd into bit13 alongside DZ's
+bit10). 6 more `tb/m68882_apu_tb.sv` checks (36/36 total) — sqrt(4.0),
+sqrt(2.25), sqrt(9.0) (odd-exponent path), sqrt(-4.0)→NaN+OPERR,
+sqrt(+0.0)=+0.0.
+
+**NOT yet implemented** (explicitly, not silently): the transcendental
+set (Phase 4b's own remaining scope — extension-field opcodes already
 confirmed); real B/W/L/S/D/X/P-to-extended format conversion for
 external operands (Phase 4c — opclass 010/011 can still only move raw
 bytes, not numbers); denormals (underflow collapses to signed zero);
-real exponent-overflow trap semantics (coarse saturate-to-
-infinity); the rest of the FPSR accrued-exception/exception-status bytes
-beyond OPERR/DZ (Phase 4d).
+real exponent-overflow trap semantics (coarse saturate-to-infinity); the
+rest of the FPSR accrued-exception/exception-status bytes beyond
+OPERR/DZ (Phase 4d).
 
-See `plan.md` for the full phased build plan. Phase 4b (FSQRT, then the
-transcendental set) continues.
+See `plan.md` for the full phased build plan. Phase 4b's own remaining
+scope (the transcendental set) continues.
 
 ```bash
 make test   # builds and runs all three testbenches via Icarus Verilog

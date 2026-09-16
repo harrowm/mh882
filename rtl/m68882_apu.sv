@@ -539,4 +539,161 @@ package m68882_apu_pkg;
         end
     endtask
 
+    // Integer square root via the standard binary digit-recurrence
+    // ("shift and subtract") algorithm: processes 2 bits of the input
+    // per step, incrementally maintaining a remainder so no per-step
+    // squaring is needed. root_out satisfies root_out^2 <= n <
+    // (root_out+1)^2; rem_out is the exact remainder n - root_out^2
+    // (used for the sqrt's own sticky bit below). Verified by hand
+    // against sqrt(25)=5 before use here (see plan.md's own Phase 4b
+    // writeup for the worked trace).
+    localparam int SQRT_K = 67;
+
+    task automatic isqrt134(
+        input  logic [2*SQRT_K-1:0] n,
+        output logic [SQRT_K-1:0]   root_out,
+        output logic [2*SQRT_K-1:0] rem_out
+    );
+        logic [2*SQRT_K-1:0] rem;
+        logic [SQRT_K-1:0]   root;
+        logic [2*SQRT_K-1:0] candidate, test_val;
+        int i;
+
+        rem  = '0;
+        root = '0;
+        for (i = SQRT_K - 1; i >= 0; i--) begin
+            candidate = {rem[2*SQRT_K-3:0], n[2*i+1], n[2*i]};
+            test_val  = {{(2*SQRT_K-SQRT_K-2){1'b0}}, root, 2'b01}; // 4*root+1
+            if (candidate >= test_val) begin
+                rem  = candidate - test_val;
+                root = {root[SQRT_K-2:0], 1'b1};
+            end else begin
+                rem  = candidate;
+                root = {root[SQRT_K-2:0], 1'b0};
+            end
+        end
+        root_out = root;
+        rem_out  = rem;
+    endtask
+
+    // FSQRT (extension-field opcode $04, Table 4-13) -- Phase 4b.
+    //
+    // sqrt(1.f * 2^e): if e (the UNBIASED exponent) is even, equals
+    // sqrt(1.f)*2^(e/2) directly. If e is odd, rewritten as
+    // sqrt(2*1.f)*2^((e-1)/2) instead (doubling the mantissa into [2,4)
+    // so the exponent adjustment stays an exact integer division) --
+    // the same "make the exponent arithmetic exact by adjusting the
+    // mantissa instead" trick fp_mul/fp_div's own normalization already
+    // relies on. `real_exp >>> 1` (arithmetic shift) gives (e-1)/2 for
+    // odd e and e/2 for even e uniformly, so no separate branch is
+    // needed for the exponent's own halving arithmetic -- only the
+    // final mantissa-window bit position needs the usual conditional
+    // check (same shape as fp_mul/fp_div's own carry/renormalization
+    // handling).
+    task automatic fp_sqrt(
+        input  logic [95:0]  a_raw,
+        input  round_mode_t  rmode,
+        output logic [95:0]  result,
+        output logic         flag_z,
+        output logic         flag_n,
+        output logic         flag_i,
+        output logic         flag_nan,
+        output logic         flag_operr
+    );
+        fpx_t a;
+        logic a_nan, a_inf, a_zero;
+
+        a = unpack_fpx(a_raw);
+        a_nan  = is_nan_fpx(a);
+        a_inf  = is_inf_fpx(a);
+        a_zero = is_zero_fpx(a);
+
+        flag_operr = 1'b0;
+
+        if (a_nan) begin
+            result = a_raw;
+        end else if (a.sign && !a_zero) begin
+            // sqrt of a negative, nonzero number is undefined
+            flag_operr = 1'b1;
+            result = {1'b0, 15'h7FFF, 16'h0, 64'hC000_0000_0000_0000};
+        end else if (a_zero) begin
+            result = a_raw; // sqrt(+0)=+0, sqrt(-0)=-0
+        end else if (a_inf) begin
+            result = a_raw; // sqrt(+Infinity) = +Infinity
+        end else begin
+            // BUG FOUND VIA DIRECT NUMERIC TESTING (Python cross-check,
+            // not just inspection -- see plan.md's own Phase 4b writeup):
+            // the first version of this code doubled the mantissa for
+            // ODD real_exp and used a single fixed shift amount for both
+            // parities. That's backwards. The real relationship: a.mant
+            // always represents m*2^63 (bit63 fixed at 1), so
+            // a.mant<<S always has its OWN top bit at a fixed, exponent-
+            // INDEPENDENT position (63+S) -- the choice that actually
+            // matters is S's own PARITY relative to real_exp's parity,
+            // not any manual doubling step. Empirically and algebraically
+            // confirmed: S=69 (odd) when real_exp is EVEN lands the
+            // integer-sqrt root's own top bit at position 66 every time
+            // (never needs a runtime bucket check); S=68 (even) when
+            // real_exp is ODD lands it at position 65 every time -- and
+            // BOTH cases use the identical `half_exp + 16383` exponent
+            // formula (no separate +/-1 adjustment between the two
+            // branches at all, unlike fp_mul/fp_div's own genuinely
+            // data-dependent bucket crossover).
+            logic signed [17:0] real_exp, half_exp;
+            logic         is_even;
+            logic [133:0] sqrt_n;
+            logic [66:0]  root;
+            logic [133:0] rem;
+            logic [63:0]  mant64;
+            logic         guard, round_bit, sticky;
+            logic [63:0]  rounded_mant;
+            logic         carry;
+            logic signed [17:0] exp_result;
+
+            real_exp = $signed({3'b0, a.exp}) - 18'sd16383;
+            is_even  = !real_exp[0];
+            half_exp = real_exp >>> 1;
+
+            sqrt_n = is_even ? ({70'b0, a.mant} << 69) : ({70'b0, a.mant} << 68);
+
+            isqrt134(sqrt_n, root, rem);
+
+            if (root[66]) begin
+                mant64     = root[66:3];
+                guard      = root[2];
+                round_bit  = root[1];
+                sticky     = root[0] | (rem != 134'b0);
+            end else begin
+                mant64     = root[65:2];
+                guard      = root[1];
+                round_bit  = root[0];
+                sticky     = (rem != 134'b0);
+            end
+            exp_result = half_exp + 18'sd16383;
+
+            round_mantissa(mant64, guard, round_bit, sticky, 1'b0, rmode, rounded_mant, carry);
+            if (carry) begin
+                rounded_mant = {1'b1, rounded_mant[63:1]};
+                exp_result   = exp_result + 18'sd1;
+            end
+
+            if (exp_result >= 18'sd32767) begin
+                result = {1'b0, 15'h7FFF, 16'h0, 64'h8000_0000_0000_0000};
+            end else if (exp_result <= 18'sd0 || rounded_mant == 64'h0) begin
+                result = {1'b0, 15'h0, 16'h0, 64'h0};
+            end else begin
+                result = {1'b0, exp_result[14:0], 16'h0, rounded_mant};
+            end
+        end
+
+        begin
+            fpx_t r;
+            r = unpack_fpx(result);
+            flag_z   = is_zero_fpx(r);
+            flag_n   = r.sign && !flag_z;
+            flag_i   = is_inf_fpx(r);
+            flag_nan = is_nan_fpx(r);
+        end
+    endtask
+
 endpackage

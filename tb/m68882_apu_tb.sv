@@ -310,6 +310,38 @@ module m68882_apu_tb;
         repeat (2) @(posedge clk_4x);
         check(u_top.u_proto.u_regfile.fpsr_r[27] == 1'b1, "FTST: N condition code set for a negative source operand");
 
+        // ── FSQRT: sqrt(4.0) = 2.0 (even exponent, exact) ────────────────
+        load_fp(0, EXT_4_0);
+        run_cycle(CIR_COMMAND, 1'b1, cmd_word(3'b000, 3'd0, 3'd1, 7'h04), rd); // FSQRT
+        repeat (2) @(posedge clk_4x);
+        check(u_top.u_proto.u_regfile.fp_r[1] == EXT_2_0, "FSQRT: sqrt(4.0) == 2.0");
+
+        // ── FSQRT: sqrt(1.0) = 1.0 (odd exponent path: exp(1.0)=0, even -- ─
+        // use sqrt(2.25)=1.5 instead to exercise a non-trivial mantissa) ──
+        load_fp(0, EXT_2_25);
+        run_cycle(CIR_COMMAND, 1'b1, cmd_word(3'b000, 3'd0, 3'd1, 7'h04), rd); // FSQRT
+        repeat (2) @(posedge clk_4x);
+        check(u_top.u_proto.u_regfile.fp_r[1] == EXT_1_5, "FSQRT: sqrt(2.25) == 1.5");
+
+        // ── FSQRT: sqrt(9.0) = 3.0 (odd real exponent: 9.0 has exp=3) ────
+        load_fp(0, 96'h4002_0000_9000_0000_0000_0000); // 9.0
+        run_cycle(CIR_COMMAND, 1'b1, cmd_word(3'b000, 3'd0, 3'd1, 7'h04), rd); // FSQRT
+        repeat (2) @(posedge clk_4x);
+        check(u_top.u_proto.u_regfile.fp_r[1] == EXT_3_0, "FSQRT: sqrt(9.0) == 3.0 (odd-exponent path)");
+
+        // ── FSQRT: sqrt(-4.0) -> NaN, OPERR set ──────────────────────────
+        load_fp(0, {1'b1, EXT_4_0[94:0]}); // -4.0
+        run_cycle(CIR_COMMAND, 1'b1, cmd_word(3'b000, 3'd0, 3'd1, 7'h04), rd); // FSQRT
+        repeat (2) @(posedge clk_4x);
+        check(u_top.u_proto.u_regfile.fpsr_r[24] == 1'b1, "FSQRT: NAN condition code set for sqrt of a negative operand");
+        check(u_top.u_proto.u_regfile.fpsr_r[13] == 1'b1, "FSQRT: OPERR exception-status bit set for sqrt of a negative operand");
+
+        // ── FSQRT: sqrt(+0.0) = +0.0 ──────────────────────────────────────
+        load_fp(0, 96'h0);
+        run_cycle(CIR_COMMAND, 1'b1, cmd_word(3'b000, 3'd0, 3'd1, 7'h04), rd); // FSQRT
+        repeat (2) @(posedge clk_4x);
+        check(u_top.u_proto.u_regfile.fp_r[1] == 96'h0, "FSQRT: sqrt(+0.0) == +0.0");
+
         $display("---");
         $display("%0d passed, %0d failed", pass_count, fail_count);
         if (fail_count != 0) begin

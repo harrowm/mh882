@@ -169,6 +169,7 @@ module m68882_proto (
     wire is_ftst = (c_ext == 7'h3A);
     wire is_fabs = (c_ext == 7'h18);
     wire is_fneg = (c_ext == 7'h1A);
+    wire is_fsqrt = (c_ext == 7'h04);
 
     // FCMP (Table 4-13 $38): condition codes as if FPn-source were
     // computed (real fp_add_sub subtraction), but the result is
@@ -188,10 +189,11 @@ module m68882_proto (
     assign absneg_result = is_fabs ? {1'b0, apu_a_rd[94:0]}
                                     : {!apu_a_rd[95], apu_a_rd[94:0]};
 
-    logic [95:0] addsub_result, mul_result, div_result;
+    logic [95:0] addsub_result, mul_result, div_result, sqrt_result;
     logic        addsub_z, addsub_n, addsub_i, addsub_nan, addsub_operr;
     logic        mul_z, mul_n, mul_i, mul_nan, mul_operr;
     logic        div_z, div_n, div_i, div_nan, div_operr, div_dz;
+    logic        sqrt_z, sqrt_n, sqrt_i, sqrt_nan, sqrt_operr;
     logic [95:0] apu_result;
     logic        apu_flag_z, apu_flag_n, apu_flag_i, apu_flag_nan, apu_flag_operr, apu_flag_dz;
 
@@ -206,6 +208,8 @@ module m68882_proto (
                mul_result, mul_z, mul_n, mul_i, mul_nan, mul_operr);
         fp_div(apu_a_rd, apu_b_rd, round_mode_t'(fpcr_o[5:4]),
                div_result, div_z, div_n, div_i, div_nan, div_operr, div_dz);
+        fp_sqrt(apu_a_rd, round_mode_t'(fpcr_o[5:4]),
+                sqrt_result, sqrt_z, sqrt_n, sqrt_i, sqrt_nan, sqrt_operr);
 
         apu_flag_dz = 1'b0;
         if (is_fmul) begin
@@ -237,6 +241,13 @@ module m68882_proto (
             apu_flag_i     = ftst_i;
             apu_flag_nan   = ftst_nan;
             apu_flag_operr = 1'b0;
+        end else if (is_fsqrt) begin
+            apu_result     = sqrt_result;
+            apu_flag_z     = sqrt_z;
+            apu_flag_n     = sqrt_n;
+            apu_flag_i     = sqrt_i;
+            apu_flag_nan   = sqrt_nan;
+            apu_flag_operr = sqrt_operr;
         end else begin
             // FADD, FSUB, and FCMP (condition codes only, see above)
             apu_result     = addsub_result;
@@ -351,7 +362,7 @@ module m68882_proto (
                                 prim_r  <= PRIM_NULL;
                                 state_r <= ST_IDLE;
                                 if (is_fadd || is_fsub || is_fmul || is_fdiv ||
-                                    is_fabs || is_fneg || is_fcmp || is_ftst) begin
+                                    is_fabs || is_fneg || is_fcmp || is_ftst || is_fsqrt) begin
                                     // FCMP/FTST only ever update condition codes --
                                     // the destination register is never written
                                     // (Section 4.5.5.1: FCMP compares "as if"
@@ -365,12 +376,19 @@ module m68882_proto (
                                     ctrl_wr_en    <= 1'b1;
                                     ctrl_wr_sel_r <= 2'd1; // FPSR
                                     // CC byte overwritten fresh each op (Section 4.5.5.1);
-                                    // DZ (bit10 of the exception-status byte) is OR'd in,
-                                    // not overwritten -- Phase 4a/4d's own documented
-                                    // simplification (no real sticky/accrued-byte model yet)
+                                    // OPERR (bit13) and DZ (bit10) of the exception-status
+                                    // byte are OR'd in, not overwritten -- Phase 4a/4d's own
+                                    // documented simplification (no real sticky/accrued-byte
+                                    // model yet). NOTE: apu_flag_operr was computed by every
+                                    // arithmetic task from Phase 4a onward but never actually
+                                    // reached FPSR until this fix -- found while writing up
+                                    // this phase's own documentation, not by a failing test
+                                    // (no test had checked OPERR until this same change added
+                                    // one).
                                     ctrl_wr_data  <= {4'b0, apu_flag_n, apu_flag_z, apu_flag_i,
                                                        apu_flag_nan,
-                                                       fpsr_o[23:11], (fpsr_o[10] | apu_flag_dz), fpsr_o[9:0]};
+                                                       fpsr_o[23:14], (fpsr_o[13] | apu_flag_operr),
+                                                       fpsr_o[12:11], (fpsr_o[10] | apu_flag_dz), fpsr_o[9:0]};
                                 end
                             end
                             3'b010: if (c_rx == 3'b111) begin // move constant to FPn
