@@ -610,6 +610,21 @@ module m68882_proto (
     logic        slotA_acos_z, slotA_acos_n, slotA_acos_i, slotA_acos_nan, slotA_acos_operr;
     logic        slotA_atanh_z, slotA_atanh_n, slotA_atanh_i, slotA_atanh_nan, slotA_atanh_operr, slotA_atanh_dz;
 
+    // Phase 14: Packed Decimal conversion results -- computed HERE (see
+    // this always_comb block's own trailing call sites below) rather
+    // than in the supply_staged/receive_converted blocks that actually
+    // consume them, specifically to keep packed_to_ext/ext_to_packed's
+    // own internal fp_log10/fp_tentox/fp_int/fp_mul/int32_to_ext/
+    // ext_to_int32 calls confined to the SAME always_comb block those
+    // tasks already have their own (Phase 9h/9f/etc.) call sites in.
+    logic [95:0] slotA_receive_packed_ext, slotA_supply_packed;
+    logic        slotA_receive_packed_operr, slotA_supply_packed_operr;
+    // Forward-declared here (Icarus needs the declaration before this
+    // block's own reference to it) -- computed by its own always_comb
+    // block further down, alongside chunk_idx_r/xfer_stage_r's own
+    // established RECEIVE-side assembly logic.
+    logic [95:0] receive_assembled;
+
     always_comb begin
         fp_int(slotA_a_r, round_mode_t'(slotA_int_round_bits),
                slotA_int_result, slotA_int_z, slotA_int_n, slotA_int_i, slotA_int_nan, slotA_int_inex2);
@@ -654,6 +669,24 @@ module m68882_proto (
         fp_acos(slotA_a_r, slotA_acos_result, slotA_acos_z, slotA_acos_n, slotA_acos_i, slotA_acos_nan, slotA_acos_operr);
         fp_atanh(slotA_a_r, slotA_atanh_result, slotA_atanh_z, slotA_atanh_n, slotA_atanh_i, slotA_atanh_nan,
                  slotA_atanh_operr, slotA_atanh_dz);
+        // Phase 14: packed_to_ext/ext_to_packed each internally call
+        // fp_log10/fp_tentox/fp_int/fp_mul/int32_to_ext/ext_to_int32 --
+        // all of which ALREADY have their own call site in THIS SAME
+        // always_comb block (above). Calling them again from a
+        // genuinely SEPARATE always_comb block (the natural place for
+        // the external-operand supply_staged/receive_converted logic
+        // that actually CONSUMES these results) reproduces the exact
+        // "two separate always_comb blocks each independently calling
+        // the same automatic task" livelock class this project has hit
+        // before -- confirmed empirically this session (a real, full
+        // simulation hang on `make test`, not just a theoretical
+        // concern). Consolidating BOTH calls into this one block (the
+        // established, proven-safe fix) resolves it; supply_staged/
+        // receive_converted's own blocks below only ever READ the
+        // resulting slotA_supply_packed/slotA_receive_packed_ext
+        // signals, no task calls of their own.
+        packed_to_ext(receive_assembled, slotA_receive_packed_ext, slotA_receive_packed_operr);
+        ext_to_packed(apu_b_rd, cmd_ext_r, slotA_supply_packed, slotA_supply_packed_operr);
     end
 
     // FABS/FNEG (trivial sign-bit ops) and FTST/FMOVE (no real ALU work
@@ -967,6 +1000,14 @@ module m68882_proto (
         ext_to_double(apu_b_rd, round_mode_t'(fpcr_o[5:4]), supply_double, supply_double_operr);
         ext_to_int16(apu_b_rd, round_mode_t'(fpcr_o[5:4]), supply_int16, supply_int16_operr);
         ext_to_int8(apu_b_rd, round_mode_t'(fpcr_o[5:4]), supply_int8, supply_int8_operr);
+        // Phase 14: Packed Decimal's own conversion (slotA_supply_packed)
+        // is computed in the slot-A always_comb block above, not here --
+        // see that block's own header comment for why. The k-factor is a
+        // 7-bit signed field per the real chip's own MPU-side FMOVE-to-
+        // packed-decimal instruction encoding (confirmed directly,
+        // Section 4.8), carried by this project's own 7-bit `ext`
+        // command-word field (cmd_ext_r), unused by every other
+        // opclass-011 format.
 
         // Phase 11: Word/Byte, like every format under 4 bytes (Figure
         // 7-4, "Operand CIR Data Alignment," confirmed directly), are
@@ -980,11 +1021,11 @@ module m68882_proto (
             FMT_X:   supply_staged = apu_b_rd; // native format, pure passthrough
             FMT_W:   supply_staged = {supply_int16, 16'h0, 64'h0};
             FMT_B:   supply_staged = {supply_int8, 24'h0, 64'h0};
-            default: supply_staged = 96'h0; // P: not yet implemented (Phase 4c/14 scope)
+            FMT_P:   supply_staged = slotA_supply_packed;
+            default: supply_staged = 96'h0;
         endcase
     end
 
-    logic [95:0] receive_assembled;
     always_comb begin
         receive_assembled = xfer_stage_r;
         unique case (chunk_idx_r)
@@ -1006,6 +1047,13 @@ module m68882_proto (
         // single 32-bit chunk this format ever transfers.
         int16_to_ext(receive_assembled[95:80], receive_int16_ext);
         int8_to_ext(receive_assembled[95:88], receive_int8_ext);
+        // Phase 14: Packed Decimal's own conversion
+        // (slotA_receive_packed_ext) is computed in the slot-A
+        // always_comb block above, not here -- see that block's own
+        // header comment for why. Packed Decimal, like Extended, is a
+        // full 3-chunk (96-bit) transfer -- receive_assembled already
+        // holds the complete packed-decimal string once all 3 chunks
+        // arrive.
     end
 
     logic [95:0] receive_converted;
@@ -1017,7 +1065,8 @@ module m68882_proto (
             FMT_X:   receive_converted = receive_assembled; // native format, pure passthrough
             FMT_W:   receive_converted = receive_int16_ext;
             FMT_B:   receive_converted = receive_int8_ext;
-            default: receive_converted = 96'h0; // P: not yet implemented
+            FMT_P:   receive_converted = slotA_receive_packed_ext;
+            default: receive_converted = 96'h0;
         endcase
     end
 

@@ -2140,10 +2140,118 @@ path is confirmed to mishandle. **`make test`: 9/9 suites clean at
 every checkpoint, zero regressions to the pre-existing 172-check APU
 suite; APU test grew 172→190.**
 
-## Phase 14 — Packed Decimal (P) external-operand format + INEX1, NOT YET STARTED
+## Phase 14 — Packed Decimal (P) external-operand format + INEX1 (complete)
 
 The last MH882-local item in the gap-closure plan, and the largest
-remaining effort — see `wobbly-honking-cascade.md` for the full format
-derivation (Figure 3-11/Table 3-4), the decimal↔binary conversion
-design (reusing `fp_tentox`/`fp_log10`, already built), and the
-k-factor rounding requirements.
+single effort of the six.
+
+**Format** (Section 3.3/Figure 3-11/Table 3-4, confirmed directly): a
+96-bit, 6-word BCD layout — word5 bit15=SM (mantissa sign), bit14=SE
+(exponent sign, meaningful only for ±infinity/NaN), bits[13:12]=2
+special-marker bits ("yy"), bits[11:0]=3-digit BCD exponent; word4
+bits[15:4]=don't-care on input (an output-only 4th exponent digit),
+bits[3:0]=the 1-digit BCD integer part; words3-0=the 16-digit BCD
+fraction. Value = sign × (int_digit.frac_digits) × 10^(signed
+exponent). Special encodings (±infinity: SE=1,yy=11,exp=$FFF,fraction
+all zero; ±NaN/SNaN: same SE/yy/exp pattern, fraction copied BIT-FOR-
+BIT into the extended mantissa, no conversion — SNaN-ness falls out
+automatically from the pre-existing `is_snan_fpx` bit62 check) are
+handled as a dedicated branch in `packed_to_ext`, entirely separate
+from the numeric conversion path.
+
+**RECEIVE (decimal→extended, `packed_to_ext`)**: parses the 3 BCD
+exponent digits and 17 BCD mantissa digits (1 integer + 16 fraction)
+via a decimal Horner loop into a 64-bit unsigned integer (`mant_val`,
+comfortably < 10^17, fits in 64 bits with room to spare), then scales
+by `10^(exponent - 16)` (the -16 correcting for `mant_val` itself
+carrying an implicit ×10^16 from treating the 17-digit string as one
+integer). **First implementation used `fp_tentox` (already built,
+Phase 9f) directly for this scaling and was WRONG** — `fp_tentox` is a
+transcendental power function (exp/ln-based), not a correctly-rounded
+power-of-10 primitive, so scaling `5×10^16` by `fp_tentox(-16)` produced
+`4.999999999999999996` instead of an exact `5.0`, caught by a direct
+proto-testbench check rather than by inspection. Fixed by recognizing
+that any power of 10 up to `10^19` fits EXACTLY in a 64-bit unsigned
+integer (the extended-precision mantissa can represent any such integer
+losslessly), so a new `pow10_64()` function computes the exact integer
+power directly and the scaling is done via a single correctly-rounded
+`fp_mul`/`fp_div` against that exact operand whenever
+`|exponent-16| <= 19` — which covers every practical packed-decimal
+string. Only decimal exponents whose magnitude pushes the effective
+scale factor beyond 10^19 fall back to the original `fp_tentox`+`fp_mul`
+path (a documented, bounded approximation for an extreme-exponent edge
+case, the same shape as the k-factor scope note below, not a silent
+gap).
+
+**A second, genuinely separate bug found and fixed while root-causing
+the above**: `fp_div(a, b)` in this codebase computes `b/a`, not `a/b`
+— it mirrors Motorola's own FDIV `Fn := Fn/Fm` (destination-divided-by-
+source) convention, already visible at every other `fp_div` call site
+in `rtl/m68882_apu.sv` via the `den, num` argument-naming convention
+(e.g. `fp_div(den, num, ...) // t = (m-1)/(m+1)`) but easy to get
+backwards when writing a new call site cold. The first `pow10_64` fix
+attempt called `fp_div(mag_ext, scale_factor, ...)` (intending
+`mag_ext/scale_factor`) and actually computed
+`scale_factor/mag_ext` — silently producing the reciprocal (`0.2`
+instead of `5.0`), caught immediately by the same proto-testbench check
+via a `$display` trace of the intermediate values. Fixed by swapping
+the arguments: `fp_div(scale_factor, mag_ext, ...)`.
+
+**SUPPLY (extended→decimal, `ext_to_packed`)**: determines the decimal
+exponent via `fp_log10` (Phase 9h) + `fp_int` (`RND_ZERO`) +
+`ext_to_int32`, scales the significand into an integer digit string via
+`int32_to_ext`+`fp_tentox`+`fp_mul`+`fp_int` (`RND_NEAREST`), extracts a
+raw 64-bit integer via a right-shift, extracts 17 BCD digits via a
+divide-by-10 loop, applies k-factor-controlled rounding with carry
+propagation, and packs the result. **k-factor scope, deliberately
+bounded** (Section 4.8, confirmed directly): static k in [-64,0]
+selects "F format" (digits right of the decimal point); k in [+1,+17]
+selects "E format" (total significant mantissa digits); k in [+18,+63]
+sets OPERR and is treated as +17; dynamic k-factor reads a 7-bit field
+from an MPU data register. This implementation covers **static,
+positive k only** (E-format, k in [1,17]) — F-format (k≤0) and dynamic
+k-factor are NOT implemented and fall back to behaving as k=17, a
+defined, documented approximation rather than silently wrong output.
+The k-factor's own bit-carrier maps directly onto this project's
+already-existing 7-bit `cmd_ext_r` field (the destination-format-P
+FMOVE encoding's own `K-FACTOR` field, unused by every other opclass-011
+format) — no new CIR/protocol machinery was needed.
+
+**A confirmed, real Icarus simulation hang, found and fixed before any
+of the above numeric bugs**: `packed_to_ext`/`ext_to_packed` internally
+call several shared automatic tasks (`fp_log10`, `fp_int`, `fp_tentox`,
+`int32_to_ext`, `ext_to_int32`, `fp_mul`) that ALREADY have their own
+call site inside `rtl/m68882_proto.sv`'s large, pre-existing slot-A
+`always_comb` block. Wiring the two new tasks' own calls into the
+SEPARATE `supply_staged`/`receive_converted` `always_comb` blocks (used
+for external-operand format conversion) reproduced the same "two
+independent `always_comb` blocks calling the same automatic task can
+livelock in zero simulation time" hazard this project has hit before —
+confirmed as a REAL hang via `make test` run in the background, 240+
+seconds past its own prior successful completion point, requiring
+`pkill -9` to recover. Fixed via the established mitigation:
+consolidated BOTH new tasks' own call sites into the ONE slot-A
+`always_comb` block that already owns every other shared-task call,
+routing results through new module-level signals
+(`slotA_receive_packed_ext`/`slotA_receive_packed_operr`/
+`slotA_supply_packed`/`slotA_supply_packed_operr`) that
+`supply_staged`/`receive_converted` now merely READ. Confirmed resolved:
+`sim/apu` rebuilt clean in well under 90s, full `make test` clean in
+~110s.
+
+**Files**: `rtl/m68882_apu.sv` (`uint64_to_ext`, `pow10_64`,
+`packed_to_ext`, `ext_to_packed`), `rtl/m68882_proto.sv` (the 4 new
+`slotA_*` signals, the 2 new task calls consolidated into the slot-A
+`always_comb` block, the `FMT_P` case in both `supply_staged` and
+`receive_converted`).
+
+**Testing**: `tb/m68882_proto_tb.sv` gained 15 new Packed-Decimal checks
+(27→42): RECEIVE "5.0" and "-123.0" (both exercising the exact-scaling
+fix above), RECEIVE +infinity (the special-encoding branch), and SUPPLY
+round-trips for extended 5.0 (k=1) and extended 123.0 (k=3). No Musashi
+cross-check for this phase — Musashi's own `m68kfpu.c` does not
+implement packed-decimal conversion (confirmed by inspection before
+starting, matching this plan's own documented fallback) — verified
+instead via hand-derived vectors against the manual's own Table 3-4
+encodings and direct decimal arithmetic. **`make test`: 9/9 suites
+clean, zero regressions.**

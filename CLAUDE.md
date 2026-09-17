@@ -936,6 +936,37 @@ See `plan.md` for the full phased build plan, including the remaining
 gap-closure phases (Packed Decimal — the last MH882-local item — and,
 cross-repo, MH030's own coprocessor-conditional instructions).
 
+**Phase 14 (Packed Decimal external-operand format + INEX1) is
+complete — the last MH882-local item, and the largest single effort of
+the six.** 96-bit BCD layout (Section 3.3/Figure 3-11/Table 3-4):
+RECEIVE (`packed_to_ext`) parses 17 BCD digits via a decimal Horner
+loop, then scales by `10^(exponent-16)`. Two real bugs found via a
+direct proto-testbench check, neither obvious from static inspection:
+(1) scaling via `fp_tentox` (transcendental, not correctly-rounded)
+produced `4.999999999999999996` instead of exact `5.0` — fixed via a
+new `pow10_64()` exact-integer-power function, used whenever the scale
+factor fits in 64 bits (covers every practical case); (2) this
+project's own `fp_div(a,b)` computes `b/a` (Motorola's own FDIV
+dest/src convention, already the established argument order at every
+other call site) — a first fix attempt got the operand order backwards
+and silently produced the reciprocal. SUPPLY (`ext_to_packed`) reuses
+`fp_log10`+`fp_int`+`fp_tentox`, scoped to **static positive k-factor
+only** (E-format, k in [1,17], Section 4.8) — F-format/dynamic k fall
+back to k=17, a documented approximation, not silent wrong output. Also
+hit and fixed (before the numeric bugs above) the same "two
+`always_comb` blocks calling one shared automatic task" livelock class
+this project has hit before — confirmed as a real `make test` hang,
+fixed by consolidating both new tasks' call sites into the single
+slot-A `always_comb` block that already owns every other shared-task
+call. `tb/m68882_proto_tb.sv` grew 27→42 checks; no Musashi cross-check
+available (its own `m68kfpu.c` doesn't implement packed decimal),
+verified via hand-derived vectors instead. **`make test`: 9/9 suites
+clean, zero regressions.**
+
+Only Phase 15 remains: the cross-repo MH030 coprocessor-conditional-
+instruction follow-on (`/Users/malcolm/MH030`), now unblocked by Phase
+10's real 32-predicate Condition CIR logic above.
+
 ```bash
 make test   # builds and runs all nine testbenches via Icarus Verilog
 ```

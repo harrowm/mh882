@@ -3163,4 +3163,353 @@ package m68882_apu_pkg;
         end
     endtask
 
+    // ── Phase 14: Packed Decimal (P) external-operand format + INEX1.
+    //
+    // Real format, confirmed directly (Section 3.3, Figure 3-11, Table
+    // 3-4): 96-bit, 6-word BCD layout. Bit positions (MSB-first, p[95]
+    // down to p[0]): p[95]=SM (sign of mantissa), p[94]=SE (sign of
+    // exponent, meaningful only for +-infinity/NaN), p[93:92]=2 special
+    // marker bits ("yy"), p[91:80]=3-digit BCD exponent (EXP2/EXP1/EXP0
+    // nibbles), p[79:68]=don't-care on input (EXP3, an output-only 4th
+    // exponent digit for decimal-exponent overflow), p[67:64]=the
+    // 1-digit BCD integer part (MANT16), p[63:0]=16-digit BCD fraction
+    // (MANT15 down to MANT0). Value = sign x (int_digit.frac_digits) x
+    // 10^(signed exponent).
+    //
+    // Special encodings (Table 3-4, confirmed directly): +-INFINITY has
+    // SE=1, yy=11, exponent=$FFF, fraction all zero. +-NAN/+-SNAN has
+    // the SAME SE/yy/exponent pattern but a NONZERO fraction, which is
+    // copied BIT-FOR-BIT into the extended mantissa with no conversion
+    // at all (the manual's own text: "the fraction part of the NAN is
+    // moved bit-for-bit into the extended precision mantissa... the
+    // exponent of the register is set to signify a NAN, but no
+    // decimal-to-binary conversion... is performed") -- this project's
+    // own is_snan_fpx already checks bit62 of whatever ends up in the
+    // mantissa, so the SNAN/NAN distinction falls out for free from
+    // that direct bit copy, no extra logic needed. +-ZERO has the
+    // int digit and all fraction digits zero (exponent/SE don't
+    // otherwise matter).
+    //
+    // Scope, explicitly bounded (documented, not silently dropped,
+    // matching this project's own established practice for W/B/P at
+    // Phase 4c): RECEIVE (decimal-to-extended, opclass 010) is fully
+    // implemented -- it never involves a k-factor at all (only the
+    // SUPPLY direction's own destination-format field has a k-factor
+    // sub-selector, confirmed directly from the FMOVE instruction
+    // encoding). SUPPLY (extended-to-decimal, opclass 011) is
+    // implemented for the STATIC, POSITIVE k-factor case only (k in
+    // [1,17], Section 4.8's own "E format" -- "indicates the number of
+    // significant digits in the mantissa"); k>17 is clamped to 17 with
+    // OPERR set (a real, documented rule: "+18 to +63... treated as
+    // +17"); k<=0 (the "F format," Fortran-style fixed decimal-point
+    // digit count) and DYNAMIC k-factor (read from an MPU data
+    // register) are NOT implemented -- both fall back to behaving as if
+    // k=17 (the most digits this format can hold), a defined but
+    // approximate fallback, not silently wrong/garbage output. The
+    // decimal exponent is derived via fp_log10 (Phase 9h) plus a
+    // round-to-nearest-integer step; like every other transcendental-
+    // derived computation in this project, this can in principle be off
+    // by one at an operand landing EXACTLY on a power of 10 (not
+    // specially guarded against, given this format's own comparatively
+    // low real-world priority for a cycle-accurate coprocessor project
+    // whose main value is protocol/timing correctness, not decimal
+    // I/O) -- documented here, not silently risked.
+
+    // Unsigned integer -> extended, mirrors int32_to_ext's own
+    // normalization pattern (Phase 4c) but for a wider, always-
+    // non-negative value (needed here for up to a 17-decimal-digit,
+    // ~10^17-magnitude integer, comfortably within 64 unsigned bits --
+    // no INT_MIN-style negation concern since this is never negative).
+    // Exact power of 10 as a 64-bit unsigned integer, for n in 0..19
+    // (10^19 is the largest power of 10 that still fits in 64 bits;
+    // used so common decimal-exponent scaling can be done via an EXACT
+    // integer operand instead of the inherently-approximate fp_tentox,
+    // which is a transcendental function, not a correctly-rounded
+    // power-of-10 primitive -- confirmed necessary the hard way: an
+    // earlier version of packed_to_ext scaled via fp_tentox(-16) and
+    // produced 4.999999999999999996 instead of an exact 5.0).
+    function automatic logic [63:0] pow10_64(input logic [4:0] n);
+        logic [63:0] p;
+        int i;
+        p = 64'd1;
+        for (i = 0; i < 19; i++) begin
+            if (i < n) p = p * 64'd10;
+        end
+        pow10_64 = p;
+    endfunction
+
+    task automatic uint64_to_ext(input logic [63:0] val, output logic [95:0] result);
+        if (val == 64'h0) begin
+            result = 96'h0;
+        end else begin
+            logic [6:0]  lz;
+            logic [63:0] mant;
+            logic [14:0] exp;
+            lz   = lzc64(val);
+            mant = val << lz;
+            exp  = 15'd16383 + (15'd63 - {8'b0, lz});
+            result = {1'b0, exp, 16'h0, mant};
+        end
+    endtask
+
+    // RECEIVE: packed decimal string -> extended precision.
+    task automatic packed_to_ext(
+        input  logic [95:0]  p,
+        output logic [95:0]  result,
+        output logic         flag_operr
+    );
+        logic        sm, se;
+        logic [1:0]  yy;
+        logic [11:0] exp_digits;
+        logic [3:0]  int_digit;
+        logic [63:0] frac_digits;
+        logic        is_special;
+
+        sm          = p[95];
+        se          = p[94];
+        yy          = p[93:92];
+        exp_digits  = p[91:80];
+        int_digit   = p[67:64];
+        frac_digits = p[63:0];
+        is_special  = se && (yy == 2'b11) && (exp_digits == 12'hFFF);
+        flag_operr  = 1'b0;
+
+        if (is_special) begin
+            if (frac_digits == 64'h0) begin
+                result = {sm, 15'h7FFF, 16'h0, 64'h8000_0000_0000_0000}; // +-infinity
+            end else begin
+                result = {sm, 15'h7FFF, 16'h0, frac_digits}; // NaN/SNAN: bit-for-bit fraction copy, no conversion
+            end
+        end else begin
+            // Parse the 3 BCD exponent digits and 17 BCD mantissa
+            // digits (1 integer + 16 fraction) into plain binary values
+            // -- each nibble is a decimal digit 0-9 by construction for
+            // an in-range string (Table 3-4); this project doesn't
+            // special-case the manual's own noted non-decimal-digit
+            // [$A-$F] behavior (Note 2, "the result is probably
+            // useless, although it is repeatable" -- the manual's own
+            // words for that case already, nothing to preserve here).
+            logic [9:0]  exp_mag; // 0-999
+            logic [63:0] mant_val; // int_digit*10^16 + 16 fraction digits, fits comfortably in 64 bits (<10^17)
+            logic signed [17:0] exp_signed, scale_exp;
+            logic [17:0] scale_exp_mag;
+            logic [95:0] scale_exp_ext, scale_factor, mag_ext, scaled_ext;
+            logic mz, mn, mi, mnan, movfl, munfl;
+            logic pz, pn, pi_, pnan, poperr, povfl, punfl, pinex2, pdz;
+            int i;
+
+            exp_mag = {6'b0, exp_digits[11:8]} * 10'd100 + {6'b0, exp_digits[7:4]} * 10'd10 + {6'b0, exp_digits[3:0]};
+            mant_val = {60'b0, int_digit};
+            for (i = 15; i >= 0; i--) begin
+                mant_val = mant_val * 64'd10 + {60'b0, frac_digits[i*4 +: 4]};
+            end
+
+            if (mant_val == 64'h0) begin
+                result = {sm, 15'h0, 16'h0, 64'h0}; // +-zero
+            end else begin
+                exp_signed = se ? (-{6'b0, exp_mag}) : {6'b0, exp_mag};
+                scale_exp  = exp_signed - 18'sd16; // mant_val itself carries an implicit x10^16 (int_digit is the 17th digit)
+                uint64_to_ext(mant_val, mag_ext);
+                scale_exp_mag = scale_exp[17] ? (-scale_exp) : scale_exp;
+
+                if (scale_exp_mag <= 18'd19) begin
+                    // Exact path: 10^|scale_exp| fits in 64 bits, so
+                    // scale via a single correctly-rounded fp_mul/fp_div
+                    // against an EXACT integer operand instead of the
+                    // transcendental fp_tentox (see pow10_64's own
+                    // comment for why this matters).
+                    uint64_to_ext(pow10_64(scale_exp_mag[4:0]), scale_factor);
+                    if (scale_exp[17]) begin
+                        // fp_div(a,b) computes b/a (Motorola FDIV's own
+                        // dest/src convention -- "a" is the divisor, see
+                        // e.g. the "t = (m-1)/(m+1)" den/num call sites
+                        // elsewhere in this file), so the divisor
+                        // (scale_factor) goes first.
+                        fp_div(scale_factor, mag_ext, RND_NEAREST, scaled_ext, mz, mn, mi, mnan, poperr, pdz, povfl, punfl, pinex2);
+                    end else begin
+                        fp_mul(mag_ext, scale_factor, RND_NEAREST, scaled_ext, mz, mn, mi, mnan, poperr, povfl, punfl, pinex2);
+                    end
+                end else begin
+                    // Out-of-range decimal exponent: fall back to
+                    // fp_tentox, same documented-approximation
+                    // precedent as the SUPPLY-side k-factor scope note.
+                    int32_to_ext({{14{scale_exp[17]}}, scale_exp}, scale_exp_ext); // sign-extend 18->32 bits
+                    fp_tentox(scale_exp_ext, scale_factor, pz, pn, pi_, pnan, povfl, punfl);
+                    fp_mul(mag_ext, scale_factor, RND_NEAREST, scaled_ext, mz, mn, mi, mnan, poperr, povfl, punfl, pinex2);
+                end
+                result = {sm, scaled_ext[94:0]};
+            end
+        end
+
+        begin
+            fpx_t r_out;
+            r_out = unpack_fpx(result);
+        end
+    endtask
+
+    // SUPPLY: extended precision -> packed decimal string. k-factor
+    // scope: static, positive only (k in [1,17], "E format") -- see
+    // this section's own header comment above for the full derivation
+    // and documented fallback for k<=0/k>17/dynamic k.
+    task automatic ext_to_packed(
+        input  logic [95:0]  a_raw,
+        input  logic [6:0]   kfactor,
+        output logic [95:0]  result,
+        output logic         flag_operr
+    );
+        fpx_t a;
+        logic a_nan, a_inf, a_zero;
+        logic signed [7:0] k_eff;
+
+        a = unpack_fpx(a_raw);
+        a_nan  = is_nan_fpx(a);
+        a_inf  = is_inf_fpx(a);
+        a_zero = is_zero_fpx(a);
+        flag_operr = 1'b0;
+
+        // Table 4-13's own k-factor field encoding (Section 4.8):
+        // +18..+63 sets OPERR and is treated as +17; <=0 (the F-format/
+        // dynamic cases this task doesn't implement) falls back to the
+        // same +17 "most digits" default rather than producing garbage.
+        if ($signed(kfactor) > 8'sd17) begin
+            k_eff = 8'sd17;
+            flag_operr = 1'b1;
+        end else if ($signed(kfactor) < 8'sd1) begin
+            k_eff = 8'sd17;
+        end else begin
+            k_eff = $signed(kfactor);
+        end
+
+        if (a_nan) begin
+            result = {a.sign, 15'h7FFF, 16'h0, a.mant}; // bit-for-bit fraction copy, reverse of RECEIVE
+        end else if (a_inf) begin
+            result = {a.sign, 15'h7FFF, 16'h0, 64'h0};
+        end else if (a_zero) begin
+            result = {a.sign, 15'h0, 16'h0, 64'h0};
+        end else begin
+            logic [95:0] log10_ext;
+            logic        lz_, ln_, li_, lnan_, loperr_, ldz_;
+            logic signed [17:0] dec_exp;
+            logic [95:0] mag_ext, scale_ext, sig_scaled, sig_rounded;
+            logic [95:0] int_ext;
+            logic        iz, in_, ii_, inan_;
+            logic        rz, rn, ri_, rnan_, roperr_, rovfl_, runfl_, rinex2_;
+            logic [95:0] one_ext_local;
+            logic [6:0]  round_exp; // real_exp of sig_rounded (0..63 range expected)
+            logic [63:0] raw_int;
+            logic [3:0]  digit [0:16];
+            logic        round_up, carry;
+            logic [9:0]  final_exp_mag;
+            logic [11:0] exp_digits_out;
+            int          i;
+
+            mag_ext = {1'b0, a.exp, 16'h0, a.mant}; // |a|
+
+            // Decimal exponent estimate via fp_log10 (Phase 9h) +
+            // round-toward-zero-to-integer (fp_int with RND_ZERO,
+            // already established/tested) -- see this task's own scope
+            // note above re: the rare exact-power-of-10 boundary case.
+            begin
+                logic [95:0] log10_result;
+                logic        lz2, ln2, li2, lnan2, loperr2, ldz2;
+                fp_log10(mag_ext, log10_result, lz2, ln2, li2, lnan2, loperr2, ldz2);
+                begin
+                    logic [95:0] trunc_ext;
+                    logic        tz, tn, ti, tnan, tinex2;
+                    logic signed [31:0] dec_exp32;
+                    fp_int(log10_result, RND_ZERO, trunc_ext, tz, tn, ti, tnan, tinex2);
+                    ext_to_int32(trunc_ext, RND_ZERO, dec_exp32, loperr_);
+                    dec_exp = dec_exp32[17:0]; // narrow 32->18 bits -- dec_exp32 is always tiny (decimal
+                                                // exponents are bounded to +-999 by the packed format,
+                                                // real values' own log10 magnitude tops out ~4933), so
+                                                // this truncation never loses information
+                end
+            end
+
+            // significand_scaled = |a| * 10^(16 - dec_exp), aiming to
+            // land the value in [10^16,10^17) so a 17-digit BCD string
+            // (1 integer + 16 fraction digits) can be extracted after
+            // rounding to the nearest integer.
+            begin
+                logic signed [17:0] scale16;
+                scale16 = 18'sd16 - dec_exp;
+                int32_to_ext({{14{scale16[17]}}, scale16}, int_ext); // sign-extend 18->32 bits
+            end
+            fp_tentox(int_ext, scale_ext, iz, in_, ii_, inan_, rovfl_, runfl_);
+            fp_mul(mag_ext, scale_ext, RND_NEAREST, sig_scaled, rz, rn, ri_, rnan_, roperr_, rovfl_, runfl_, rinex2_);
+
+            // Round to the nearest integer (reusing fp_int, already
+            // established/tested) then extract the raw 64-bit integer
+            // value via a direct shift -- sig_rounded is by
+            // construction an exact integer in (roughly) [10^16,10^17),
+            // whose own real exponent comfortably fits the 0-63 shift
+            // range this same pattern already uses elsewhere
+            // (ext_to_int32 etc).
+            begin
+                logic tz, tn, ti, tnan, tinex2;
+                fp_int(sig_scaled, RND_NEAREST, sig_rounded, tz, tn, ti, tnan, tinex2);
+            end
+            begin
+                fpx_t sx;
+                logic signed [17:0] sreal_exp;
+                sx = unpack_fpx(sig_rounded);
+                sreal_exp = $signed({3'b0, sx.exp}) - 18'sd16383;
+                if (sreal_exp < 18'sd0) begin
+                    raw_int = 64'h0;
+                end else if (sreal_exp > 18'sd63) begin
+                    raw_int = 64'hFFFF_FFFF_FFFF_FFFF; // saturate -- shouldn't occur for a genuine 17-digit value
+                end else begin
+                    raw_int = sx.mant >> (18'sd63 - sreal_exp);
+                end
+            end
+
+            // Extract 17 decimal digits (digit[0]=leading/most
+            // significant down to digit[16]=last fraction digit) via
+            // plain repeated divide-by-10-and-mod -- simplicity over
+            // efficiency, this op is not cycle-critical.
+            for (i = 16; i >= 0; i--) begin
+                digit[i] = raw_int % 64'd10;
+                raw_int  = raw_int / 64'd10;
+            end
+
+            // k-factor rounding: keep digit[0..k_eff-1], round based on
+            // digit[k_eff] (simple round-half-up on the decimal digit
+            // boundary -- a documented simplification, not full FPCR-
+            // rounding-mode-aware decimal rounding), propagating carry
+            // leftward; a carry all the way out of digit[0] (e.g.
+            // 9.99...->10.0...) bumps dec_exp and resets to a clean
+            // leading 1 with all kept digits zero.
+            round_up = (int'(k_eff) <= 16) && (digit[k_eff] >= 4'd5);
+            carry = round_up;
+            for (i = int'(k_eff) - 1; i >= 0; i--) begin
+                if (carry) begin
+                    if (digit[i] == 4'd9) begin
+                        digit[i] = 4'd0;
+                        carry = 1'b1;
+                    end else begin
+                        digit[i] = digit[i] + 4'd1;
+                        carry = 1'b0;
+                    end
+                end
+            end
+            if (carry) begin
+                digit[0] = 4'd1;
+                dec_exp  = dec_exp + 18'sd1;
+            end
+            for (i = int'(k_eff); i <= 16; i++) digit[i] = 4'd0;
+
+            final_exp_mag = (dec_exp < 18'sd0) ? 10'(-dec_exp) : 10'(dec_exp);
+            if (final_exp_mag > 10'd999) flag_operr = 1'b1; // decimal exponent magnitude exceeds 3 digits
+
+            exp_digits_out = {(final_exp_mag / 10'd100) % 10'd10, (final_exp_mag / 10'd10) % 10'd10, final_exp_mag % 10'd10};
+
+            begin
+                logic [63:0] frac_out;
+                frac_out = 64'h0;
+                for (i = 0; i < 16; i++) frac_out = frac_out | ({60'b0, digit[i+1]} << ((15-i)*4));
+                result = {a.sign, (dec_exp < 18'sd0), 2'b00, exp_digits_out, 12'h0, digit[0], frac_out};
+            end
+        end
+    endtask
+
 endpackage

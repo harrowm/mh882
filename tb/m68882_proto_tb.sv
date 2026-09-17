@@ -365,6 +365,90 @@ module m68882_proto_tb;
         run_cycle(CIR_OPERAND, 1'b0, 32'h0, rd);
         check(rd == 32'h5555_6666, "opclass 011: Extended-Precision (X) passthrough out of FP5, chunk 2");
 
+        repeat (4) @(posedge clk_4x);
+
+        // ── Phase 14: opclass 010, Packed Decimal (P) -> FP6, "5.0" ──
+        // Format (Figure 3-11, confirmed directly): word5 = SM|SE|yy|
+        // 3-digit exponent; word4 = don't-care|1-digit integer part;
+        // words3-0 = 16-digit fraction. "5.0" = sign 0, exponent 0,
+        // integer digit 5, all fraction digits 0.
+        run_cycle(CIR_COMMAND, 1'b1, cmd_word(3'b010, FMT_P, 3'd6, 7'd0), rd);
+        run_cycle(CIR_INSTRADDR, 1'b1, 32'h0000_1000, rd);
+        run_cycle(CIR_RESPONSE, 1'b0, 32'h0, rd);
+        run_cycle(CIR_OPERAND, 1'b1, 32'h0000_0005, rd); // word5=0x0000, word4=0x0005 (int digit 5)
+        run_cycle(CIR_OPERAND, 1'b1, 32'h0000_0000, rd);
+        run_cycle(CIR_OPERAND, 1'b1, 32'h0000_0000, rd);
+        run_cycle(CIR_RESPONSE, 1'b0, 32'h0, rd);
+        check(u_top.u_proto.u_regfile.fp_r[6] == EXT_5_0,
+              "opclass 010: Packed Decimal \"5.0\" converts to extended-precision 5.0 in FP6");
+
+        repeat (4) @(posedge clk_4x);
+
+        // ── opclass 010: Packed Decimal -> FP6, "-123.0" -- exercises a
+        // real multi-digit fraction/integer split, a nonzero decimal
+        // exponent is NOT needed here (123 fits as int_digit=1,
+        // fraction digits 2,3,0,0,...), and a negative sign (SM=1).
+        // 123.0 = 1.23 x 10^2, so int_digit=1, frac starts 2,3,0...,
+        // decimal exponent = +2.
+        run_cycle(CIR_COMMAND, 1'b1, cmd_word(3'b010, FMT_P, 3'd6, 7'd0), rd);
+        run_cycle(CIR_INSTRADDR, 1'b1, 32'h0000_1000, rd);
+        run_cycle(CIR_RESPONSE, 1'b0, 32'h0, rd);
+        run_cycle(CIR_OPERAND, 1'b1, 32'h8002_0001, rd); // SM=1(bit31),exp=002(3-digit BCD),int digit=1
+        run_cycle(CIR_OPERAND, 1'b1, 32'h2300_0000, rd); // fraction: digit1=2,digit2=3, rest 0
+        run_cycle(CIR_OPERAND, 1'b1, 32'h0000_0000, rd);
+        run_cycle(CIR_RESPONSE, 1'b0, 32'h0, rd);
+        check(u_top.u_proto.u_regfile.fp_r[6] == {1'b1, 15'h4005, 16'h0, 64'hF600_0000_0000_0000},
+              "opclass 010: Packed Decimal \"-123.0\" (nonzero decimal exponent, multi-digit) converts correctly");
+
+        repeat (4) @(posedge clk_4x);
+
+        // ── opclass 010: Packed Decimal special encodings -- +infinity
+        // and NaN (Table 3-4, confirmed directly: SE=1, yy=11,
+        // exponent=$FFF; fraction all-zero=infinity, nonzero=NaN with
+        // the fraction copied bit-for-bit into the extended mantissa).
+        run_cycle(CIR_COMMAND, 1'b1, cmd_word(3'b010, FMT_P, 3'd6, 7'd0), rd);
+        run_cycle(CIR_INSTRADDR, 1'b1, 32'h0000_1000, rd);
+        run_cycle(CIR_RESPONSE, 1'b0, 32'h0, rd);
+        run_cycle(CIR_OPERAND, 1'b1, 32'h7FFF_0000, rd); // SM=0,SE=1,yy=11,exp=FFF (word5=0x7FFF)
+        run_cycle(CIR_OPERAND, 1'b1, 32'h0000_0000, rd);
+        run_cycle(CIR_OPERAND, 1'b1, 32'h0000_0000, rd);
+        run_cycle(CIR_RESPONSE, 1'b0, 32'h0, rd);
+        check(u_top.u_proto.u_regfile.fp_r[6] == 96'h7fff_0000_8000_0000_0000_0000,
+              "opclass 010: Packed Decimal +infinity encoding converts to extended +infinity");
+
+        repeat (4) @(posedge clk_4x);
+
+        // ── Phase 14: opclass 011, Packed Decimal (P) <- FP6, static
+        // positive k-factor (E-format). FP6="5.0", k=1 -> "5.E+0". The
+        // k-factor rides on this project's own 7-bit `ext` command-word
+        // field (unused by every other opclass-011 format).
+        u_top.u_proto.u_regfile.fp_r[6] = EXT_5_0;
+        run_cycle(CIR_COMMAND, 1'b1, cmd_word(3'b011, FMT_P, 3'd6, 7'd1), rd); // k=1
+        run_cycle(CIR_INSTRADDR, 1'b1, 32'h0000_1000, rd);
+        run_cycle(CIR_RESPONSE, 1'b0, 32'h0, rd);
+        run_cycle(CIR_OPERAND, 1'b0, 32'h0, rd);
+        check(rd == 32'h0000_0005, "opclass 011: extended 5.0 with k=1 converts back to Packed Decimal \"5.\" (word5/word4)");
+        run_cycle(CIR_OPERAND, 1'b0, 32'h0, rd);
+        check(rd == 32'h0000_0000, "opclass 011: extended 5.0 with k=1, fraction word 1 all zero");
+        run_cycle(CIR_OPERAND, 1'b0, 32'h0, rd);
+        check(rd == 32'h0000_0000, "opclass 011: extended 5.0 with k=1, fraction word 2 all zero");
+
+        repeat (4) @(posedge clk_4x);
+
+        // ── opclass 011: extended 123.0, k=3 (3 significant digits,
+        // E-format) -> "1.23E+2" -- the same value RECEIVE already
+        // proved converts correctly, now round-tripped the other way.
+        u_top.u_proto.u_regfile.fp_r[6] = {1'b0, 15'h4005, 16'h0, 64'hF600_0000_0000_0000};
+        run_cycle(CIR_COMMAND, 1'b1, cmd_word(3'b011, FMT_P, 3'd6, 7'd3), rd); // k=3
+        run_cycle(CIR_INSTRADDR, 1'b1, 32'h0000_1000, rd);
+        run_cycle(CIR_RESPONSE, 1'b0, 32'h0, rd);
+        run_cycle(CIR_OPERAND, 1'b0, 32'h0, rd);
+        check(rd == 32'h0002_0001, "opclass 011: extended 123.0 with k=3 converts back to Packed Decimal, word5/word4 (exp=2, int digit=1)");
+        run_cycle(CIR_OPERAND, 1'b0, 32'h0, rd);
+        check(rd == 32'h2300_0000, "opclass 011: extended 123.0 with k=3, fraction digits 2,3 then zero");
+        run_cycle(CIR_OPERAND, 1'b0, 32'h0, rd);
+        check(rd == 32'h0000_0000, "opclass 011: extended 123.0 with k=3, fraction word 2 all zero");
+
         $display("---");
         $display("%0d passed, %0d failed", pass_count, fail_count);
         if (fail_count != 0) begin
