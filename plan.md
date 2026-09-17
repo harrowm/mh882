@@ -2255,3 +2255,28 @@ starting, matching this plan's own documented fallback) — verified
 instead via hand-derived vectors against the manual's own Table 3-4
 encodings and direct decimal arithmetic. **`make test`: 9/9 suites
 clean, zero regressions.**
+
+## Phase 15 — MH030-side coprocessor-conditional instructions (cross-repo, complete)
+
+Closed in a later session, entirely in `/Users/malcolm/MH030` (see that
+project's own `plan.md` Phase 281, sub-phases 1-5, and `CLAUDE.md` for
+the full writeup — not duplicated here). Summary: MH030's own
+`CLAUDE.md` had documented cpBcc/cpDBcc/cpScc/cpTRAPcc + Coprocessor
+Protocol Violation as a deliberate scope boundary (its own Phase 248
+item #7) specifically because meaningfully testing them needed a real
+attached coprocessor evaluating genuine condition predicates — this
+project's own Phase 10 (the 32-predicate Condition CIR logic above) was
+exactly that missing piece. All four instructions plus dedicated
+Protocol Violation test coverage are now implemented and tested in
+MH030 (`dec_is_cpbcc`/`dec_is_cpdbcc`/`dec_is_cpscc`/`dec_is_cptrapcc`,
+a shared `cpcc_*` CIR dispatch FSM reused unchanged across all four).
+Verification used a testbench-side CIR stub (mirroring MH030's own
+established cpSAVE/cpRESTORE precedent) rather than a live MH882
+instance — a genuine cross-repo cosim remains a deliberately deferred,
+documented aspiration, not attempted. `make test`/`make cosim_grp`/the
+full 124-suite Tom Harte sweep all confirmed clean at every sub-phase
+on the MH030 side.
+
+**This closes `wobbly-honking-cascade.md` (this plan) in full.** No
+outstanding gap-closure work remains in either MH882 or MH030 from this
+plan.

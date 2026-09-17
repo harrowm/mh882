@@ -963,9 +963,19 @@ available (its own `m68kfpu.c` doesn't implement packed decimal),
 verified via hand-derived vectors instead. **`make test`: 9/9 suites
 clean, zero regressions.**
 
-Only Phase 15 remains: the cross-repo MH030 coprocessor-conditional-
-instruction follow-on (`/Users/malcolm/MH030`), now unblocked by Phase
-10's real 32-predicate Condition CIR logic above.
+**Phase 15 (cross-repo MH030 coprocessor-conditional-instruction
+follow-on) is complete**, closing the `wobbly-honking-cascade.md`
+gap-closure plan in full. Implemented entirely in
+`/Users/malcolm/MH030` (see that project's own `plan.md` Phase 281,
+sub-phases 1-5, and `CLAUDE.md` — not duplicated here): all four
+coprocessor conditional instructions (cpBcc.W/.L, cpDBcc, cpScc
+Dn-direct, cpTRAPcc) plus dedicated Coprocessor Protocol Violation test
+coverage, unblocked by this project's own Phase 10 real Condition CIR
+logic above. Verified via a testbench-side CIR stub on the MH030 side
+(mirroring MH030's own established cpSAVE/cpRESTORE precedent) rather
+than a live MH882 instance — a genuine cross-repo cosim remains a
+deliberately deferred, documented aspiration on both sides, not
+attempted. No outstanding gap-closure work remains in this project.
 
 ```bash
 make test   # builds and runs all nine testbenches via Icarus Verilog
