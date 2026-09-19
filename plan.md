@@ -2280,3 +2280,72 @@ on the MH030 side.
 **This closes `wobbly-honking-cascade.md` (this plan) in full.** No
 outstanding gap-closure work remains in either MH882 or MH030 from this
 plan.
+
+## Phase 16 — Comparative review against an independent MC68881/68882 implementation (complete)
+
+Cross-checked this project against
+[mattuna15/68881-fpga](https://github.com/mattuna15/68881-fpga), an
+independent, actively-developed, hardware-verified MC68881/68882 core
+(VHDL, Xilinx 7-series/UltraScale+, ~11.4K lines across 10 RTL files,
+DSP48-pipelined shared multiplier/adder, dual CIR+peripheral host
+interface). Focused specifically on the areas this project's own
+history shows were genuinely tricky the first time — denormal
+handling, BSUN/all-32-condition-predicates, packed decimal k-factor
+scope, FDIV operand order — since those are exactly where an
+independent implementation's own choices are most likely to reveal
+something real, in either direction.
+
+**Result: no bugs found in MH882.** Two of its past hard-won design
+decisions got independently cross-validated by a completely separate
+implementation, and one already-trusted piece got re-confirmed by
+re-deriving it from the actual signal wiring rather than the code's own
+comment:
+
+- **Denormal input classification — consistent.** Both projects
+  independently arrived at the identical formula for normalizing
+  `exp=0` inputs (`lz=clz(mantissa); mantissa<<=lz; effective_exp=1-lz`),
+  including identical handling of the `exp=0`-with-explicit-integer-
+  bit-set edge case this project's own Phase 13 had to resolve
+  empirically via Musashi's `softfloat.c`. Two independent
+  implementations converging on the same non-obvious formula is a
+  meaningful validation.
+- **All 32 FP condition predicates — consistent.** Compared
+  68881-fpga's `eval_fcc_condition` (`mc68881_top.vhd:1703-1763`)
+  term-by-term against this project's own `cond_eval`
+  (`m68882_proto.sv:1089-1114`) for all 16 shared base predicates
+  (reused identically by the signaling/nonsignaling groups in both
+  projects). No discrepancies.
+- **FDIV operand order — re-confirmed, not just trusted.**
+  Re-derived this project's own wiring from scratch
+  (`apu_a_sel=cmd_rx_r` (source), `apu_b_sel=cmd_ry_r` (dest) ->
+  `fp_div(b,a)=b/a=dest/source=FPn/source`) rather than trusting the
+  existing comment — confirms `FPn := FPn/source` matches real MC68881
+  semantics exactly.
+- **Denormal underflow rounding — this project's own approach
+  independently validated by contrast.** 68881-fpga's own
+  `mc68881_fp80_addsub_unit.vhd` turned out to have a real bug here: it
+  rounds to *normal* precision unconditionally, then truncates again
+  (plain `shift_right`, no sticky-bit preservation, unlike every other
+  shift in the same file) if the result underflows into denormal
+  range — textbook double rounding, verified with a hand-checkable bit
+  pattern (60/256 cases diverge at a reduced bit width). This is
+  exactly the failure mode this project's own Phase 13 comments
+  explicitly name and avoid (shift-then-round-once). Filed as a real
+  issue upstream — see below. Not a finding about MH882; a contrast
+  that confirms MH882 got this one right.
+- **Packed decimal F-format (k≤0) — not a bug, a useful reference.**
+  This project deliberately defers F-format (falls back to k=17,
+  Phase 14). 68881-fpga's own `mc68881_packed_decimal_unit.vhd:430-435`
+  does implement it, with the real manual formula for F-format
+  significant-digit count — kept as a reference for if/when this
+  project's own deferred gap gets picked up, not acted on now.
+
+**Upstream issue filed (as a standalone, ready-to-file markdown
+document, matching this project's own established convention for
+external-project bugs found during comparative work — see
+`docs/musashi_issue_fmod_frem.md`'s own precedent):**
+`docs/68881fpga_issue_denormal_double_rounding.md`, for the denormal
+double-rounding bug above.
+
+No RTL changes in this project — this phase is a documentation-only,
+comparative-review finding. `make test` unaffected (9/9, unchanged).

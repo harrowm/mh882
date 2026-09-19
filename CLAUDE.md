@@ -977,6 +977,27 @@ than a live MH882 instance — a genuine cross-repo cosim remains a
 deliberately deferred, documented aspiration on both sides, not
 attempted. No outstanding gap-closure work remains in this project.
 
+**Phase 16 (comparative review against an independent MC68881/68882
+implementation) is complete.** Cross-checked against
+[mattuna15/68881-fpga](https://github.com/mattuna15/68881-fpga) (VHDL,
+Xilinx-targeted, hardware-verified), focused on the areas this
+project's own history found genuinely tricky: denormal handling,
+BSUN/all-32-condition-predicates, packed decimal k-factor scope, FDIV
+operand order. **No bugs found in MH882** — denormal input
+classification, all 32 condition predicates, and FDIV operand order
+all independently cross-validated with no discrepancies; the other
+project's own packed-decimal unit implements F-format (k≤0), a useful
+reference for this project's own documented deferred gap, not a bug.
+One real finding, in the *other* project: its own denormal underflow
+path rounds twice (normal precision, then truncates again with no
+sticky bit) — the exact double-rounding failure mode this project's
+own Phase 13 explicitly avoids (shift-then-round-once), confirming
+Phase 13's approach was right rather than casting doubt on it. Filed
+upstream as `docs/68881fpga_issue_denormal_double_rounding.md`
+(standalone, ready-to-file, same convention as
+`docs/musashi_issue_fmod_frem.md`). Documentation-only — no RTL
+changes, `make test` unaffected.
+
 ```bash
 make test   # builds and runs all nine testbenches via Icarus Verilog
 ```
